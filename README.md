@@ -16,7 +16,9 @@
 - 会话级记忆：每个 session 一份 JSON 文件
 - 全局记忆：偏好/片段等全局信息单独保存
 - 半自动注入：按策略注入当前会话摘要，支持手动 recall
+- 自动裁剪：内置 DCP 风格 `discard/extract/prune` 机制
 - 本地看板：查看、编辑、删除记忆（带审计日志）
+- 批量删除：在 `37777` 勾选会话条目后批量删除
 - 生命周期联动：默认监听 OpenCode `4096`，控制看板 `37777`
 
 ---
@@ -79,6 +81,7 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 1. 打开 OpenCode（默认 `http://127.0.0.1:4096`）
 2. 查看记忆面板：`http://127.0.0.1:37777`
 3. 关闭 OpenCode 后，`37777` 应在约 10-20 秒内自动停止
+4. 面板自动刷新间隔默认为 `60s`（页面切回前台会立即刷新一次）
 
 如果没生效：见本文“常见问题排查”。
 
@@ -96,6 +99,10 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 - `/memory recall <关键词>`：手动跨会话召回
 - `/memory sessions`：查看会话记忆列表
 - `/memory clear session <id>`：删除某个 session 记忆
+- `/memory clear sessions <id1,id2,...>`：批量删除多个 session 记忆
+- `/memory discard [session <id>|current] [aggressive]`：清理低信号工具噪音
+- `/memory extract [session <id>|current] [maxEvents]`：把旧正文蒸馏进摘要
+- `/memory prune [session <id>|current]`：执行组合裁剪
 - `/memory dashboard`：重建 dashboard 数据
 
 #### 5.3 跨会话召回触发
@@ -130,6 +137,7 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 - 若要删除记忆：
   - 用 `/memory clear session <id>`
   - 或在 `37777` 页面点 `Delete session`
+  - 或在 `37777` 页面勾选多个会话后点“批量删除(n)”
 
 #### 6.2 如果你不开 `37777`
 
@@ -171,6 +179,11 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 
 - 插件会优先读事件标题；若无标题，会回退用首条用户消息生成标题
 
+#### 8.5 为什么会话里出现 `[memory-system] ...` 提示
+
+- 这是“可见模式”提示，表示注入/裁剪动作已执行
+- 新版本会做合并去抖：同一波操作仅显示最新一条，避免刷屏
+
 ---
 
 ### 9. Windows 使用说明（重点）
@@ -195,7 +208,8 @@ This plugin provides local memory for OpenCode with:
 - Session-based JSON memory files
 - Cross-session recall (intent-triggered + manual)
 - Token budget compaction
-- Dashboard with edit/delete + audit log (`37777`)
+- DCP-style pruning (`discard/extract/prune`)
+- Dashboard with edit/delete/batch-delete + audit log (`37777`)
 - Dashboard lifecycle synced to OpenCode web lifecycle (`4096` by default)
 
 ### 1. Required files
@@ -224,12 +238,17 @@ Typical paths:
 - OpenCode web: `http://127.0.0.1:4096`
 - Dashboard: `http://127.0.0.1:37777`
 - Stop OpenCode -> dashboard stops in ~10-20s
+- Dashboard auto-refresh interval: `60s` (and immediate refresh on tab focus)
 
 ### 4. Commands
 
 - `/memory recall <query>`
 - `/memory sessions`
 - `/memory clear session <id>`
+- `/memory clear sessions <id1,id2,...>`
+- `/memory discard [session <id>|current] [aggressive]`
+- `/memory extract [session <id>|current] [maxEvents]`
+- `/memory prune [session <id>|current]`
 - `/memory dashboard`
 
 ### 5. Runtime data paths
