@@ -305,6 +305,16 @@ export const MemorySystemPlugin = ({ client }) => {
     const title = extractSessionTitle(event);
     if (!title) return;
     sessionTitleByID.set(sid, title);
+    // Keep dashboard title in sync with OpenCode title without creating
+    // new session files before the first user message.
+    if (hasSessionMemoryFile(sid)) {
+      const sessionData = loadSessionMemory(sid);
+      if (normalizeText(sessionData.sessionTitle || '') !== title) {
+        sessionData.sessionTitle = title;
+        persistSessionMemory(sessionData);
+        writeDashboardFiles();
+      }
+    }
   }
 
   function ensureDashboardDir() {
