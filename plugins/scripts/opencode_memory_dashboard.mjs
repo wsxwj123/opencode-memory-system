@@ -274,7 +274,7 @@ function serve() {
       return;
     }
     miss += 1;
-    if (miss >= 2) {
+    if (miss >= 12) {
       clearInterval(watchdog);
       process.exit(0);
     }

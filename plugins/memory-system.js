@@ -14,12 +14,12 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_SUMMARY_TRIGGER_EVENTS = 40;
   const AUTO_SUMMARY_KEEP_RECENT_EVENTS = 18;
   const AUTO_SUMMARY_MAX_CHARS = 2400;
-  const AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE = 1600;
+  const AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE = 2600;
   const AUTO_BODY_TOKEN_BUDGET = 50_000;
   const AUTO_BODY_BUDGET_SOFT_RATIO = 0.7;
   const AUTO_BODY_BUDGET_HARD_RATIO = 0.9;
   const AUTO_BODY_BUDGET_TARGET_RATIO = 0.75;
-  const AUTO_BODY_KEEP_RECENT_CONVO_EVENTS = 12;
+  const AUTO_BODY_KEEP_RECENT_CONVO_EVENTS = 20;
 
   // Injection strategy (token-saving defaults)
   const AUTO_INJECT_MEMORY_DOCS = false;
@@ -66,11 +66,14 @@ export const MemorySystemPlugin = ({ client }) => {
   // Runtime state
   const sessionRecallState = new Map();
   const sessionUserMessageCounters = new Map();
+  const sessionTitleByID = new Map();
+  const messageRoleByID = new Map();
+  const processedMessageKeys = new Set();
 
   // Recall trigger patterns
   const RECALL_TRIGGER_PATTERNS = [
     /另一个对话|另外一个对话|上一个对话|上次那个对话|之前那个对话|跨对话/i,
-    /另外的session|上一个session|之前的session|那个session/i,
+    /另外的session|上一个session|上一会话|上个会话|之前的session|那个session|刚刚那个会话|刚才那个会话|上个聊天/i,
     /in another chat|in previous chat|from previous session|other session/i
   ];
 
@@ -249,10 +252,12 @@ export const MemorySystemPlugin = ({ client }) => {
 
   function extractSessionID(event) {
     return (
-      event?.properties?.info?.id ||
+      event?.properties?.info?.sessionID ||
       event?.properties?.sessionID ||
+      event?.properties?.part?.sessionID ||
       event?.session?.id ||
       event?.data?.sessionID ||
+      event?.properties?.info?.id ||
       null
     );
   }
@@ -265,6 +270,41 @@ export const MemorySystemPlugin = ({ client }) => {
       event?.title ||
       ''
     );
+  }
+
+  function extractMessageID(event) {
+    return (
+      event?.properties?.info?.id ||
+      event?.properties?.messageID ||
+      event?.data?.messageID ||
+      event?.message?.id ||
+      null
+    );
+  }
+
+  function safeJsonPreview(value, max = 220) {
+    try {
+      return truncateText(normalizeText(JSON.stringify(value ?? {})), max);
+    } catch {
+      return '';
+    }
+  }
+
+  function extractMessageSummaryFromInfo(info) {
+    const title = normalizeText(String(info?.summary?.title || ''));
+    const body = normalizeText(String(info?.summary?.body || ''));
+    if (title && body) return truncateText(`${title} ${body}`, 400);
+    if (body) return truncateText(body, 400);
+    if (title) return truncateText(title, 400);
+    return '';
+  }
+
+  function maybeSetRuntimeSessionTitle(event) {
+    const sid = extractSessionID(event);
+    if (!sid) return;
+    const title = extractSessionTitle(event);
+    if (!title) return;
+    sessionTitleByID.set(sid, title);
   }
 
   function ensureDashboardDir() {
@@ -327,6 +367,14 @@ export const MemorySystemPlugin = ({ client }) => {
         lastAt: null,
         lastQuery: ''
       },
+      inject: {
+        globalPrefsCount: 0,
+        currentSummaryCount: 0,
+        triggerRecallCount: 0,
+        memoryDocsCount: 0,
+        lastAt: null,
+        lastReason: ''
+      },
       budget: {
         bodyTokenBudget: AUTO_BODY_TOKEN_BUDGET,
         lastEstimatedBodyTokens: 0,
@@ -345,6 +393,13 @@ export const MemorySystemPlugin = ({ client }) => {
         if (!normalizeText(data.sessionTitle || '')) {
           data.sessionTitle = deriveSessionTitleFromEvents(data);
         }
+        data.inject = data.inject || {};
+        data.inject.globalPrefsCount = Number(data.inject.globalPrefsCount || 0);
+        data.inject.currentSummaryCount = Number(data.inject.currentSummaryCount || 0);
+        data.inject.triggerRecallCount = Number(data.inject.triggerRecallCount || 0);
+        data.inject.memoryDocsCount = Number(data.inject.memoryDocsCount || 0);
+        data.inject.lastAt = data.inject.lastAt || null;
+        data.inject.lastReason = data.inject.lastReason || '';
         return data;
       }
     }
@@ -469,7 +524,13 @@ export const MemorySystemPlugin = ({ client }) => {
       tool: 0,
       other: 0
     };
-    const highlights = [];
+    const userHighlights = [];
+    const assistantHighlights = [];
+    const toolHighlights = [];
+    const decisionHints = [];
+    const riskHints = [];
+    const todoHints = [];
+    const seen = new Set();
 
     for (const ev of events) {
       if (ev?.kind === 'user-message') counts.user += 1;
@@ -477,14 +538,48 @@ export const MemorySystemPlugin = ({ client }) => {
       else if (ev?.kind === 'tool-result') counts.tool += 1;
       else counts.other += 1;
 
-      if (highlights.length < 8) {
-        const msg = truncateText(normalizeText(String(ev?.summary || '')), 140);
-        if (msg) highlights.push(`- ${ev?.kind || 'event'}: ${msg}`);
+      const msg = truncateText(normalizeText(String(ev?.summary || '')), 160);
+      if (!msg) continue;
+      if (seen.has(msg)) continue;
+      seen.add(msg);
+
+      if (ev?.kind === 'user-message' && userHighlights.length < 4) userHighlights.push(msg);
+      if (ev?.kind === 'assistant-message' && assistantHighlights.length < 4) assistantHighlights.push(msg);
+      if (ev?.kind === 'tool-result' && toolHighlights.length < 4) {
+        const tool = ev?.tool ? `[${ev.tool}] ` : '';
+        toolHighlights.push(`${tool}${msg}`);
+      }
+
+      if (decisionHints.length < 4 && /决定|采用|使用|必须|约束|计划|方案|将会|will|must|plan|decide/i.test(msg)) {
+        decisionHints.push(msg);
+      }
+      if (riskHints.length < 3 && /错误|失败|冲突|超时|缺失|问题|风险|error|failed|conflict|timeout|missing/i.test(msg)) {
+        riskHints.push(msg);
+      }
+      if (todoHints.length < 3 && /待办|下一步|后续|需要|TODO|next|follow[- ]?up/i.test(msg)) {
+        todoHints.push(msg);
       }
     }
 
-    const header = `[${new Date().toISOString()}] compressed ${events.length} events (u=${counts.user}, a=${counts.assistant}, t=${counts.tool}, o=${counts.other})`;
-    return [header, ...highlights].join('\n');
+    const keyFacts = [...userHighlights, ...assistantHighlights].slice(0, 6);
+    const lines = [];
+    lines.push(`## Structured Session Summary`);
+    lines.push(`- window: ${new Date().toISOString()} · events=${events.length} (u=${counts.user}, a=${counts.assistant}, t=${counts.tool}, o=${counts.other})`);
+    lines.push(`- key facts:`);
+    if (keyFacts.length) keyFacts.forEach((x) => lines.push(`  - ${x}`));
+    else lines.push(`  - no stable key fact extracted`);
+    lines.push(`- tool execution:`);
+    if (toolHighlights.length) toolHighlights.forEach((x) => lines.push(`  - ${x}`));
+    else lines.push(`  - no tool result in this window`);
+    lines.push(`- decisions/constraints:`);
+    if (decisionHints.length) decisionHints.forEach((x) => lines.push(`  - ${x}`));
+    else lines.push(`  - no explicit decision captured`);
+    lines.push(`- todo/risks:`);
+    if (todoHints.length) todoHints.forEach((x) => lines.push(`  - TODO: ${x}`));
+    if (riskHints.length) riskHints.forEach((x) => lines.push(`  - RISK: ${x}`));
+    if (!todoHints.length && !riskHints.length) lines.push(`  - none detected`);
+
+    return lines.join('\n');
   }
 
   function compressSessionMemory(sessionData) {
@@ -566,7 +661,7 @@ export const MemorySystemPlugin = ({ client }) => {
       const compactable = convoIndices.slice(0, keepFrom);
       if (!compactable.length) break;
 
-      const batchSize = estimated >= hardLimit ? 16 : 8;
+      const batchSize = estimated >= hardLimit ? 10 : 6;
       const selected = compactable.slice(0, batchSize);
       const selectedSet = new Set(selected);
       const toCompress = selected.map((idx) => sessionData.recentEvents[idx]).filter(Boolean);
@@ -650,6 +745,10 @@ export const MemorySystemPlugin = ({ client }) => {
       const sessionData = loadSessionMemory(sessionID, projectName);
       const titleFromEvent = extractSessionTitle(rawEvent);
       if (titleFromEvent) sessionData.sessionTitle = titleFromEvent;
+      if (!normalizeText(sessionData.sessionTitle || '')) {
+        const runtimeTitle = sessionTitleByID.get(sessionID) || '';
+        if (runtimeTitle) sessionData.sessionTitle = runtimeTitle;
+      }
       const cleanSummary = truncateText(normalizeText(summary || ''));
       const fp = stableFingerprint(kind, cleanSummary, sessionID, toolName);
 
@@ -694,6 +793,56 @@ export const MemorySystemPlugin = ({ client }) => {
     const t = normalizeText(String(text || ''));
     if (!t) return false;
     return RECALL_TRIGGER_PATTERNS.some((re) => re.test(t));
+  }
+
+  async function processUserMessageEvent(sessionID, text, rawEvent) {
+    const clean = normalizeText(String(text || ''));
+    const isFirstUserMessageForSession = !hasSessionMemoryFile(sessionID);
+
+    if (isFirstUserMessageForSession) {
+      appendAutoEvent({
+        sessionID,
+        kind: 'session-start',
+        summary: 'Session created',
+        rawEvent
+      });
+
+      if (AUTO_INJECT_MEMORY_DOCS) {
+        await injectMemoryText(sessionID, memoryDocs, 'memory-docs');
+      }
+
+      if (AUTO_INJECT_GLOBAL_PREFS_ON_SESSION_START) {
+        const globalText = buildGlobalPrefsContextText();
+        if (globalText) await injectMemoryText(sessionID, globalText, 'global-prefs');
+      }
+    }
+
+    if (clean) {
+      appendAutoEvent({
+        sessionID,
+        kind: 'user-message',
+        summary: clean,
+        rawEvent
+      });
+    }
+
+    const currentCount = (sessionUserMessageCounters.get(sessionID) || 0) + 1;
+    sessionUserMessageCounters.set(sessionID, currentCount);
+
+    if (
+      AUTO_CURRENT_SESSION_SUMMARY_ENABLED &&
+      currentCount >= AUTO_CURRENT_SESSION_REFRESH_EVERY &&
+      currentCount % AUTO_CURRENT_SESSION_REFRESH_EVERY === 0
+    ) {
+      const currentSummary = buildCurrentSessionSummaryText(sessionID);
+      if (currentSummary) {
+        await injectMemoryText(sessionID, currentSummary, 'current-session-refresh');
+      }
+    }
+
+    if (AUTO_RECALL_ENABLED && clean && shouldTriggerRecall(clean)) {
+      await maybeInjectTriggerRecall(sessionID, clean);
+    }
   }
 
   function scoreSessionForQuery(sessionData, queryTokens) {
@@ -790,13 +939,52 @@ export const MemorySystemPlugin = ({ client }) => {
   async function injectMemoryText(sessionID, text, reason = 'memory-inject') {
     try {
       if (!sessionID || !text) return;
-      await client.session.prompt({
-        path: { id: sessionID },
-        body: {
-          noReply: true,
-          parts: [{ type: 'text', text, synthetic: true }]
+      const noteInject = () => {
+        const mem = loadSessionMemory(sessionID);
+        mem.inject = mem.inject || {};
+        if (reason === 'global-prefs') mem.inject.globalPrefsCount = Number(mem.inject.globalPrefsCount || 0) + 1;
+        if (reason === 'current-session-refresh') mem.inject.currentSummaryCount = Number(mem.inject.currentSummaryCount || 0) + 1;
+        if (reason === 'trigger-recall') mem.inject.triggerRecallCount = Number(mem.inject.triggerRecallCount || 0) + 1;
+        if (reason === 'memory-docs') mem.inject.memoryDocsCount = Number(mem.inject.memoryDocsCount || 0) + 1;
+        mem.inject.lastAt = new Date().toISOString();
+        mem.inject.lastReason = String(reason || 'memory-inject');
+        persistSessionMemory(mem);
+        writeDashboardFiles();
+      };
+      if (client?.session && typeof client.session.prompt === 'function') {
+        await client.session.prompt({
+          path: { id: sessionID },
+          body: {
+            noReply: true,
+            parts: [{ type: 'text', text, synthetic: true }]
+          }
+        });
+        noteInject();
+        return;
+      }
+
+      if (client?.session && typeof client.session.update === 'function') {
+        try {
+          await client.session.update(sessionID, {
+            noReply: true,
+            parts: [{ type: 'text', text, synthetic: true }]
+          });
+          noteInject();
+          return;
+        } catch {
+          await client.session.update({
+            path: { id: sessionID },
+            body: {
+              noReply: true,
+              parts: [{ type: 'text', text, synthetic: true }]
+            }
+          });
+          noteInject();
+          return;
         }
-      });
+      }
+
+      console.error(`memory-system inject skipped (${reason}): no supported client.session method`);
     } catch (err) {
       console.error(`memory-system inject failed (${reason}):`, err);
     }
@@ -848,10 +1036,9 @@ export const MemorySystemPlugin = ({ client }) => {
     if (summary) pushLineWithLimit(lines, `compressed: ${summary}`, state);
 
     const recent = s.recentEvents.slice(-AUTO_CURRENT_SESSION_SUMMARY_MAX_EVENTS);
-    for (const ev of recent) {
-      const msg = truncateText(normalizeText(String(ev?.summary || '')), 160);
-      if (!msg) continue;
-      pushLineWithLimit(lines, `- ${ev?.kind || 'event'}: ${msg}`, state);
+    const structured = buildCompressedChunk(recent);
+    for (const row of structured.split('\n')) {
+      pushLineWithLimit(lines, row, state);
     }
 
     pushLineWithLimit(lines, '</OPENCODE_CURRENT_SESSION_SUMMARY>', state);
@@ -927,6 +1114,14 @@ export const MemorySystemPlugin = ({ client }) => {
         recall: {
           count: Number(sess?.recall?.count || 0),
           lastAt: sess?.recall?.lastAt || null
+        },
+        inject: {
+          globalPrefsCount: Number(sess?.inject?.globalPrefsCount || 0),
+          currentSummaryCount: Number(sess?.inject?.currentSummaryCount || 0),
+          triggerRecallCount: Number(sess?.inject?.triggerRecallCount || 0),
+          memoryDocsCount: Number(sess?.inject?.memoryDocsCount || 0),
+          lastAt: sess?.inject?.lastAt || null,
+          lastReason: sess?.inject?.lastReason || ''
         },
         budget: {
           bodyTokenBudget: Number(sess?.budget?.bodyTokenBudget || AUTO_BODY_TOKEN_BUDGET),
@@ -1050,7 +1245,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    </div>',
       '  </div>',
       '  <script>',
-      '    const DATA = ' + payload + ';',
+      '    let DATA = ' + payload + ';',
       '    const $ = (id) => document.getElementById(id);',
       '    const projectList = $("projectList");',
       '    const sessionList = $("sessionList");',
@@ -1061,19 +1256,32 @@ export const MemorySystemPlugin = ({ client }) => {
       '    const I18N = { zh:{title:"记忆看板",lang:"语言",global:"全局偏好",token:"Token 估算为近似值（chars/4）",edit:"编辑摘要",del:"删除会话",nos:"暂无会话",noproj:"暂无项目记忆",save:"保存",cancel:"取消"}, en:{title:"Memory Dashboard",lang:"Language",global:"Global Preferences",token:"Token estimate is approximate (chars/4).",edit:"Edit summary",del:"Delete session",nos:"No sessions.",noproj:"No project memory yet.",save:"Save",cancel:"Cancel"} };',
       '    let LANG = localStorage.getItem("memory_dashboard_lang") || "zh";',
       '    function t(k){ return (I18N[LANG]&&I18N[LANG][k]) || (I18N.en&&I18N.en[k]) || k; }',
-      '    $("genAt").textContent = "Generated: " + new Date(DATA.generatedAt).toLocaleString();',
-      '    $("mProjects").textContent = DATA.summary.projectCount;',
-      '    $("mSessions").textContent = DATA.summary.sessionCount;',
-      '    $("mEvents").textContent = DATA.summary.eventCount;',
+      '    function updateMetrics(){',
+      '      const gen = DATA && DATA.generatedAt ? new Date(DATA.generatedAt).toLocaleString() : "-";',
+      '      $("genAt").textContent = "Generated: " + gen;',
+      '      const s = (DATA && DATA.summary) || {projectCount:0,sessionCount:0,eventCount:0};',
+      '      $("mProjects").textContent = s.projectCount || 0;',
+      '      $("mSessions").textContent = s.sessionCount || 0;',
+      '      $("mEvents").textContent = s.eventCount || 0;',
+      '    }',
+      '    async function refreshDashboardData(){',
+      '      try {',
+      '        const r = await fetch("/api/dashboard", { cache: "no-store" });',
+      '        if (r.ok) DATA = await r.json();',
+      '      } catch (_) {}',
+      '      updateMetrics();',
+      '      renderGlobalPrefs();',
+      '      renderProjects();',
+      '    }',
       '    async function apiPost(url,payload){ const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); if(!r.ok) throw new Error(await r.text()); return r.json(); }',
       '    async function editSummary(projectName,sessionID,current){ const modal=$("editModal"); const ta=$("editTextarea"); const saveBtn=$("editSaveBtn"); const cancelBtn=$("editCancelBtn"); $("editTitle").textContent=t("edit")+" - "+sessionID; ta.value=current||""; $("editCancelBtn").textContent=t("cancel"); $("editSaveBtn").textContent=t("save"); modal.style.display="flex"; const close=()=>{ modal.style.display="none"; }; cancelBtn.onclick=close; saveBtn.onclick=async()=>{ if(!window.confirm("Apply summary update and write audit log?")) return; try{ await apiPost("/api/memory/session/summary",{projectName,sessionID,summaryText:ta.value,confirm:true,source:"dashboard"}); close(); window.location.reload(); }catch(e){ alert("Update failed: "+e.message);} }; }',
       '    async function deleteSession(projectName,sessionID){ if(!window.confirm("Delete this session memory file? This writes an audit log.")) return; try{ await apiPost("/api/memory/session/delete",{projectName,sessionID,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Delete failed: "+e.message);} }',
       '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); }',
       '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); if(!entries.length){globalPrefs.textContent=t("noproj")==="No project memory yet."?"No global preferences.":"暂无全局偏好"; return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
-      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sid=document.createElement("div"); sid.className="session-id"; sid.textContent=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:s.sessionID||""; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; st.textContent="id:"+(s.sessionID||"")+" · u:"+(s.stats.userMessages||0)+" · a:"+(s.stats.assistantMessages||0)+" · t:"+(s.stats.toolResults||0)+" · r:"+((s.recall&&s.recall.count)||0)+" · body~"+bt+" tokens"; head.appendChild(sid); head.appendChild(st); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; meta.textContent="compressed summary"+reason; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); }',
+      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sid=document.createElement("div"); sid.className="session-id"; sid.textContent=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:s.sessionID||""; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; st.textContent="id:"+(s.sessionID||"")+" · u:"+(s.stats.userMessages||0)+" · a:"+(s.stats.assistantMessages||0)+" · t:"+(s.stats.toolResults||0)+" · r:"+((s.recall&&s.recall.count)||0)+" · i:g"+ig+"/c"+ic+"/x"+ir+" · body~"+bt+" tokens"; head.appendChild(sid); head.appendChild(st); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; meta.textContent="compressed summary"+reason; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); }',
       '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent="sessions="+project.sessionCount+" · events="+project.totalEvents+" · tech="+ts; renderSessions(project); }',
       '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent="sessions="+p.sessionCount+" · events="+p.totalEvents; item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
-      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=langSel.value; localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); }; applyLang(); renderGlobalPrefs(); renderProjects();',
+      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=langSel.value; localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); }; applyLang(); refreshDashboardData();',
       '  </script>',
       '</body>',
       '</html>'
@@ -1134,8 +1342,27 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           required: ['command']
         },
         execute: async ({ command, args = [] }) => {
+          const memoryHelp = [
+            'Memory commands:',
+            '- learn',
+            '- project',
+            '- global',
+            '- set <key> <value>',
+            '- save snippet <name>',
+            '- export project',
+            '- import <filepath>',
+            '- clear session <id>|project|all',
+            '- edit project',
+            '- feedback <text>',
+            '- recall <query>',
+            '- sessions',
+            '- dashboard [path|build|json]'
+          ].join('\n');
           const projectMemoryPath = getProjectMemoryPath();
           const projectName = getProjectName();
+          if (!command || typeof command !== 'string') {
+            return memoryHelp;
+          }
 
           switch (command) {
             case 'learn': {
@@ -1336,7 +1563,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
             }
 
             default:
-              return `Unknown memory command: ${command}`;
+              return `Unknown memory command: ${command}\n\n${memoryHelp}`;
           }
         }
       },
@@ -1359,6 +1586,15 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           required: ['command']
         },
         execute: async ({ command, args = [] }) => {
+          const contextHelp = [
+            'Context commands:',
+            '- add <text>',
+            '- view',
+            '- clear'
+          ].join('\n');
+          if (!command || typeof command !== 'string') {
+            return contextHelp;
+          }
           switch (command) {
             case 'add':
               return `Added to context: ${args.join(' ')}`;
@@ -1367,7 +1603,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
             case 'clear':
               return 'Session context cleared.';
             default:
-              return `Unknown context command: ${command}`;
+              return `Unknown context command: ${command}\n\n${contextHelp}`;
           }
         }
       },
@@ -1382,12 +1618,93 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
     event: async ({ event }) => {
       const sessionID = extractSessionID(event);
 
+      if (event.type === 'session.created' || event.type === 'session.updated') {
+        maybeSetRuntimeSessionTitle(event);
+      }
+
       if (event.type === 'session.created' && sessionID) {
         sessionUserMessageCounters.set(sessionID, 0);
         return;
       }
 
       if (!sessionID) return;
+
+      if (event.type === 'message.updated') {
+        const info = event?.properties?.info || {};
+        const role = info?.role === 'assistant' ? 'assistant' : info?.role === 'user' ? 'user' : '';
+        const messageID = extractMessageID(event);
+        if (!role || !messageID) return;
+
+        const roleKey = `${sessionID}:${messageID}`;
+        messageRoleByID.set(roleKey, role);
+
+        const dedupeKey = `msg:${roleKey}:${role}`;
+        if (processedMessageKeys.has(dedupeKey)) return;
+        processedMessageKeys.add(dedupeKey);
+
+        const text = extractMessageSummaryFromInfo(info);
+        if (role === 'user') {
+          await processUserMessageEvent(sessionID, text, event);
+          return;
+        }
+
+        if (text) {
+          appendAutoEvent({
+            sessionID,
+            kind: 'assistant-message',
+            summary: text,
+            rawEvent: event
+          });
+        }
+        return;
+      }
+
+      if (event.type === 'message.part.updated') {
+        const part = event?.properties?.part;
+        if (!part || !part.messageID) return;
+
+        const role = messageRoleByID.get(`${sessionID}:${part.messageID}`) || 'assistant';
+
+        if (part.type === 'text') {
+          const text = extractContentText(part.text || event?.properties?.delta || '');
+          if (!text) return;
+          if (role === 'user') {
+            await processUserMessageEvent(sessionID, text, event);
+            return;
+          }
+          appendAutoEvent({
+            sessionID,
+            kind: role === 'user' ? 'user-message' : 'assistant-message',
+            summary: text,
+            rawEvent: event
+          });
+          return;
+        }
+
+        if (part.type === 'tool') {
+          const toolName = part.tool || 'unknown-tool';
+          const inputPreview = safeJsonPreview(part?.state?.input, 220);
+          const outputPreview = truncateText(
+            normalizeText(
+              part?.state?.output ||
+                part?.state?.error ||
+                safeJsonPreview(part?.state, 260)
+            ),
+            260
+          );
+
+          appendAutoEvent({
+            sessionID,
+            kind: 'tool-result',
+            toolName,
+            summary: `[${toolName}] input=${inputPreview} output=${outputPreview}`,
+            rawEvent: event
+          });
+          return;
+        }
+
+        return;
+      }
 
       if (event.type === 'user.message') {
         const text = extractContentText(event?.data?.content || event?.content || event?.data?.text || '');
@@ -1480,6 +1797,13 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
         });
         sessionUserMessageCounters.delete(sessionID);
         sessionRecallState.delete(sessionID);
+        sessionTitleByID.delete(sessionID);
+      }
+
+      if (event.type === 'session.deleted') {
+        sessionUserMessageCounters.delete(sessionID);
+        sessionRecallState.delete(sessionID);
+        sessionTitleByID.delete(sessionID);
       }
     }
   };
