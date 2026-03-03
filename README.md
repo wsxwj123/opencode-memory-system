@@ -17,6 +17,7 @@
 - 全局记忆：偏好/片段等全局信息单独保存
 - 半自动注入：按策略注入当前会话摘要，支持手动 recall
 - 自动裁剪：内置 DCP 风格 `discard/extract/prune` 机制
+- 多模型参数兼容：兼容 OpenAI / Gemini / Anthropic 常见工具参数形态
 - 本地看板：查看、编辑、删除记忆（带审计日志）
 - 批量删除：在 `37777` 勾选会话条目后批量删除
 - 生命周期联动：默认监听 OpenCode `4096`，控制看板 `37777`
@@ -97,6 +98,7 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 #### 5.2 手动命令（可选）
 
 - `/memory recall <关键词>`：手动跨会话召回
+- `/memory prefer <key> <value>`：写入全局偏好（推荐，最稳）
 - `/memory sessions`：查看会话记忆列表
 - `/memory clear session <id>`：删除某个 session 记忆
 - `/memory clear sessions <id1,id2,...>`：批量删除多个 session 记忆
@@ -184,6 +186,19 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 
 - 这是“可见模式”提示，表示注入/裁剪动作已执行
 - 新版本会做合并去抖：同一波操作仅显示最新一条，避免刷屏
+- 当前默认：`AUTO_VISIBLE_NOTICES=false`（默认不向会话插入可见提示）
+
+#### 8.6 37777 页面数据是静态还是动态
+
+- 页面内容通过 `GET /api/dashboard` 动态拉取
+- 自动刷新间隔 `60s`
+- 标签页切回前台时，仅在距离上次刷新 `>=60s` 才会拉取
+
+#### 8.7 Session 列表布局说明
+
+- 每条 session 头部现在是左对齐布局
+- 第一行显示：`标题 + id`
+- 第二行显示：统计信息（`u/a/t/r/注入/最近注入/prune/正文token`）
 
 ---
 
@@ -210,6 +225,7 @@ This plugin provides local memory for OpenCode with:
 - Cross-session recall (intent-triggered + manual)
 - Token budget compaction
 - DCP-style pruning (`discard/extract/prune`)
+- OpenAI/Gemini/Anthropic-style tool payload compatibility
 - Dashboard with edit/delete/batch-delete + audit log (`37777`)
 - Dashboard lifecycle synced to OpenCode web lifecycle (`4096` by default)
 
@@ -240,10 +256,12 @@ Typical paths:
 - Dashboard: `http://127.0.0.1:37777`
 - Stop OpenCode -> dashboard stops in ~10-20s
 - Dashboard auto-refresh interval: `60s` (tab-focus refresh only if >=60s since last refresh)
+- Dashboard data source is dynamic: `/api/dashboard` (not static-only snapshot rendering)
 
 ### 4. Commands
 
 - `/memory recall <query>`
+- `/memory prefer <key> <value>`
 - `/memory sessions`
 - `/memory clear session <id>`
 - `/memory clear sessions <id1,id2,...>`
