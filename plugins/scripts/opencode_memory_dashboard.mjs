@@ -61,6 +61,152 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
+function normalizeText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function truncateText(value, max = 240) {
+  const s = String(value || '');
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}...`;
+}
+
+function sanitizeCompressedSummaryText(value) {
+  let s = String(value || '');
+  if (!s) return '';
+  if (!s.includes('\n') && /## Structured Session Summary/i.test(s)) {
+    s = s
+      .replace(/\s-\swindow:/gi, '\n- window:')
+      .replace(/\s-\skey facts:/gi, '\n- key facts:')
+      .replace(/\s-\stool execution:/gi, '\n- tool execution:')
+      .replace(/\s-\sdecisions\/constraints:/gi, '\n- decisions/constraints:')
+      .replace(/\s-\stodo\/risks:/gi, '\n- todo/risks:')
+      .replace(/\s## Structured Session Summary/gi, '\n## Structured Session Summary');
+  }
+  return s
+    .split('\n')
+    .map((x) => x.trimEnd())
+    .filter((line) => {
+      const t = normalizeText(line);
+      if (!t) return false;
+      if (/<OPENCODE_[A-Z_]+/i.test(t) || /<\/OPENCODE_[A-Z_]+>/i.test(t)) return false;
+      if (/EXTREMELY_IMPORTANT|using-superpowers|OPENCODE_KNOWLEDGE_BASE/i.test(t)) return false;
+      return true;
+    })
+    .join('\n')
+    .trim();
+}
+
+function listProjectNames() {
+  try {
+    return fs
+      .readdirSync(projectsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    return [];
+  }
+}
+
+function readProjectSessions(projectName) {
+  const dir = path.join(projectsDir, projectName, 'sessions');
+  let files = [];
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  } catch {
+    files = [];
+  }
+  const sessions = [];
+  for (const f of files) {
+    const obj = safeReadJson(path.join(dir, f));
+    if (!obj || !obj.sessionID) continue;
+    const stats = obj.stats || {};
+    sessions.push({
+      sessionID: obj.sessionID,
+      sessionTitle: normalizeText(obj.sessionTitle || ''),
+      createdAt: obj.createdAt || null,
+      updatedAt: obj.updatedAt || null,
+      stats: {
+        userMessages: Number(stats.userMessages || 0),
+        assistantMessages: Number(stats.assistantMessages || 0),
+        toolResults: Number(stats.toolResults || 0),
+        systemEvents: Number(stats.systemEvents || 0)
+      },
+      recentEvents: Array.isArray(obj.recentEvents) ? obj.recentEvents.slice(-12) : [],
+      summary: {
+        compressedEvents: Number(obj?.summary?.compressedEvents || 0),
+        lastCompressedAt: obj?.summary?.lastCompressedAt || null,
+        compressedText: sanitizeCompressedSummaryText(obj?.summary?.compressedText || ''),
+        compressedPreview: truncateText(sanitizeCompressedSummaryText(obj?.summary?.compressedText || ''), 240)
+      },
+      recall: {
+        count: Number(obj?.recall?.count || 0),
+        lastAt: obj?.recall?.lastAt || null
+      },
+      inject: {
+        globalPrefsCount: Number(obj?.inject?.globalPrefsCount || 0),
+        currentSummaryCount: Number(obj?.inject?.currentSummaryCount || 0),
+        triggerRecallCount: Number(obj?.inject?.triggerRecallCount || 0),
+        memoryDocsCount: Number(obj?.inject?.memoryDocsCount || 0),
+        lastAt: obj?.inject?.lastAt || null,
+        lastReason: obj?.inject?.lastReason || ''
+      },
+      budget: {
+        bodyTokenBudget: Number(obj?.budget?.bodyTokenBudget || 50000),
+        lastEstimatedBodyTokens: Number(obj?.budget?.lastEstimatedBodyTokens || 0),
+        lastCompactedAt: obj?.budget?.lastCompactedAt || null,
+        lastCompactionReason: obj?.budget?.lastCompactionReason || ''
+      }
+    });
+  }
+  sessions.sort((a, b) => (Date.parse(b.updatedAt || 0) || 0) - (Date.parse(a.updatedAt || 0) || 0));
+  return sessions;
+}
+
+function buildLiveDashboardData() {
+  const projects = [];
+  for (const name of listProjectNames()) {
+    const meta = safeReadJson(projectMetaPathFrom(name)) || {};
+    const sessions = readProjectSessions(name);
+    const totalEvents = sessions.reduce(
+      (acc, s) => acc + (s.recentEvents?.length || 0) + Number(s?.summary?.compressedEvents || 0),
+      0
+    );
+    projects.push({
+      name,
+      path: path.join(projectsDir, name, 'memory.json'),
+      lastLearned: meta?.lastLearned || null,
+      techStack: Array.isArray(meta?.techStack) ? meta.techStack : [],
+      sessionCount: sessions.length,
+      totalEvents,
+      sessions
+    });
+  }
+  projects.sort((a, b) => {
+    const ta = Date.parse((a.sessions[0] && a.sessions[0].updatedAt) || a.lastLearned || 0) || 0;
+    const tb = Date.parse((b.sessions[0] && b.sessions[0].updatedAt) || b.lastLearned || 0) || 0;
+    return tb - ta;
+  });
+
+  const global = (safeReadJson(path.join(memoryDir, 'global.json')) || {});
+  const data = {
+    generatedAt: new Date().toISOString(),
+    global: {
+      preferences: global?.preferences && typeof global.preferences === 'object' ? global.preferences : {},
+      snippets: global?.snippets && typeof global.snippets === 'object' ? global.snippets : {},
+      feedback: Array.isArray(global?.feedback) ? global.feedback : []
+    },
+    projects,
+    summary: {
+      projectCount: projects.length,
+      sessionCount: projects.reduce((acc, p) => acc + Number(p.sessionCount || 0), 0),
+      eventCount: projects.reduce((acc, p) => acc + Number(p.totalEvents || 0), 0)
+    }
+  };
+  writeJson(dataPath, data);
+  return data;
+}
+
 async function readJsonBody(req) {
   return await new Promise((resolve, reject) => {
     let data = '';
@@ -346,11 +492,8 @@ function serve() {
     const rawPath = decodeURIComponent((req.url || '/').split('?')[0]);
 
     if (method === 'GET' && rawPath === '/api/dashboard') {
-      if (!fs.existsSync(dataPath)) {
-        sendJson(res, 404, { error: 'dashboard data not found, run /memory dashboard build first' });
-        return;
-      }
-      sendJson(res, 200, safeReadJson(dataPath) || {});
+      const live = buildLiveDashboardData();
+      sendJson(res, 200, live);
       return;
     }
 

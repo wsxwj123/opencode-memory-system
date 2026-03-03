@@ -73,7 +73,8 @@ export const MemorySystemPlugin = ({ client }) => {
   // Recall trigger patterns
   const RECALL_TRIGGER_PATTERNS = [
     /另一个对话|另外一个对话|上一个对话|上次那个对话|之前那个对话|跨对话/i,
-    /另外的session|上一个session|上一会话|上个会话|之前的session|那个session|刚刚那个会话|刚才那个会话|上个聊天/i,
+    /刚刚的会话|刚刚会话|之前的会话|之前会话|刚才的会话|刚才会话|刚在另一个会话|刚在那个会话|另一个会话|那个会话|前一个会话|上个对话|上一个会话|刚刚那个聊天|刚刚的那个聊天|那个聊天|前一个聊天|上一个聊天|另一个session|另外的session|上一个session|上一会话|上个会话|之前的session|那个session|刚刚那个会话|刚才那个会话|上个聊天|上次会话/i,
+    /刚才在另一个会话|我刚才在另一个会话|刚刚在另一个会话|之前在另一个会话/i,
     /in another chat|in previous chat|from previous session|other session/i
   ];
 
@@ -176,6 +177,73 @@ export const MemorySystemPlugin = ({ client }) => {
     return value.replace(/\s+/g, ' ').trim();
   }
 
+  function truncateFromEnd(value, max = AUTO_MAX_EVENT_TEXT) {
+    if (typeof value !== 'string') return '';
+    if (value.length <= max) return value;
+    return `...${value.slice(value.length - max + 3)}`;
+  }
+
+  function isMemoryInjectionText(value) {
+    const s = String(value || '');
+    return /<OPENCODE_[A-Z_]+/i.test(s) || /<\/OPENCODE_[A-Z_]+>/i.test(s);
+  }
+
+  function stripMemoryInjectionMarkers(value) {
+    const s = String(value || '');
+    return s
+      .split('\n')
+      .filter((line) => !isMemoryInjectionText(line))
+      .join('\n')
+      .trim();
+  }
+
+  function isSummaryNoiseText(value) {
+    const s = String(value || '');
+    if (!s) return true;
+    if (isMemoryInjectionText(s)) return true;
+    return /EXTREMELY_IMPORTANT|using-superpowers|superpowers skill content|OpenCode Memory System|OPENCODE_KNOWLEDGE_BASE|我主要功能包括|我可以帮你完成以下任务|我的工具\/能力|我没有\"?插件\"?/i.test(s);
+  }
+
+  function sanitizeCompressedSummaryText(value) {
+    let base = stripMemoryInjectionMarkers(String(value || ''));
+    if (!base) return '';
+
+    // Repair legacy summaries that were flattened into a single line.
+    if (!base.includes('\n') && /## Structured Session Summary/i.test(base)) {
+      base = base
+        .replace(/\s-\swindow:/gi, '\n- window:')
+        .replace(/\s-\skey facts:/gi, '\n- key facts:')
+        .replace(/\s-\stool execution:/gi, '\n- tool execution:')
+        .replace(/\s-\sdecisions\/constraints:/gi, '\n- decisions/constraints:')
+        .replace(/\s-\stodo\/risks:/gi, '\n- todo/risks:')
+        .replace(/\s## Structured Session Summary/gi, '\n## Structured Session Summary');
+    }
+
+    return base
+      .split('\n')
+      .filter((line) => {
+        const text = normalizeText(line);
+        if (!text) return false;
+        if (/^## Structured Session Summary$/i.test(text)) return true;
+        if (/^- (window|key facts|tool execution|decisions\/constraints|todo\/risks):/i.test(text)) return true;
+        if (/^[- ]{0,2}(TODO:|RISK:)/i.test(text)) return true;
+        if (isSummaryNoiseText(text)) return false;
+        return true;
+      })
+      .join('\n')
+      .trim();
+  }
+
+  function isCorruptedSummaryText(value) {
+    const s = String(value || '');
+    if (!s) return false;
+    if (/<OPENCODE_[A-Z_]+/i.test(s)) return true;
+    if (/EXTREMELY_IMPORTANT|using-superpowers|OPENCODE_KNOWLEDGE_BASE/i.test(s)) return true;
+    if (!s.includes('\n') && /## Structured Session Summary/i.test(s)) return true;
+    if ((s.match(/## Structured Session Summary/gi) || []).length >= 2) return true;
+    return false;
+  }
+
   function estimateTokensFromText(text) {
     const chars = String(text || '').length;
     if (chars <= 0) return 0;
@@ -184,10 +252,18 @@ export const MemorySystemPlugin = ({ client }) => {
 
   function deriveSessionTitleFromEvents(sessionData) {
     const events = Array.isArray(sessionData?.recentEvents) ? sessionData.recentEvents : [];
-    const firstUser = events.find((ev) => ev?.kind === 'user-message' && normalizeText(String(ev?.summary || '')));
+    const firstUser = events.find((ev) => {
+      if (ev?.kind !== 'user-message') return false;
+      const s = normalizeText(String(ev?.summary || ''));
+      return s && !isSummaryNoiseText(s);
+    });
     if (firstUser) return truncateText(normalizeText(String(firstUser.summary || '')), 60);
 
-    const firstAssistant = events.find((ev) => ev?.kind === 'assistant-message' && normalizeText(String(ev?.summary || '')));
+    const firstAssistant = events.find((ev) => {
+      if (ev?.kind !== 'assistant-message') return false;
+      const s = normalizeText(String(ev?.summary || ''));
+      return s && !isSummaryNoiseText(s);
+    });
     if (firstAssistant) return truncateText(normalizeText(String(firstAssistant.summary || '')), 60);
 
     return '';
@@ -272,6 +348,16 @@ export const MemorySystemPlugin = ({ client }) => {
     );
   }
 
+  function extractSessionCwd(event) {
+    return normalizeText(
+      event?.session?.cwd ||
+      event?.properties?.info?.cwd ||
+      event?.properties?.cwd ||
+      event?.data?.cwd ||
+      ''
+    );
+  }
+
   function extractMessageID(event) {
     return (
       event?.properties?.info?.id ||
@@ -349,7 +435,7 @@ export const MemorySystemPlugin = ({ client }) => {
       stats: legacy.stats || emptyStats(),
       recentEvents: Array.isArray(legacy.recentEvents) ? legacy.recentEvents : [],
       summary: {
-        compressedText: normalizeText(String(legacy.summary?.compressedText || legacy.lastSummary || '')),
+        compressedText: sanitizeCompressedSummaryText(String(legacy.summary?.compressedText || legacy.lastSummary || '')),
         compressedEvents: Number(legacy.summary?.compressedEvents || 0),
         lastCompressedAt: legacy.summary?.lastCompressedAt || null
       },
@@ -362,6 +448,7 @@ export const MemorySystemPlugin = ({ client }) => {
     return {
       sessionID,
       sessionTitle: '',
+      sessionCwd: normalizeText(process.cwd()),
       project: projectName,
       createdAt: now,
       updatedAt: now,
@@ -383,7 +470,8 @@ export const MemorySystemPlugin = ({ client }) => {
         triggerRecallCount: 0,
         memoryDocsCount: 0,
         lastAt: null,
-        lastReason: ''
+        lastReason: '',
+        lastStatus: ''
       },
       budget: {
         bodyTokenBudget: AUTO_BODY_TOKEN_BUDGET,
@@ -403,6 +491,17 @@ export const MemorySystemPlugin = ({ client }) => {
         if (!normalizeText(data.sessionTitle || '')) {
           data.sessionTitle = deriveSessionTitleFromEvents(data);
         }
+        data.summary = data.summary || {};
+        const rawSummary = String(data?.summary?.compressedText || '');
+        const cleanSummary = sanitizeCompressedSummaryText(rawSummary);
+        if (!normalizeText(data.sessionCwd || '')) data.sessionCwd = normalizeText(process.cwd());
+        if (isCorruptedSummaryText(rawSummary) && Array.isArray(data.recentEvents) && data.recentEvents.length) {
+          // Rebuild from recent events to avoid carrying broken legacy summaries forever.
+          data.summary.compressedText = buildCompressedChunk(data.recentEvents.slice(-36), data) || cleanSummary;
+          data.summary.lastCompressedAt = new Date().toISOString();
+        } else {
+          data.summary.compressedText = cleanSummary;
+        }
         data.inject = data.inject || {};
         data.inject.globalPrefsCount = Number(data.inject.globalPrefsCount || 0);
         data.inject.currentSummaryCount = Number(data.inject.currentSummaryCount || 0);
@@ -410,6 +509,7 @@ export const MemorySystemPlugin = ({ client }) => {
         data.inject.memoryDocsCount = Number(data.inject.memoryDocsCount || 0);
         data.inject.lastAt = data.inject.lastAt || null;
         data.inject.lastReason = data.inject.lastReason || '';
+        data.inject.lastStatus = data.inject.lastStatus || '';
         return data;
       }
     }
@@ -525,7 +625,7 @@ export const MemorySystemPlugin = ({ client }) => {
     writeJson(metaPath, meta);
   }
 
-  function buildCompressedChunk(events) {
+  function buildCompressedChunk(events, sessionData = null) {
     if (!Array.isArray(events) || events.length === 0) return '';
 
     const counts = {
@@ -536,11 +636,55 @@ export const MemorySystemPlugin = ({ client }) => {
     };
     const userHighlights = [];
     const assistantHighlights = [];
-    const toolHighlights = [];
+    const outcomeHighlights = [];
+    const goalHints = [];
+    const nextActions = [];
     const decisionHints = [];
     const riskHints = [];
     const todoHints = [];
+    const blockerHints = [];
+    const toolCounts = new Map();
+    const skillCounts = new Map();
+    const dirScores = new Map();
+    const keyFileScores = new Map();
+    const dirSignals = new Map();
+    let latestOutcomeKind = '';
     const seen = new Set();
+
+    const addDirScore = (dir, score = 1) => {
+      const d = normalizeText(dir);
+      if (!d || d.length < 2) return;
+      if (!d.startsWith('/Users/') && !d.startsWith('/home/') && !/^[A-Za-z]:[\\/]/.test(d)) return;
+      if (/\/\.config\/opencode\/skills\//i.test(d) || /\/node_modules\//i.test(d)) return;
+      dirScores.set(d, Number(dirScores.get(d) || 0) + Number(score || 0));
+    };
+
+    const addDirSignal = (dir, field, score = 0) => {
+      const d = normalizeText(dir);
+      if (!d || !dirScores.has(d)) return;
+      const cur = dirSignals.get(d) || { goal: 0, result: 0, intensity: 0, continuity: 0, convergence: 0 };
+      cur[field] = Number(cur[field] || 0) + Number(score || 0);
+      dirSignals.set(d, cur);
+    };
+
+    const extractPaths = (text) => {
+      const s = String(text || '');
+      const out = [];
+      const quoted = [...s.matchAll(/['"]((?:\/|[A-Za-z]:\\)[^'"]+)['"]/g)].map((m) => m[1]);
+      const unix = s.match(/\/Users\/[^\n"'`<>|]+/g) || [];
+      const win = s.match(/[A-Za-z]:\\[^\s"'`<>|]+/g) || [];
+      for (const raw of [...quoted, ...unix, ...win]) {
+        const cleaned = raw.replace(/[),.;:]+$/g, '').replace(/[\\]+$/g, '');
+        if (cleaned.length > 3) out.push(cleaned);
+      }
+      return out;
+    };
+
+    const addSkill = (name) => {
+      const n = normalizeText(String(name || '')).toLowerCase();
+      if (!n) return;
+      skillCounts.set(n, Number(skillCounts.get(n) || 0) + 1);
+    };
 
     for (const ev of events) {
       if (ev?.kind === 'user-message') counts.user += 1;
@@ -548,16 +692,42 @@ export const MemorySystemPlugin = ({ client }) => {
       else if (ev?.kind === 'tool-result') counts.tool += 1;
       else counts.other += 1;
 
-      const msg = truncateText(normalizeText(String(ev?.summary || '')), 160);
-      if (!msg) continue;
-      if (seen.has(msg)) continue;
-      seen.add(msg);
+      const rawMsg = normalizeText(String(ev?.summary || ''));
+      const msg = truncateText(rawMsg, 180);
+      if (!rawMsg) continue;
+      if (isSummaryNoiseText(rawMsg)) continue;
+      if (!/[A-Za-z0-9\u4e00-\u9fff]/.test(rawMsg)) continue;
+      if (rawMsg.length < 3) continue;
+      if (seen.has(`${ev?.kind || 'event'}:${rawMsg}`)) continue;
+      seen.add(`${ev?.kind || 'event'}:${rawMsg}`);
+
+      if (ev?.tool) toolCounts.set(ev.tool, Number(toolCounts.get(ev.tool) || 0) + 1);
+
+      if (ev?.tool === 'use_skill') {
+        const m1 = msg.match(/skill_name["':\s]+([A-Za-z0-9._-]+)/i);
+        const m2 = msg.match(/Launching skill:\s*([A-Za-z0-9._-]+)/i);
+        if (m1?.[1]) addSkill(m1[1]);
+        if (m2?.[1]) addSkill(m2[1]);
+      }
+      const m3 = rawMsg.match(/\/\.config\/opencode\/skills\/([A-Za-z0-9._-]+)/i);
+      if (m3?.[1]) addSkill(m3[1]);
+
+      const isResultLike = /PASS|FAIL|WROTE|Edit applied successfully|Fixed\s+\S+|error|failed|成功|失败|完成|已生成|已创建/i.test(rawMsg);
+      const isProcessLike = /"status":"pending"|"status":"running"|pending|running/i.test(rawMsg);
 
       if (ev?.kind === 'user-message' && userHighlights.length < 4) userHighlights.push(msg);
       if (ev?.kind === 'assistant-message' && assistantHighlights.length < 4) assistantHighlights.push(msg);
-      if (ev?.kind === 'tool-result' && toolHighlights.length < 4) {
+      if (goalHints.length < 3 && ev?.kind === 'user-message' && /请|需要|帮我|目标|完成|交付|回复|写|生成|修复|看一下|路径/i.test(rawMsg)) {
+        goalHints.push(msg);
+      }
+      if (ev?.kind === 'tool-result' && isResultLike && outcomeHighlights.length < 8) {
+        const hasToolPrefix = /^\[[^\]]+\]\s/.test(msg);
         const tool = ev?.tool ? `[${ev.tool}] ` : '';
-        toolHighlights.push(`${tool}${msg}`);
+        outcomeHighlights.push(hasToolPrefix ? msg : `${tool}${msg}`);
+        latestOutcomeKind = /FAIL|error|failed|失败/i.test(msg) ? 'blocked' : 'progress';
+      } else if (ev?.kind === 'assistant-message' && /完成|已生成|done|finished|created/i.test(msg) && outcomeHighlights.length < 8) {
+        outcomeHighlights.push(msg);
+        latestOutcomeKind = 'done';
       }
 
       if (decisionHints.length < 4 && /决定|采用|使用|必须|约束|计划|方案|将会|will|must|plan|decide/i.test(msg)) {
@@ -566,28 +736,125 @@ export const MemorySystemPlugin = ({ client }) => {
       if (riskHints.length < 3 && /错误|失败|冲突|超时|缺失|问题|风险|error|failed|conflict|timeout|missing/i.test(msg)) {
         riskHints.push(msg);
       }
-      if (todoHints.length < 3 && /待办|下一步|后续|需要|TODO|next|follow[- ]?up/i.test(msg)) {
+      if (blockerHints.length < 3 && /FAIL|error|failed|失败|阻塞|missing/i.test(msg)) {
+        blockerHints.push(msg);
+      }
+      if (
+        todoHints.length < 3 &&
+        ((ev?.kind === 'user-message' && /待办|下一步|TODO|next|follow[- ]?up|to do/i.test(msg)) ||
+          /(^|\s)(TODO|next step|follow[- ]?up)(\s|:|$)/i.test(msg))
+      ) {
         todoHints.push(msg);
+      }
+      if (nextActions.length < 3 && /需要|请|下一步|TODO|next|修复|补充|继续/i.test(rawMsg)) {
+        nextActions.push(msg);
+      }
+
+      for (const p of extractPaths(rawMsg)) {
+        const dir = path.extname(p) ? path.dirname(p) : p;
+        let score = 1;
+        if (ev?.kind === 'user-message') score += 2;
+        if (ev?.kind === 'tool-result') score += 1;
+        if (/WROTE|output=|已生成|写入/i.test(rawMsg)) score += 4;
+        if (/PASS|FAIL|error|failed|失败/i.test(rawMsg)) score += 3;
+        if (/read|cat|view|查看/i.test(rawMsg) && !/WROTE|Edit applied|Fixed/i.test(rawMsg)) score -= 1;
+        addDirScore(dir, score);
+        addDirSignal(dir, 'intensity', 1);
+        addDirSignal(dir, 'continuity', 0.5);
+        if (ev?.kind === 'user-message') addDirSignal(dir, 'goal', 1.5);
+        if (/PASS|FAIL|WROTE|output=|已生成|写入/i.test(rawMsg)) addDirSignal(dir, 'result', 2);
+        if (/response_package|output|deliver|交付|投稿|manuscript|review/i.test(rawMsg)) addDirSignal(dir, 'convergence', 1);
+        if (path.extname(p)) {
+          keyFileScores.set(p, Number(keyFileScores.get(p) || 0) + Math.max(score, 1));
+        }
       }
     }
 
     const keyFacts = [...userHighlights, ...assistantHighlights].slice(0, 6);
+    const toolTop = [...toolCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+    const skillTop = [...skillCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+    const isGoodDir = (dir) => {
+      const d = normalizeText(dir);
+      if (!d) return false;
+      if (/^\/[A-Za-z]$/.test(d)) return false;
+      if (/^\/Users\/[^/]+$/.test(d)) return false;
+      if (/^\/Users\/[^/]+\/[^/]{1,4}$/.test(d)) return false;
+      const depth = d.split('/').filter(Boolean).length;
+      return depth >= 4;
+    };
+    const workdirs = [...dirScores.entries()]
+      .sort((a, b) => (b[1] - a[1]) || (b[0].length - a[0].length))
+      .map((x) => x[0])
+      .filter((d) => isGoodDir(d))
+      .filter((d, i, arr) => arr.findIndex((o) => o === d || o.endsWith(d) || d.endsWith(o)) === i)
+      .slice(0, 5);
+    const keyFiles = [...keyFileScores.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map((x) => x[0])
+      .filter((f, i, arr) => arr.findIndex((o) => o === f) === i)
+      .slice(0, 5);
+    const sessionCwd = normalizeText(String(sessionData?.sessionCwd || process.cwd()));
+    const recommendedWorkdir = workdirs.length ? workdirs[0] : sessionCwd;
+    const relatedWorkdirs = workdirs.slice(1);
+    const status = blockerHints.length
+      ? 'blocked'
+      : (latestOutcomeKind || (outcomeHighlights.length ? 'progress' : 'in-progress'));
+
     const lines = [];
     lines.push(`## Structured Session Summary`);
     lines.push(`- window: ${new Date().toISOString()} · events=${events.length} (u=${counts.user}, a=${counts.assistant}, t=${counts.tool}, o=${counts.other})`);
+    lines.push(`- status: ${status}`);
+    lines.push(`- workspace: session_cwd=${sessionCwd || 'N/A'} · recommended_workdir=${recommendedWorkdir || 'N/A'}`);
+    if (relatedWorkdirs.length) {
+      lines.push(`- related_workdirs:`);
+      relatedWorkdirs.slice(0, 4).forEach((d) => lines.push(`  - ${truncateText(d, 160)}`));
+    }
     lines.push(`- key facts:`);
     if (keyFacts.length) keyFacts.forEach((x) => lines.push(`  - ${x}`));
     else lines.push(`  - no stable key fact extracted`);
-    lines.push(`- tool execution:`);
-    if (toolHighlights.length) toolHighlights.forEach((x) => lines.push(`  - ${x}`));
-    else lines.push(`  - no tool result in this window`);
+    lines.push(`- task goal:`);
+    if (goalHints.length) goalHints.slice(0, 3).forEach((x) => lines.push(`  - ${x}`));
+    else if (keyFacts.length) lines.push(`  - ${keyFacts[0]}`);
+    else lines.push(`  - not explicit`);
+    lines.push(`- key outcomes:`);
+    if (outcomeHighlights.length) outcomeHighlights.slice(0, 6).forEach((x) => lines.push(`  - ${x}`));
+    else lines.push(`  - no high-signal outcome captured`);
+    lines.push(`- tools used:`);
+    if (toolTop.length) toolTop.forEach(([k, v]) => lines.push(`  - ${k} (${v})`));
+    else lines.push(`  - none`);
+    lines.push(`- skills used:`);
+    if (skillTop.length) skillTop.forEach(([k, v]) => lines.push(`  - ${k} (${v})`));
+    else lines.push(`  - none detected`);
+    lines.push(`- key files:`);
+    if (keyFiles.length) keyFiles.forEach((f) => lines.push(`  - ${truncateText(f, 180)}`));
+    else lines.push(`  - none extracted`);
     lines.push(`- decisions/constraints:`);
     if (decisionHints.length) decisionHints.forEach((x) => lines.push(`  - ${x}`));
     else lines.push(`  - no explicit decision captured`);
+    lines.push(`- blockers:`);
+    if (blockerHints.length) blockerHints.forEach((x) => lines.push(`  - ${x}`));
+    else lines.push(`  - none`);
     lines.push(`- todo/risks:`);
     if (todoHints.length) todoHints.forEach((x) => lines.push(`  - TODO: ${x}`));
     if (riskHints.length) riskHints.forEach((x) => lines.push(`  - RISK: ${x}`));
     if (!todoHints.length && !riskHints.length) lines.push(`  - none detected`);
+    lines.push(`- next actions:`);
+    if (nextActions.length) nextActions.slice(0, 3).forEach((x) => lines.push(`  - ${x}`));
+    else if (blockerHints.length) lines.push(`  - resolve blockers listed above`);
+    else lines.push(`  - continue from recommended_workdir and verify outputs`);
+    lines.push(`- workdir scoring:`);
+    if (workdirs.length) {
+      workdirs.slice(0, 3).forEach((d) => {
+        const sig = dirSignals.get(d) || {};
+        lines.push(
+          `  - ${truncateText(d, 140)} · goal=${Number(sig.goal || 0).toFixed(1)} result=${Number(sig.result || 0).toFixed(1)} intensity=${Number(sig.intensity || 0).toFixed(1)} continuity=${Number(sig.continuity || 0).toFixed(1)} convergence=${Number(sig.convergence || 0).toFixed(1)}`
+        );
+      });
+    } else {
+      lines.push(`  - no workdir score`);
+    }
+    lines.push(`- handoff anchor:`);
+    lines.push(`  - Continue in ${recommendedWorkdir || sessionCwd || 'current workspace'}; start by checking key outcomes and key files, then execute next actions.`);
 
     return lines.join('\n');
   }
@@ -603,12 +870,12 @@ export const MemorySystemPlugin = ({ client }) => {
     );
     if (!toCompress.length) return;
 
-    const chunk = buildCompressedChunk(toCompress);
-    const current = normalizeText(String(sessionData?.summary?.compressedText || ''));
+    const chunk = buildCompressedChunk(toCompress, sessionData);
+      const current = sanitizeCompressedSummaryText(String(sessionData?.summary?.compressedText || ''));
     const merged = [current, chunk].filter(Boolean).join('\n\n');
 
     sessionData.summary = {
-      compressedText: truncateText(merged, AUTO_SUMMARY_MAX_CHARS),
+      compressedText: truncateFromEnd(merged, AUTO_SUMMARY_MAX_CHARS),
       compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + toCompress.length,
       lastCompressedAt: new Date().toISOString()
     };
@@ -628,11 +895,11 @@ export const MemorySystemPlugin = ({ client }) => {
   }
 
   function appendCompressedSummaryChunk(sessionData, eventsToCompress) {
-    const chunk = buildCompressedChunk(eventsToCompress);
-    const current = normalizeText(String(sessionData?.summary?.compressedText || ''));
+    const chunk = buildCompressedChunk(eventsToCompress, sessionData);
+    const current = sanitizeCompressedSummaryText(String(sessionData?.summary?.compressedText || ''));
     const merged = [current, chunk].filter(Boolean).join('\n\n');
     sessionData.summary = {
-      compressedText: truncateText(merged, AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE),
+      compressedText: truncateFromEnd(merged, AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE),
       compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + eventsToCompress.length,
       lastCompressedAt: new Date().toISOString()
     };
@@ -697,21 +964,21 @@ export const MemorySystemPlugin = ({ client }) => {
       const events = Array.isArray(sessionData.recentEvents) ? sessionData.recentEvents : [];
       if (events.length > 6) {
         const cut = Math.max(1, events.length - 6);
-        const chunk = buildCompressedChunk(events.slice(0, cut));
+        const chunk = buildCompressedChunk(events.slice(0, cut), sessionData);
         const merged = [
-          normalizeText(String(sessionData?.summary?.compressedText || '')),
+          sanitizeCompressedSummaryText(String(sessionData?.summary?.compressedText || '')),
           chunk
         ].filter(Boolean).join('\n\n');
         sessionData.summary = {
-          compressedText: truncateText(merged, AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE),
+          compressedText: truncateFromEnd(merged, AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE),
           compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + cut,
           lastCompressedAt: new Date().toISOString()
         };
         sessionData.recentEvents = events.slice(cut);
       } else {
         sessionData.summary = {
-          compressedText: truncateText(
-            normalizeText(String(sessionData?.summary?.compressedText || '')),
+          compressedText: truncateFromEnd(
+            sanitizeCompressedSummaryText(String(sessionData?.summary?.compressedText || '')),
             Math.min(AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE, 1000)
           ),
           compressedEvents: Number(sessionData?.summary?.compressedEvents || 0),
@@ -753,6 +1020,9 @@ export const MemorySystemPlugin = ({ client }) => {
 
       const projectName = getProjectName();
       const sessionData = loadSessionMemory(sessionID, projectName);
+      const cwdFromEvent = extractSessionCwd(rawEvent);
+      if (cwdFromEvent) sessionData.sessionCwd = cwdFromEvent;
+      else if (!normalizeText(sessionData.sessionCwd || '')) sessionData.sessionCwd = normalizeText(process.cwd());
       const titleFromEvent = extractSessionTitle(rawEvent);
       if (titleFromEvent) sessionData.sessionTitle = titleFromEvent;
       if (!normalizeText(sessionData.sessionTitle || '')) {
@@ -760,6 +1030,8 @@ export const MemorySystemPlugin = ({ client }) => {
         if (runtimeTitle) sessionData.sessionTitle = runtimeTitle;
       }
       const cleanSummary = truncateText(normalizeText(summary || ''));
+      if (isMemoryInjectionText(cleanSummary)) return;
+      if (isSummaryNoiseText(cleanSummary)) return;
       const fp = stableFingerprint(kind, cleanSummary, sessionID, toolName);
 
       if (sessionData.lastFingerprint === fp) return;
@@ -805,8 +1077,22 @@ export const MemorySystemPlugin = ({ client }) => {
     return RECALL_TRIGGER_PATTERNS.some((re) => re.test(t));
   }
 
+  function referencesAnotherSessionTitle(text, currentSessionID = '') {
+    const t = normalizeText(String(text || ''));
+    if (!t || t.length < 6) return false;
+    const sessions = listSessionMemories(getProjectName());
+    for (const s of sessions) {
+      if (!s?.sessionID || s.sessionID === currentSessionID) continue;
+      const title = normalizeText(String(s?.sessionTitle || ''));
+      if (!title || title.length < 6) continue;
+      if (t.includes(title) || title.includes(t)) return true;
+    }
+    return false;
+  }
+
   async function processUserMessageEvent(sessionID, text, rawEvent) {
     const clean = normalizeText(String(text || ''));
+    if (!clean || isMemoryInjectionText(clean)) return;
     const isFirstUserMessageForSession = !hasSessionMemoryFile(sessionID);
 
     if (isFirstUserMessageForSession) {
@@ -850,23 +1136,29 @@ export const MemorySystemPlugin = ({ client }) => {
       }
     }
 
-    if (AUTO_RECALL_ENABLED && clean && shouldTriggerRecall(clean)) {
+    if (AUTO_RECALL_ENABLED && clean && (shouldTriggerRecall(clean) || referencesAnotherSessionTitle(clean, sessionID))) {
       await maybeInjectTriggerRecall(sessionID, clean);
     }
   }
 
   function scoreSessionForQuery(sessionData, queryTokens) {
     if (!sessionData || !queryTokens.length) return 0;
+    const queryJoined = queryTokens.join(' ');
     const recent = Array.isArray(sessionData.recentEvents)
       ? sessionData.recentEvents.map((e) => normalizeText(String(e?.summary || ''))).join(' ')
       : '';
-    const compressed = normalizeText(String(sessionData?.summary?.compressedText || ''));
-    const blob = `${recent} ${compressed}`.toLowerCase();
+    const compressed = normalizeText(sanitizeCompressedSummaryText(String(sessionData?.summary?.compressedText || '')));
+    const title = normalizeText(String(sessionData?.sessionTitle || ''));
+    const cwd = normalizeText(String(sessionData?.sessionCwd || ''));
+    const blob = `${title} ${cwd} ${recent} ${compressed}`.toLowerCase();
 
     let score = 0;
     for (const token of queryTokens) {
       if (blob.includes(token)) score += 2;
     }
+    if (/路径|path|目录|folder|workdir/i.test(queryJoined) && /\/|[a-z]:\\/i.test(blob)) score += 2;
+    if (/审稿|review|reviewer|投稿|response/i.test(queryJoined) && /审稿|review|response/i.test(blob)) score += 2;
+    if (/另一个|之前|上次|session|对话/i.test(queryJoined)) score += 1;
 
     // Slight recency bias
     const updated = Date.parse(sessionData?.updatedAt || 0) || 0;
@@ -884,6 +1176,10 @@ export const MemorySystemPlugin = ({ client }) => {
     const state = { chars: 0, maxChars };
 
     pushLineWithLimit(lines, `<OPENCODE_MEMORY_RECALL query="${truncateText(normalizeText(query), 120)}">`, state);
+    pushLineWithLimit(lines, 'Execution policy:', state);
+    pushLineWithLimit(lines, '- If the recalled memory already contains a concrete path or file location, answer directly from memory first.', state);
+    pushLineWithLimit(lines, '- Do NOT run file search/read tools unless the user explicitly asks to verify, re-check, or if memory is clearly ambiguous.', state);
+    pushLineWithLimit(lines, '- If answering from memory, say it is from recalled memory and provide the exact path.', state);
 
     for (const s of sessions) {
       const stats = s?.stats || emptyStats();
@@ -892,6 +1188,10 @@ export const MemorySystemPlugin = ({ client }) => {
         `Session ${s.sessionID} (updated=${s.updatedAt || 'unknown'}, u=${stats.userMessages || 0}, a=${stats.assistantMessages || 0}, t=${stats.toolResults || 0}):`,
         state
       );
+      const title = truncateText(normalizeText(String(s?.sessionTitle || '')), 120);
+      if (title) pushLineWithLimit(lines, `- title: ${title}`, state);
+      const cwd = truncateText(normalizeText(String(s?.sessionCwd || '')), 160);
+      if (cwd) pushLineWithLimit(lines, `- session_cwd: ${cwd}`, state);
 
       const summary = truncateText(normalizeText(String(s?.summary?.compressedText || '')), 360);
       if (summary) pushLineWithLimit(lines, `- compressed: ${summary}`, state);
@@ -935,7 +1235,14 @@ export const MemorySystemPlugin = ({ client }) => {
     }
 
     scored.sort((a, b) => b.score - a.score);
-    const hits = scored.slice(0, maxSessions).map((x) => x.session);
+    let hits = scored.slice(0, maxSessions).map((x) => x.session);
+    if (!hits.length && /路径|path|目录|folder|workdir|审稿|review|投稿/i.test(queryText)) {
+      const byRecent = allSessions
+        .filter((s) => includeCurrent || !currentSessionID || s.sessionID !== currentSessionID)
+        .sort((a, b) => (Date.parse(b.updatedAt || 0) || 0) - (Date.parse(a.updatedAt || 0) || 0))
+        .slice(0, Math.max(1, Math.min(2, maxSessions)));
+      hits = byRecent;
+    }
 
     const text = buildRecallContextText(queryText, hits, {
       maxChars: options.maxChars,
@@ -948,7 +1255,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
   async function injectMemoryText(sessionID, text, reason = 'memory-inject') {
     try {
-      if (!sessionID || !text) return;
+      if (!sessionID || !text) return false;
       const noteInject = () => {
         const mem = loadSessionMemory(sessionID);
         mem.inject = mem.inject || {};
@@ -958,6 +1265,16 @@ export const MemorySystemPlugin = ({ client }) => {
         if (reason === 'memory-docs') mem.inject.memoryDocsCount = Number(mem.inject.memoryDocsCount || 0) + 1;
         mem.inject.lastAt = new Date().toISOString();
         mem.inject.lastReason = String(reason || 'memory-inject');
+        mem.inject.lastStatus = 'success';
+        persistSessionMemory(mem);
+        writeDashboardFiles();
+      };
+      const noteInjectFailed = () => {
+        const mem = loadSessionMemory(sessionID);
+        mem.inject = mem.inject || {};
+        mem.inject.lastAt = new Date().toISOString();
+        mem.inject.lastReason = String(reason || 'memory-inject');
+        mem.inject.lastStatus = 'failed';
         persistSessionMemory(mem);
         writeDashboardFiles();
       };
@@ -970,7 +1287,7 @@ export const MemorySystemPlugin = ({ client }) => {
           }
         });
         noteInject();
-        return;
+        return true;
       }
 
       if (client?.session && typeof client.session.update === 'function') {
@@ -980,7 +1297,7 @@ export const MemorySystemPlugin = ({ client }) => {
             parts: [{ type: 'text', text, synthetic: true }]
           });
           noteInject();
-          return;
+          return true;
         } catch {
           await client.session.update({
             path: { id: sessionID },
@@ -990,13 +1307,27 @@ export const MemorySystemPlugin = ({ client }) => {
             }
           });
           noteInject();
-          return;
+          return true;
         }
       }
 
       console.error(`memory-system inject skipped (${reason}): no supported client.session method`);
+      noteInjectFailed();
+      return false;
     } catch (err) {
       console.error(`memory-system inject failed (${reason}):`, err);
+      try {
+        const mem = loadSessionMemory(sessionID);
+        mem.inject = mem.inject || {};
+        mem.inject.lastAt = new Date().toISOString();
+        mem.inject.lastReason = String(reason || 'memory-inject');
+        mem.inject.lastStatus = 'failed';
+        persistSessionMemory(mem);
+        writeDashboardFiles();
+      } catch {
+        // ignore
+      }
+      return false;
     }
   }
 
@@ -1042,7 +1373,7 @@ export const MemorySystemPlugin = ({ client }) => {
       state
     );
 
-    const summary = truncateText(normalizeText(String(s?.summary?.compressedText || '')), 260);
+    const summary = truncateText(sanitizeCompressedSummaryText(String(s?.summary?.compressedText || '')), 260);
     if (summary) pushLineWithLimit(lines, `compressed: ${summary}`, state);
 
     const recent = s.recentEvents.slice(-AUTO_CURRENT_SESSION_SUMMARY_MAX_EVENTS);
@@ -1078,7 +1409,16 @@ export const MemorySystemPlugin = ({ client }) => {
 
     if (!text || !hits.length) return;
 
-    await injectMemoryText(sessionID, text, 'trigger-recall');
+    const injected = await injectMemoryText(sessionID, text, 'trigger-recall');
+    if (!injected) {
+      appendAutoEvent({
+        sessionID,
+        kind: 'system-event',
+        summary: 'trigger-recall prepared but injection failed',
+        rawEvent: null
+      });
+      return;
+    }
 
     const mem = loadSessionMemory(sessionID);
     mem.recall = mem.recall || { count: 0, lastAt: null, lastQuery: '' };
@@ -1110,6 +1450,7 @@ export const MemorySystemPlugin = ({ client }) => {
       const sessionList = sessionsRaw.map((sess) => ({
         sessionID: sess.sessionID,
         sessionTitle: normalizeText(sess.sessionTitle || '') || deriveSessionTitleFromEvents(sess) || '',
+        sessionCwd: normalizeText(sess.sessionCwd || ''),
         createdAt: sess.createdAt || null,
         updatedAt: sess.updatedAt || null,
         stats: sess.stats || emptyStats(),
@@ -1119,7 +1460,8 @@ export const MemorySystemPlugin = ({ client }) => {
         summary: {
           compressedEvents: Number(sess?.summary?.compressedEvents || 0),
           lastCompressedAt: sess?.summary?.lastCompressedAt || null,
-          compressedText: truncateText(normalizeText(String(sess?.summary?.compressedText || '')), 240)
+          compressedText: sanitizeCompressedSummaryText(String(sess?.summary?.compressedText || '')),
+          compressedPreview: truncateText(sanitizeCompressedSummaryText(String(sess?.summary?.compressedText || '')), 240)
         },
         recall: {
           count: Number(sess?.recall?.count || 0),
@@ -1131,7 +1473,8 @@ export const MemorySystemPlugin = ({ client }) => {
           triggerRecallCount: Number(sess?.inject?.triggerRecallCount || 0),
           memoryDocsCount: Number(sess?.inject?.memoryDocsCount || 0),
           lastAt: sess?.inject?.lastAt || null,
-          lastReason: sess?.inject?.lastReason || ''
+          lastReason: sess?.inject?.lastReason || '',
+          lastStatus: sess?.inject?.lastStatus || ''
         },
         budget: {
           bodyTokenBudget: Number(sess?.budget?.bodyTokenBudget || AUTO_BODY_TOKEN_BUDGET),
@@ -1288,7 +1631,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    async function deleteSession(projectName,sessionID){ if(!window.confirm("Delete this session memory file? This writes an audit log.")) return; try{ await apiPost("/api/memory/session/delete",{projectName,sessionID,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Delete failed: "+e.message);} }',
       '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); }',
       '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); if(!entries.length){globalPrefs.textContent=t("noproj")==="No project memory yet."?"No global preferences.":"暂无全局偏好"; return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
-      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sid=document.createElement("div"); sid.className="session-id"; sid.textContent=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:s.sessionID||""; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; st.textContent="id:"+(s.sessionID||"")+" · u:"+(s.stats.userMessages||0)+" · a:"+(s.stats.assistantMessages||0)+" · t:"+(s.stats.toolResults||0)+" · r:"+((s.recall&&s.recall.count)||0)+" · i:g"+ig+"/c"+ic+"/x"+ir+" · body~"+bt+" tokens"; head.appendChild(sid); head.appendChild(st); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; meta.textContent="compressed summary"+reason; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); }',
+      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sid=document.createElement("div"); sid.className="session-id"; sid.textContent=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:s.sessionID||""; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"id:\"+(s.sessionID||\"\")+\" · u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · 正文~\"+bt+\" tokens\"; head.appendChild(sid); head.appendChild(st); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; meta.textContent="compressed summary"+reason; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); }',
       '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent="sessions="+project.sessionCount+" · events="+project.totalEvents+" · tech="+ts; renderSessions(project); }',
       '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent="sessions="+p.sessionCount+" · events="+p.totalEvents; item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
       '    langSel.value=LANG; langSel.onchange=()=>{ LANG=langSel.value; localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); }; applyLang(); refreshDashboardData();',
@@ -1370,7 +1713,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           ].join('\n');
           const projectMemoryPath = getProjectMemoryPath();
           const projectName = getProjectName();
-          if (!command || typeof command !== 'string') {
+          if (!command || command === 'undefined' || typeof command !== 'string') {
             return memoryHelp;
           }
 
@@ -1602,7 +1945,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
             '- view',
             '- clear'
           ].join('\n');
-          if (!command || typeof command !== 'string') {
+          if (!command || command === 'undefined' || typeof command !== 'string') {
             return contextHelp;
           }
           switch (command) {
@@ -1627,10 +1970,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
     },
     event: async ({ event }) => {
       const sessionID = extractSessionID(event);
-
-      if (event.type === 'session.created' || event.type === 'session.updated') {
-        maybeSetRuntimeSessionTitle(event);
-      }
+      maybeSetRuntimeSessionTitle(event);
 
       if (event.type === 'session.created' && sessionID) {
         sessionUserMessageCounters.set(sessionID, 0);
