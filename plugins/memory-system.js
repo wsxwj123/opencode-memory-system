@@ -56,7 +56,8 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_DASHBOARD_PORT = 37777;
   const AUTO_OPENCODE_WEB_PORT = 4096;
   const AUTO_VISIBLE_NOTICES = true;
-  const AUTO_VISIBLE_NOTICE_COOLDOWN_MS = 8000;
+  const AUTO_VISIBLE_NOTICE_COOLDOWN_MS = 30000;
+  const AUTO_VISIBLE_NOTICE_FOR_DISCARD = false;
 
   // --- Storage paths ---
   const memoryDir = path.join(os.homedir(), '.opencode', 'memory');
@@ -1233,11 +1234,13 @@ export const MemorySystemPlugin = ({ client }) => {
         sessionData.budget = sessionData.budget || {};
         sessionData.budget.lastCompactedAt = new Date().toISOString();
         sessionData.budget.lastCompactionReason = `discard_low_signal_tools(${discardResult.removed})`;
-        void emitVisibleNotice(
-          sessionID,
-          `已裁剪 ${discardResult.removed} 条低信号工具输出，正文估算 ~${estimatedTokens} tokens`,
-          'discard:auto'
-        );
+        if (AUTO_VISIBLE_NOTICE_FOR_DISCARD) {
+          void emitVisibleNotice(
+            sessionID,
+            `已裁剪 ${discardResult.removed} 条低信号工具输出，正文估算 ~${estimatedTokens} tokens`,
+            'discard:auto'
+          );
+        }
       }
       persistSessionMemory(sessionData, projectName);
       writeDashboardFiles();
@@ -1902,6 +1905,9 @@ export const MemorySystemPlugin = ({ client }) => {
       '    const langSel = $("langSel");',
       '    const I18N = { zh:{title:"记忆看板",lang:"语言",global:"全局偏好",token:"Token 估算为近似值（chars/4）",edit:"编辑摘要",del:"删除会话",nos:"暂无会话",noproj:"暂无项目记忆",save:"保存",cancel:"取消"}, en:{title:"Memory Dashboard",lang:"Language",global:"Global Preferences",token:"Token estimate is approximate (chars/4).",edit:"Edit summary",del:"Delete session",nos:"No sessions.",noproj:"No project memory yet.",save:"Save",cancel:"Cancel"} };',
       '    let LANG = localStorage.getItem("memory_dashboard_lang") || "zh";',
+      '    const __selectedSessionIDs = new Set();',
+      '    let __activeProjectName = "";',
+      '    function updateBatchDeleteBtn(){ const b=$("batchDeleteBtn"); if(!b) return; const n=__selectedSessionIDs.size; b.textContent=n>0?("批量删除("+n+")"):"批量删除"; b.disabled=n===0; }',
       '    function t(k){ return (I18N[LANG]&&I18N[LANG][k]) || (I18N.en&&I18N.en[k]) || k; }',
       '    function updateMetrics(){',
       '      const gen = DATA && DATA.generatedAt ? new Date(DATA.generatedAt).toLocaleString() : "-";',
@@ -1924,11 +1930,11 @@ export const MemorySystemPlugin = ({ client }) => {
       '    async function apiPost(url,payload){ const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); if(!r.ok) throw new Error(await r.text()); return r.json(); }',
       '    async function editSummary(projectName,sessionID,current){ const modal=$("editModal"); const ta=$("editTextarea"); const saveBtn=$("editSaveBtn"); const cancelBtn=$("editCancelBtn"); $("editTitle").textContent=t("edit")+" - "+sessionID; ta.value=current||""; $("editCancelBtn").textContent=t("cancel"); $("editSaveBtn").textContent=t("save"); modal.style.display="flex"; const close=()=>{ modal.style.display="none"; }; cancelBtn.onclick=close; saveBtn.onclick=async()=>{ if(!window.confirm("Apply summary update and write audit log?")) return; try{ await apiPost("/api/memory/session/summary",{projectName,sessionID,summaryText:ta.value,confirm:true,source:"dashboard"}); close(); window.location.reload(); }catch(e){ alert("Update failed: "+e.message);} }; }',
       '    async function deleteSession(projectName,sessionID){ if(!window.confirm("Delete this session memory file? This writes an audit log.")) return; try{ await apiPost("/api/memory/session/delete",{projectName,sessionID,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Delete failed: "+e.message);} }',
-      '    async function batchDeleteSessions(projectName){ const raw=window.prompt("输入要删除的 sessionID（逗号/空格/换行分隔）",""); if(!raw) return; const ids=raw.split(/[\\s,]+/).map(x=>x.trim()).filter(Boolean); if(!ids.length) return; if(!window.confirm("批量删除 "+ids.length+" 个会话记忆？将写入审计日志。")) return; try{ await apiPost("/api/memory/sessions/delete",{projectName,sessionIDs:ids,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Batch delete failed: "+e.message);} }',
+      '    async function batchDeleteSessions(projectName){ const ids=[...__selectedSessionIDs].filter(Boolean); if(!ids.length){ alert("请先勾选要删除的会话"); return; } if(!window.confirm("批量删除 "+ids.length+" 个会话记忆？将写入审计日志。")) return; try{ await apiPost("/api/memory/sessions/delete",{projectName,sessionIDs:ids,confirm:true,source:"dashboard"}); ids.forEach((id)=>__selectedSessionIDs.delete(id)); updateBatchDeleteBtn(); await refreshDashboardData(); }catch(e){ alert("Batch delete failed: "+e.message);} }',
       '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); }',
       '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); if(!entries.length){globalPrefs.textContent=t("noproj")==="No project memory yet."?"No global preferences.":"暂无全局偏好"; return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
-      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sid=document.createElement("div"); sid.className="session-id"; sid.textContent=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:s.sessionID||""; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"id:\"+(s.sessionID||\"\")+\" · u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · prune:auto\"+(pa.autoRuns||0)+\"/manual\"+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · 正文~\"+bt+\" tokens\"; head.appendChild(sid); head.appendChild(st); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); }',
-      '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent="sessions="+project.sessionCount+" · events="+project.totalEvents+" · tech="+ts; const b=$("batchDeleteBtn"); if(b) b.onclick=()=>batchDeleteSessions(project.name); renderSessions(project); }',
+      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; sid.textContent=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:s.sessionID||""; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"id:\"+(s.sessionID||\"\")+\" · u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · prune:auto\"+(pa.autoRuns||0)+\"/manual\"+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · 正文~\"+bt+\" tokens\"; head.appendChild(sel); head.appendChild(sid); head.appendChild(st); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
+      '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); __activeProjectName=project.name||""; __selectedSessionIDs.clear(); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent="sessions="+project.sessionCount+" · events="+project.totalEvents+" · tech="+ts; const b=$("batchDeleteBtn"); if(b) b.onclick=()=>batchDeleteSessions(project.name); renderSessions(project); updateBatchDeleteBtn(); }',
       '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent="sessions="+p.sessionCount+" · events="+p.totalEvents; item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
       '    let __autoRefreshTimer = null;',
       '    function startAutoRefresh(){ if(__autoRefreshTimer) clearInterval(__autoRefreshTimer); __autoRefreshTimer = setInterval(()=>{ refreshDashboardData(); }, 60000); }',
@@ -1993,7 +1999,9 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           },
           required: ['command']
         },
-        execute: async ({ command, args = [] }) => {
+        execute: async (input = {}) => {
+          let { command, args = [] } = input || {};
+          const raw = input && typeof input === 'object' ? input : {};
           const memoryHelp = [
             'Memory commands:',
             '- learn',
@@ -2015,6 +2023,136 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           ].join('\n');
           const projectMemoryPath = getProjectMemoryPath();
           const projectName = getProjectName();
+
+          const normalizeGlobalKey = (key) => {
+            const k = normalizeText(String(key || ''));
+            if (!k) return '';
+            if (k.includes('.')) return k;
+            return `preferences.${k}`;
+          };
+
+          const inferPreferenceFromContent = (content) => {
+            const text = normalizeText(String(content || ''));
+            if (!text) return null;
+            if (/中文|简体中文|chinese/i.test(text)) {
+              return { key: 'preferences.language', value: 'Chinese' };
+            }
+            if (/英文|english/i.test(text)) {
+              return { key: 'preferences.language', value: 'English' };
+            }
+            if (/日文|japanese/i.test(text)) {
+              return { key: 'preferences.language', value: 'Japanese' };
+            }
+            return { key: 'preferences.note', value: truncateText(text, 200) };
+          };
+
+          const toArgsArray = (value) => {
+            if (Array.isArray(value)) return value.map((x) => String(x));
+            if (typeof value === 'string') {
+              const s = value.trim();
+              if (!s) return [];
+              if ((s.startsWith('[') && s.endsWith(']')) || (s.startsWith('{') && s.endsWith('}'))) {
+                try {
+                  const parsed = JSON.parse(s);
+                  if (Array.isArray(parsed)) return parsed.map((x) => String(x));
+                  if (parsed && typeof parsed === 'object') return Object.values(parsed).map((x) => String(x));
+                } catch {
+                  // ignore parse error
+                }
+              }
+              return s.split(/\s+/).map((x) => String(x));
+            }
+            if (value && typeof value === 'object') return Object.values(value).map((x) => String(x));
+            return [];
+          };
+
+          const pickFirstDefined = (obj, keys) => {
+            for (const k of keys) {
+              if (!obj || typeof obj !== 'object') continue;
+              if (obj[k] !== undefined && obj[k] !== null) return obj[k];
+            }
+            return undefined;
+          };
+
+          const pickFirstString = (obj, keys) => {
+            const v = pickFirstDefined(obj, keys);
+            if (typeof v !== 'string') return '';
+            return v.trim();
+          };
+
+          // Unified compatibility layer for OpenAI/Gemini/Anthropic style payloads.
+          const nested = [
+            raw,
+            raw?.input,
+            raw?.arguments,
+            raw?.params,
+            raw?.parameters,
+            raw?.payload,
+            raw?.data
+          ].filter((x) => x && typeof x === 'object');
+          const merged = Object.assign({}, ...nested);
+
+          if (!command || command === 'undefined' || typeof command !== 'string') {
+            command =
+              pickFirstString(merged, ['command', 'cmd', 'action', 'operation', 'name', 'task']) ||
+              command;
+          }
+          command = normalizeText(String(command || '')).toLowerCase();
+
+          if (command.startsWith('/memory')) {
+            const parts = command.split(/\s+/).filter(Boolean);
+            command = parts[1] || '';
+          }
+
+          const commandAlias = {
+            get: 'global',
+            view: 'global',
+            remember: 'set',
+            write: 'set',
+            preference: 'set',
+            preferences: 'set'
+          };
+          if (commandAlias[command]) command = commandAlias[command];
+
+          if (!Array.isArray(args) || !args.length) {
+            const rawArgs = pickFirstDefined(merged, ['args', 'arguments', 'argv', 'params', 'values']);
+            args = toArgsArray(rawArgs);
+          }
+          if (!Array.isArray(args)) args = [];
+
+          // OpenAI/Gemini compatibility:
+          // {"action":"global","content":"...","operation":"learn"}
+          // {"command":"set","key":"preferences.language","value":"Chinese"}
+          if (command === 'global' || (command === 'learn' && String(pickFirstString(merged, ['action'])).toLowerCase() === 'global')) {
+            const compatKey = pickFirstDefined(merged, ['key', 'path', 'field']);
+            const compatValue = pickFirstDefined(merged, ['value', 'val']);
+            const compatContent = pickFirstDefined(merged, ['content', 'text', 'query', 'message']);
+            if (compatKey !== undefined && compatValue !== undefined && String(compatKey).trim()) {
+              command = 'set';
+              args = [normalizeGlobalKey(String(compatKey)), String(compatValue)];
+            } else if (compatContent) {
+              const inferred = inferPreferenceFromContent(compatContent);
+              if (inferred) {
+                command = 'set';
+                args = [inferred.key, inferred.value];
+              }
+            }
+          } else if (command === 'set') {
+            if (args.length < 2) {
+              const compatKey = pickFirstDefined(merged, ['key', 'path', 'field']);
+              const compatValue = pickFirstDefined(merged, ['value', 'val']);
+              if (compatKey !== undefined && compatValue !== undefined) {
+                args = [normalizeGlobalKey(String(compatKey)), String(compatValue)];
+              } else {
+                const compatContent = pickFirstDefined(merged, ['content', 'text', 'query', 'message']);
+                if (compatContent) {
+                  const inferred = inferPreferenceFromContent(compatContent);
+                  if (inferred) args = [inferred.key, inferred.value];
+                }
+              }
+            }
+          }
+
           if (!command || command === 'undefined' || typeof command !== 'string') {
             return memoryHelp;
           }
@@ -2239,7 +2377,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
               });
               persistSessionMemory(sess, projectName);
               writeDashboardFiles();
-              if ((res.removed || 0) > 0) {
+              if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && (res.removed || 0) > 0) {
                 await emitVisibleNotice(
                   sid,
                   `已裁剪 ${res.removed} 条低信号工具输出，正文估算 ~${est} tokens`,
@@ -2277,7 +2415,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
               });
               persistSessionMemory(sess, projectName);
               writeDashboardFiles();
-              if ((res.extracted || 0) > 0) {
+              if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && (res.extracted || 0) > 0) {
                 await emitVisibleNotice(
                   sid,
                   `已蒸馏 ${res.extracted} 条历史对话到结构化摘要，正文估算 ~${est} tokens`,
@@ -2305,7 +2443,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
               });
               persistSessionMemory(sess, projectName);
               writeDashboardFiles();
-              if ((d.removed || 0) > 0 || (e.extracted || 0) > 0) {
+              if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && ((d.removed || 0) > 0 || (e.extracted || 0) > 0)) {
                 await emitVisibleNotice(
                   sid,
                   `已执行裁剪：discard=${d.removed || 0}，extract=${e.extracted || 0}，正文估算 ~${est} tokens`,
@@ -2427,7 +2565,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           });
           persistSessionMemory(sess, projectName);
           writeDashboardFiles();
-          if ((d.removed || 0) > 0) {
+          if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && (d.removed || 0) > 0) {
             await emitVisibleNotice(
               sid,
               `已裁剪 ${d.removed} 条低信号工具输出，正文估算 ~${est} tokens`,
@@ -2462,7 +2600,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           });
           persistSessionMemory(sess, projectName);
           writeDashboardFiles();
-          if ((e.extracted || 0) > 0) {
+          if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && (e.extracted || 0) > 0) {
             await emitVisibleNotice(
               sid,
               `已蒸馏 ${e.extracted} 条历史对话到结构化摘要，正文估算 ~${est} tokens`,
