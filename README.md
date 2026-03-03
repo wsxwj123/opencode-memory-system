@@ -81,7 +81,7 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 1. 打开 OpenCode（默认 `http://127.0.0.1:4096`）
 2. 查看记忆面板：`http://127.0.0.1:37777`
 3. 关闭 OpenCode 后，`37777` 应在约 10-20 秒内自动停止
-4. 面板自动刷新间隔默认为 `60s`（页面切回前台会立即刷新一次）
+4. 面板自动刷新间隔默认为 `60s`（页面切回前台仅在距离上次刷新已满 `60s` 时才刷新）
 
 如果没生效：见本文“常见问题排查”。
 
@@ -118,6 +118,7 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 
 - `~/.opencode/memory/global.json`
   - 全局偏好与片段（例如语言偏好）
+  - 支持两种偏好写法：`preferences.*`（推荐）与历史顶层标量键（兼容）
 
 - `~/.opencode/memory/projects/<项目名>/sessions/*.json`
   - 每个 session 一份记忆文件（核心数据）
@@ -238,7 +239,7 @@ Typical paths:
 - OpenCode web: `http://127.0.0.1:4096`
 - Dashboard: `http://127.0.0.1:37777`
 - Stop OpenCode -> dashboard stops in ~10-20s
-- Dashboard auto-refresh interval: `60s` (and immediate refresh on tab focus)
+- Dashboard auto-refresh interval: `60s` (tab-focus refresh only if >=60s since last refresh)
 
 ### 4. Commands
 

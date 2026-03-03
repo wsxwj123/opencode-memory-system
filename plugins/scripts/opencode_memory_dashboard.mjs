@@ -149,13 +149,25 @@ function readProjectSessions(projectName) {
         triggerRecallCount: Number(obj?.inject?.triggerRecallCount || 0),
         memoryDocsCount: Number(obj?.inject?.memoryDocsCount || 0),
         lastAt: obj?.inject?.lastAt || null,
-        lastReason: obj?.inject?.lastReason || ''
+        lastReason: obj?.inject?.lastReason || '',
+        lastStatus: obj?.inject?.lastStatus || ''
       },
       budget: {
         bodyTokenBudget: Number(obj?.budget?.bodyTokenBudget || 50000),
         lastEstimatedBodyTokens: Number(obj?.budget?.lastEstimatedBodyTokens || 0),
         lastCompactedAt: obj?.budget?.lastCompactedAt || null,
         lastCompactionReason: obj?.budget?.lastCompactionReason || ''
+      },
+      pruneAudit: {
+        autoRuns: Number(obj?.pruneAudit?.autoRuns || 0),
+        manualRuns: Number(obj?.pruneAudit?.manualRuns || 0),
+        discardRemovedTotal: Number(obj?.pruneAudit?.discardRemovedTotal || 0),
+        extractMovedTotal: Number(obj?.pruneAudit?.extractMovedTotal || 0),
+        lastAt: obj?.pruneAudit?.lastAt || null,
+        lastSource: obj?.pruneAudit?.lastSource || '',
+        lastDiscardRemoved: Number(obj?.pruneAudit?.lastDiscardRemoved || 0),
+        lastExtractMoved: Number(obj?.pruneAudit?.lastExtractMoved || 0),
+        lastEstimatedBodyTokens: Number(obj?.pruneAudit?.lastEstimatedBodyTokens || 0)
       }
     });
   }
@@ -581,6 +593,54 @@ function serve() {
       return;
     }
 
+    if (method === 'POST' && rawPath === '/api/memory/sessions/delete') {
+      try {
+        const body = await readJsonBody(req);
+        if (!body?.confirm) {
+          sendJson(res, 400, { error: 'confirm=true required' });
+          return;
+        }
+        const projectName = String(body.projectName || '');
+        const sessionIDs = Array.isArray(body.sessionIDs)
+          ? body.sessionIDs.map((x) => String(x || '').trim()).filter(Boolean)
+          : [];
+        if (!projectName || !sessionIDs.length) {
+          sendJson(res, 400, { error: 'projectName and sessionIDs[] are required' });
+          return;
+        }
+        let removed = 0;
+        let legacyRemoved = 0;
+        const deletedPaths = [];
+        for (const sessionID of sessionIDs) {
+          const deletedInfo = deleteSessionFileVariants(projectName, sessionID);
+          if (deletedInfo.existed) {
+            removed += 1;
+            deletedPaths.push(...deletedInfo.deleted);
+          }
+          if (removeLegacySessionFromMeta(projectName, sessionID)) legacyRemoved += 1;
+          removeSessionFromDashboardData(projectName, sessionID);
+        }
+        appendAudit({
+          action: 'delete_sessions_batch',
+          projectName,
+          sessionCount: sessionIDs.length,
+          removed,
+          legacyRemoved,
+          source: body.source || 'dashboard'
+        });
+        sendJson(res, 200, {
+          ok: true,
+          requested: sessionIDs.length,
+          removed,
+          legacyRemoved,
+          deletedPaths
+        });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || String(err) });
+      }
+      return;
+    }
+
     const reqPath = decodeURIComponent((req.url || '/').split('?')[0]);
     const target = reqPath === '/' ? indexPath : path.join(dashboardDir, reqPath);
     if (!target.startsWith(dashboardDir)) {
@@ -629,8 +689,15 @@ async function main() {
     return;
   }
 
-  if (action !== 'start') {
-    console.log('Usage: node opencode_memory_dashboard.mjs [start|stop|status] [port]');
+  if (action === 'restart') {
+    const state = readState();
+    if (state?.mode === 'docker') stopDocker(state.container);
+    if (state?.mode === 'node') stopNode(state.pid);
+    clearState();
+    // best-effort wait to release port
+    await new Promise((r) => setTimeout(r, 250));
+  } else if (action !== 'start') {
+    console.log('Usage: node opencode_memory_dashboard.mjs [start|stop|status|restart] [port]');
     process.exit(1);
   }
 

@@ -20,6 +20,9 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_BODY_BUDGET_HARD_RATIO = 0.9;
   const AUTO_BODY_BUDGET_TARGET_RATIO = 0.75;
   const AUTO_BODY_KEEP_RECENT_CONVO_EVENTS = 20;
+  const AUTO_DISCARD_KEEP_RECENT_TOOL_EVENTS = 8;
+  const AUTO_DISCARD_MAX_REMOVALS_PER_PASS = 30;
+  const AUTO_EXTRACT_EVENTS_PER_PASS = 24;
 
   // Injection strategy (token-saving defaults)
   const AUTO_INJECT_MEMORY_DOCS = false;
@@ -52,6 +55,8 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_DASHBOARD_AUTOSTART = true;
   const AUTO_DASHBOARD_PORT = 37777;
   const AUTO_OPENCODE_WEB_PORT = 4096;
+  const AUTO_VISIBLE_NOTICES = true;
+  const AUTO_VISIBLE_NOTICE_COOLDOWN_MS = 8000;
 
   // --- Storage paths ---
   const memoryDir = path.join(os.homedir(), '.opencode', 'memory');
@@ -69,6 +74,7 @@ export const MemorySystemPlugin = ({ client }) => {
   const sessionTitleByID = new Map();
   const messageRoleByID = new Map();
   const processedMessageKeys = new Set();
+  const sessionNoticeState = new Map();
 
   // Recall trigger patterns
   const RECALL_TRIGGER_PATTERNS = [
@@ -95,7 +101,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
       const args = [
         dashboardServiceScript,
-        'start',
+        'restart',
         String(AUTO_DASHBOARD_PORT),
         String(process.pid),
         String(AUTO_OPENCODE_WEB_PORT)
@@ -201,7 +207,7 @@ export const MemorySystemPlugin = ({ client }) => {
     const s = String(value || '');
     if (!s) return true;
     if (isMemoryInjectionText(s)) return true;
-    return /EXTREMELY_IMPORTANT|using-superpowers|superpowers skill content|OpenCode Memory System|OPENCODE_KNOWLEDGE_BASE|我主要功能包括|我可以帮你完成以下任务|我的工具\/能力|我没有\"?插件\"?/i.test(s);
+    return /EXTREMELY_IMPORTANT|using-superpowers|superpowers skill content|OpenCode Memory System|OPENCODE_KNOWLEDGE_BASE|我主要功能包括|我可以帮你完成以下任务|我的工具\/能力|我没有\"?插件\"?|\[memory-system\]/i.test(s);
   }
 
   function sanitizeCompressedSummaryText(value) {
@@ -316,6 +322,52 @@ export const MemorySystemPlugin = ({ client }) => {
       toolResults: 0,
       systemEvents: 0
     };
+  }
+
+  function defaultPruneAudit() {
+    return {
+      autoRuns: 0,
+      manualRuns: 0,
+      discardRemovedTotal: 0,
+      extractMovedTotal: 0,
+      lastAt: null,
+      lastSource: '',
+      lastDiscardRemoved: 0,
+      lastExtractMoved: 0,
+      lastEstimatedBodyTokens: 0
+    };
+  }
+
+  function ensurePruneAudit(sessionData) {
+    if (!sessionData || typeof sessionData !== 'object') return defaultPruneAudit();
+    const cur = sessionData.pruneAudit && typeof sessionData.pruneAudit === 'object'
+      ? sessionData.pruneAudit
+      : {};
+    sessionData.pruneAudit = {
+      autoRuns: Number(cur.autoRuns || 0),
+      manualRuns: Number(cur.manualRuns || 0),
+      discardRemovedTotal: Number(cur.discardRemovedTotal || 0),
+      extractMovedTotal: Number(cur.extractMovedTotal || 0),
+      lastAt: cur.lastAt || null,
+      lastSource: cur.lastSource || '',
+      lastDiscardRemoved: Number(cur.lastDiscardRemoved || 0),
+      lastExtractMoved: Number(cur.lastExtractMoved || 0),
+      lastEstimatedBodyTokens: Number(cur.lastEstimatedBodyTokens || 0)
+    };
+    return sessionData.pruneAudit;
+  }
+
+  function recordPruneAudit(sessionData, { source = 'auto', discardRemoved = 0, extractMoved = 0, estimatedTokens = 0 } = {}) {
+    const audit = ensurePruneAudit(sessionData);
+    if (source === 'auto') audit.autoRuns += 1;
+    else audit.manualRuns += 1;
+    audit.discardRemovedTotal += Number(discardRemoved || 0);
+    audit.extractMovedTotal += Number(extractMoved || 0);
+    audit.lastAt = new Date().toISOString();
+    audit.lastSource = String(source || 'auto');
+    audit.lastDiscardRemoved = Number(discardRemoved || 0);
+    audit.lastExtractMoved = Number(extractMoved || 0);
+    audit.lastEstimatedBodyTokens = Number(estimatedTokens || 0);
   }
 
   function sortByUpdated(items) {
@@ -493,6 +545,7 @@ export const MemorySystemPlugin = ({ client }) => {
         lastCompactedAt: null,
         lastCompactionReason: ''
       },
+      pruneAudit: defaultPruneAudit(),
       lastFingerprint: ''
     };
   }
@@ -524,6 +577,7 @@ export const MemorySystemPlugin = ({ client }) => {
         data.inject.lastAt = data.inject.lastAt || null;
         data.inject.lastReason = data.inject.lastReason || '';
         data.inject.lastStatus = data.inject.lastStatus || '';
+        ensurePruneAudit(data);
         return data;
       }
     }
@@ -920,7 +974,9 @@ export const MemorySystemPlugin = ({ client }) => {
   }
 
   function compactConversationByBudget(sessionData) {
-    if (!Array.isArray(sessionData.recentEvents) || !sessionData.recentEvents.length) return;
+    if (!Array.isArray(sessionData.recentEvents) || !sessionData.recentEvents.length) {
+      return { extracted: 0, estimated: Number(sessionData?.budget?.lastEstimatedBodyTokens || 0) };
+    }
 
     const budget = AUTO_BODY_TOKEN_BUDGET;
     const softLimit = Math.floor(budget * AUTO_BODY_BUDGET_SOFT_RATIO);
@@ -937,8 +993,9 @@ export const MemorySystemPlugin = ({ client }) => {
     sessionData.budget.bodyTokenBudget = budget;
     sessionData.budget.lastEstimatedBodyTokens = estimated;
 
-    if (estimated <= softLimit) return;
+    if (estimated <= softLimit) return { extracted: 0, estimated };
 
+    let extracted = 0;
     let guard = 0;
     while (estimated > target && guard < 12) {
       guard += 1;
@@ -960,6 +1017,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
       appendCompressedSummaryChunk(sessionData, toCompress);
       sessionData.recentEvents = sessionData.recentEvents.filter((_, idx) => !selectedSet.has(idx));
+      extracted += toCompress.length;
       estimated = estimateBodyTokens(sessionData);
     }
 
@@ -968,6 +1026,91 @@ export const MemorySystemPlugin = ({ client }) => {
       sessionData.budget.lastCompactedAt = new Date().toISOString();
       sessionData.budget.lastCompactionReason = `conversation_budget_over_soft_limit(${softLimit})`;
     }
+    return { extracted, estimated };
+  }
+
+  function isHighSignalToolSummary(text) {
+    const s = normalizeText(String(text || ''));
+    if (!s) return false;
+    return /PASS|FAIL|WROTE|Fixed|Edit applied|error|failed|成功|失败|完成|已生成|已创建|路径|path|目录|workdir|response_package/i.test(s);
+  }
+
+  function isDiscardableToolSummary(text) {
+    const s = normalizeText(String(text || ''));
+    if (!s) return false;
+    if (isHighSignalToolSummary(s)) return false;
+    if (/"status":"pending"|"status":"running"|\bpending\b|\brunning\b/i.test(s)) return true;
+    if (/^(\[[^\]]+\]\s*)?input=\{\}\s*output=\{\s*"?status"?\s*:\s*"?pending"?/i.test(s)) return true;
+    if (/^\[[^\]]+\]\s*input=.*\soutput=\s*$/i.test(s)) return true;
+    return false;
+  }
+
+  function discardLowValueToolEvents(sessionData, options = {}) {
+    const keepRecent = Number(options.keepRecent || AUTO_DISCARD_KEEP_RECENT_TOOL_EVENTS);
+    const maxRemovals = Number(options.maxRemovals || AUTO_DISCARD_MAX_REMOVALS_PER_PASS);
+    const events = Array.isArray(sessionData?.recentEvents) ? sessionData.recentEvents : [];
+    if (!events.length) return { removed: 0 };
+
+    const toolIdx = [];
+    for (let i = 0; i < events.length; i += 1) {
+      if (events[i]?.kind === 'tool-result') toolIdx.push(i);
+    }
+    if (toolIdx.length <= keepRecent) return { removed: 0 };
+
+    const protectedSet = new Set(toolIdx.slice(-keepRecent));
+    const removeSet = new Set();
+    for (const idx of toolIdx) {
+      if (protectedSet.has(idx)) continue;
+      const ev = events[idx];
+      if (isDiscardableToolSummary(ev?.summary || '')) {
+        removeSet.add(idx);
+        if (removeSet.size >= maxRemovals) break;
+      }
+    }
+
+    if (!removeSet.size) return { removed: 0 };
+
+    const removedEvents = events.filter((_, idx) => removeSet.has(idx));
+    const removedByTool = new Map();
+    for (const ev of removedEvents) {
+      const key = ev?.tool || 'tool';
+      removedByTool.set(key, Number(removedByTool.get(key) || 0) + 1);
+    }
+
+    sessionData.recentEvents = events.filter((_, idx) => !removeSet.has(idx));
+    appendCompressedSummaryChunk(sessionData, removedEvents.map((ev) => ({
+      ...ev,
+      summary: `[discarded-low-signal] ${truncateText(normalizeText(String(ev?.summary || '')), 160)}`
+    })));
+
+    return {
+      removed: removeSet.size,
+      removedByTool: [...removedByTool.entries()].sort((a, b) => b[1] - a[1])
+    };
+  }
+
+  function extractSessionContext(sessionData, options = {}) {
+    const events = Array.isArray(sessionData?.recentEvents) ? sessionData.recentEvents : [];
+    if (!events.length) return { extracted: 0 };
+    const maxExtract = Math.max(6, Number(options.maxExtract || AUTO_EXTRACT_EVENTS_PER_PASS));
+    const keepRecentConvo = Math.max(8, Number(options.keepRecentConvo || AUTO_BODY_KEEP_RECENT_CONVO_EVENTS));
+
+    const convoIdx = [];
+    for (let i = 0; i < events.length; i += 1) {
+      if (isConversationEvent(events[i])) convoIdx.push(i);
+    }
+    if (convoIdx.length <= keepRecentConvo) return { extracted: 0 };
+
+    const keepFrom = convoIdx.length - keepRecentConvo;
+    const extractableConvo = convoIdx.slice(0, keepFrom);
+    const picked = extractableConvo.slice(0, maxExtract);
+    if (!picked.length) return { extracted: 0 };
+
+    const pickedSet = new Set(picked);
+    const selected = events.filter((_, idx) => pickedSet.has(idx));
+    appendCompressedSummaryChunk(sessionData, selected);
+    sessionData.recentEvents = events.filter((_, idx) => !pickedSet.has(idx));
+    return { extracted: picked.length };
   }
 
   function enforceSessionFileBudget(sessionData, sessionPath) {
@@ -1077,7 +1220,25 @@ export const MemorySystemPlugin = ({ client }) => {
 
       sessionData.lastFingerprint = fp;
       compressSessionMemory(sessionData);
-      compactConversationByBudget(sessionData);
+      const compactResult = compactConversationByBudget(sessionData) || { extracted: 0, estimated: 0 };
+      const discardResult = discardLowValueToolEvents(sessionData);
+      const estimatedTokens = estimateBodyTokens(sessionData);
+      recordPruneAudit(sessionData, {
+        source: 'auto',
+        discardRemoved: Number(discardResult.removed || 0),
+        extractMoved: Number(compactResult.extracted || 0),
+        estimatedTokens
+      });
+      if (discardResult.removed > 0) {
+        sessionData.budget = sessionData.budget || {};
+        sessionData.budget.lastCompactedAt = new Date().toISOString();
+        sessionData.budget.lastCompactionReason = `discard_low_signal_tools(${discardResult.removed})`;
+        void emitVisibleNotice(
+          sessionID,
+          `已裁剪 ${discardResult.removed} 条低信号工具输出，正文估算 ~${estimatedTokens} tokens`,
+          'discard:auto'
+        );
+      }
       persistSessionMemory(sessionData, projectName);
       writeDashboardFiles();
     } catch (err) {
@@ -1296,9 +1457,69 @@ export const MemorySystemPlugin = ({ client }) => {
     return { text, hits, estimatedTokens: estimateTokensFromText(text) };
   }
 
+  function canEmitVisibleNotice(sessionID, key = 'notice') {
+    if (!AUTO_VISIBLE_NOTICES || !sessionID) return false;
+    const now = Date.now();
+    const prev = sessionNoticeState.get(sessionID);
+    if (prev && prev.key === key && (now - prev.at) < AUTO_VISIBLE_NOTICE_COOLDOWN_MS) return false;
+    sessionNoticeState.set(sessionID, { key, at: now });
+    return true;
+  }
+
+  async function emitVisibleNotice(sessionID, message, key = 'notice') {
+    try {
+      if (!canEmitVisibleNotice(sessionID, key)) return false;
+      const text = `[memory-system] ${truncateText(normalizeText(String(message || '')), 220)}`;
+      if (!text.trim()) return false;
+
+      if (client?.session && typeof client.session.prompt === 'function') {
+        await client.session.prompt({
+          path: { id: sessionID },
+          body: {
+            noReply: true,
+            parts: [{ type: 'text', text, synthetic: false }]
+          }
+        });
+        return true;
+      }
+
+      if (client?.session && typeof client.session.update === 'function') {
+        try {
+          await client.session.update(sessionID, {
+            noReply: true,
+            parts: [{ type: 'text', text, synthetic: false }]
+          });
+          return true;
+        } catch {
+          await client.session.update({
+            path: { id: sessionID },
+            body: {
+              noReply: true,
+              parts: [{ type: 'text', text, synthetic: false }]
+            }
+          });
+          return true;
+        }
+      }
+    } catch {
+      // ignore visible notice failures
+    }
+    return false;
+  }
+
   async function injectMemoryText(sessionID, text, reason = 'memory-inject') {
     try {
       if (!sessionID || !text) return false;
+      const reasonLabel = (() => {
+        const m = {
+          'global-prefs': '已注入全局偏好记忆',
+          'current-session-refresh': '已注入当前会话摘要记忆',
+          'trigger-recall': '已注入跨会话召回记忆',
+          'memory-docs': '已注入记忆系统文档',
+          'memory-inject': '已注入记忆'
+        };
+        return m[String(reason || 'memory-inject')] || '已注入记忆';
+      })();
       const noteInject = () => {
         const mem = loadSessionMemory(sessionID);
         mem.inject = mem.inject || {};
@@ -1330,6 +1551,7 @@ export const MemorySystemPlugin = ({ client }) => {
           }
         });
         noteInject();
+        await emitVisibleNotice(sessionID, `${reasonLabel}（~${estimateTokensFromText(text)} tokens）`, `inject:${reason}`);
         return true;
       }
 
@@ -1340,6 +1562,7 @@ export const MemorySystemPlugin = ({ client }) => {
             parts: [{ type: 'text', text, synthetic: true }]
           });
           noteInject();
+          await emitVisibleNotice(sessionID, `${reasonLabel}（~${estimateTokensFromText(text)} tokens）`, `inject:${reason}`);
           return true;
         } catch {
           await client.session.update({
@@ -1350,6 +1573,7 @@ export const MemorySystemPlugin = ({ client }) => {
             }
           });
           noteInject();
+          await emitVisibleNotice(sessionID, `${reasonLabel}（~${estimateTokensFromText(text)} tokens）`, `inject:${reason}`);
           return true;
         }
       }
@@ -1376,9 +1600,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
   function buildGlobalPrefsContextText() {
     const globalMemory = readJson(globalMemoryPath) || {};
-    const prefs = globalMemory?.preferences && typeof globalMemory.preferences === 'object'
-      ? globalMemory.preferences
-      : {};
+    const prefs = getNormalizedGlobalPreferences(globalMemory);
 
     const entries = Object.entries(prefs).slice(0, AUTO_INJECT_GLOBAL_PREFS_MAX_ITEMS);
     if (!entries.length) return '';
@@ -1393,6 +1615,24 @@ export const MemorySystemPlugin = ({ client }) => {
 
     if (lines.length <= 2) return '';
     return lines.join('\n');
+  }
+
+  function getNormalizedGlobalPreferences(globalMemory) {
+    const gm = globalMemory && typeof globalMemory === 'object' ? globalMemory : {};
+    const prefs =
+      gm.preferences && typeof gm.preferences === 'object'
+        ? gm.preferences
+        : {};
+    const legacyTopLevel = {};
+    for (const [k, v] of Object.entries(gm)) {
+      if (k === 'preferences' || k === 'snippets' || k === 'feedback') continue;
+      if (v === null || v === undefined) continue;
+      const t = typeof v;
+      if (t === 'string' || t === 'number' || t === 'boolean') {
+        legacyTopLevel[k] = v;
+      }
+    }
+    return { ...legacyTopLevel, ...prefs };
   }
 
   function buildCurrentSessionSummaryText(sessionID) {
@@ -1524,6 +1764,17 @@ export const MemorySystemPlugin = ({ client }) => {
           lastEstimatedBodyTokens: Number(sess?.budget?.lastEstimatedBodyTokens || 0),
           lastCompactedAt: sess?.budget?.lastCompactedAt || null,
           lastCompactionReason: sess?.budget?.lastCompactionReason || ''
+        },
+        pruneAudit: {
+          autoRuns: Number(sess?.pruneAudit?.autoRuns || 0),
+          manualRuns: Number(sess?.pruneAudit?.manualRuns || 0),
+          discardRemovedTotal: Number(sess?.pruneAudit?.discardRemovedTotal || 0),
+          extractMovedTotal: Number(sess?.pruneAudit?.extractMovedTotal || 0),
+          lastAt: sess?.pruneAudit?.lastAt || null,
+          lastSource: sess?.pruneAudit?.lastSource || '',
+          lastDiscardRemoved: Number(sess?.pruneAudit?.lastDiscardRemoved || 0),
+          lastExtractMoved: Number(sess?.pruneAudit?.lastExtractMoved || 0),
+          lastEstimatedBodyTokens: Number(sess?.pruneAudit?.lastEstimatedBodyTokens || 0)
         }
       }));
 
@@ -1552,7 +1803,7 @@ export const MemorySystemPlugin = ({ client }) => {
     return {
       generatedAt: new Date().toISOString(),
       global: {
-        preferences: globalMemory?.preferences && typeof globalMemory.preferences === 'object' ? globalMemory.preferences : {},
+        preferences: getNormalizedGlobalPreferences(globalMemory),
         snippets: globalMemory?.snippets && typeof globalMemory.snippets === 'object' ? globalMemory.snippets : {},
         feedback: Array.isArray(globalMemory?.feedback) ? globalMemory.feedback : []
       },
@@ -1627,7 +1878,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    <main class="main">',
       '      <div class="panel"><h1 id="projectTitle" style="font-size:18px;">No project selected</h1><div class="sub" id="projectMeta"></div></div>',
       '      <div class="panel"><h1 id="globalTitle" style="font-size:16px;">Global Preferences</h1><div class="sub" id="tokenHint">Token estimate is approximate (chars/4).</div><div id="globalPrefs" class="empty">No global preferences.</div></div>',
-      '      <div class="panel"><h1 style="font-size:16px;">Sessions</h1><div id="sessionList" class="empty">No sessions.</div></div>',
+      '      <div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;"><h1 style="font-size:16px;">Sessions</h1><button id="batchDeleteBtn" style="height:30px;">批量删除</button></div><div id="sessionList" class="empty">No sessions.</div></div>',
       '    </main>',
       '  </div>',
       '  <div id="editModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9999;align-items:center;justify-content:center;">',
@@ -1660,10 +1911,11 @@ export const MemorySystemPlugin = ({ client }) => {
       '      $("mSessions").textContent = s.sessionCount || 0;',
       '      $("mEvents").textContent = s.eventCount || 0;',
       '    }',
+      '    let __lastRefreshAt = 0;',
       '    async function refreshDashboardData(){',
       '      try {',
       '        const r = await fetch("/api/dashboard", { cache: "no-store" });',
-      '        if (r.ok) DATA = await r.json();',
+      '        if (r.ok) { DATA = await r.json(); __lastRefreshAt = Date.now(); }',
       '      } catch (_) {}',
       '      updateMetrics();',
       '      renderGlobalPrefs();',
@@ -1672,12 +1924,16 @@ export const MemorySystemPlugin = ({ client }) => {
       '    async function apiPost(url,payload){ const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); if(!r.ok) throw new Error(await r.text()); return r.json(); }',
       '    async function editSummary(projectName,sessionID,current){ const modal=$("editModal"); const ta=$("editTextarea"); const saveBtn=$("editSaveBtn"); const cancelBtn=$("editCancelBtn"); $("editTitle").textContent=t("edit")+" - "+sessionID; ta.value=current||""; $("editCancelBtn").textContent=t("cancel"); $("editSaveBtn").textContent=t("save"); modal.style.display="flex"; const close=()=>{ modal.style.display="none"; }; cancelBtn.onclick=close; saveBtn.onclick=async()=>{ if(!window.confirm("Apply summary update and write audit log?")) return; try{ await apiPost("/api/memory/session/summary",{projectName,sessionID,summaryText:ta.value,confirm:true,source:"dashboard"}); close(); window.location.reload(); }catch(e){ alert("Update failed: "+e.message);} }; }',
       '    async function deleteSession(projectName,sessionID){ if(!window.confirm("Delete this session memory file? This writes an audit log.")) return; try{ await apiPost("/api/memory/session/delete",{projectName,sessionID,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Delete failed: "+e.message);} }',
+      '    async function batchDeleteSessions(projectName){ const raw=window.prompt("输入要删除的 sessionID（逗号/空格/换行分隔）",""); if(!raw) return; const ids=raw.split(/[\\s,]+/).map(x=>x.trim()).filter(Boolean); if(!ids.length) return; if(!window.confirm("批量删除 "+ids.length+" 个会话记忆？将写入审计日志。")) return; try{ await apiPost("/api/memory/sessions/delete",{projectName,sessionIDs:ids,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Batch delete failed: "+e.message);} }',
       '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); }',
       '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); if(!entries.length){globalPrefs.textContent=t("noproj")==="No project memory yet."?"No global preferences.":"暂无全局偏好"; return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
-      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sid=document.createElement("div"); sid.className="session-id"; sid.textContent=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:s.sessionID||""; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"id:\"+(s.sessionID||\"\")+\" · u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · 正文~\"+bt+\" tokens\"; head.appendChild(sid); head.appendChild(st); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; meta.textContent="compressed summary"+reason; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); }',
-      '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent="sessions="+project.sessionCount+" · events="+project.totalEvents+" · tech="+ts; renderSessions(project); }',
+      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sid=document.createElement("div"); sid.className="session-id"; sid.textContent=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:s.sessionID||""; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"id:\"+(s.sessionID||\"\")+\" · u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · prune:auto\"+(pa.autoRuns||0)+\"/manual\"+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · 正文~\"+bt+\" tokens\"; head.appendChild(sid); head.appendChild(st); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); }',
+      '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent="sessions="+project.sessionCount+" · events="+project.totalEvents+" · tech="+ts; const b=$("batchDeleteBtn"); if(b) b.onclick=()=>batchDeleteSessions(project.name); renderSessions(project); }',
       '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent="sessions="+p.sessionCount+" · events="+p.totalEvents; item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
-      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=langSel.value; localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); }; applyLang(); refreshDashboardData();',
+      '    let __autoRefreshTimer = null;',
+      '    function startAutoRefresh(){ if(__autoRefreshTimer) clearInterval(__autoRefreshTimer); __autoRefreshTimer = setInterval(()=>{ refreshDashboardData(); }, 60000); }',
+      '    document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState!=="visible") return; const now=Date.now(); if(now-(__lastRefreshAt||0)>=60000) refreshDashboardData(); });',
+      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=langSel.value; localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); }; applyLang(); refreshDashboardData(); startAutoRefresh();',
       '  </script>',
       '</body>',
       '</html>'
@@ -1726,7 +1982,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           properties: {
             command: {
               type: 'string',
-              enum: ['learn', 'project', 'global', 'set', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard'],
+              enum: ['learn', 'project', 'global', 'set', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune'],
               description: 'The memory command to execute'
             },
             args: {
@@ -1747,12 +2003,15 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
             '- save snippet <name>',
             '- export project',
             '- import <filepath>',
-            '- clear session <id>|project|all',
+            '- clear session <id>|sessions <id1,id2,...>|project|all',
             '- edit project',
             '- feedback <text>',
             '- recall <query>',
             '- sessions',
-            '- dashboard [path|build|json]'
+            '- dashboard [path|build|json]',
+            '- discard [session <id>|current] [aggressive]',
+            '- extract [session <id>|current] [maxEvents]',
+            '- prune [session <id>|current]'
           ].join('\n');
           const projectMemoryPath = getProjectMemoryPath();
           const projectName = getProjectName();
@@ -1894,7 +2153,31 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                 writeDashboardFiles();
                 return `Session memory cleared: ${sid}`;
               }
-              return 'Usage: /memory clear [session <id>|project|all]';
+              if (target === 'sessions') {
+                const rawIds = args.slice(1).join(' ');
+                if (!rawIds) return 'Usage: /memory clear sessions <id1,id2,...>';
+                const ids = rawIds
+                  .split(/[,\s]+/)
+                  .map((x) => normalizeText(x))
+                  .filter(Boolean);
+                if (!ids.length) return 'Usage: /memory clear sessions <id1,id2,...>';
+                const meta = readProjectMeta(projectName);
+                let removed = 0;
+                for (const sid of ids) {
+                  const p = getSessionMemoryPath(sid, projectName);
+                  if (fs.existsSync(p)) {
+                    fs.unlinkSync(p);
+                    removed += 1;
+                  }
+                  if (meta?.autoMemory?.sessions?.[sid]) {
+                    delete meta.autoMemory.sessions[sid];
+                  }
+                }
+                if (meta?.autoMemory?.sessions) writeProjectMeta(meta, projectName);
+                writeDashboardFiles();
+                return `Batch clear completed: requested=${ids.length}, removed=${removed}`;
+              }
+              return 'Usage: /memory clear [session <id>|sessions <id1,id2,...>|project|all]';
             }
 
             case 'edit': {
@@ -1924,6 +2207,112 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                   compressedEvents: Number(s?.summary?.compressedEvents || 0)
                 }));
               return `Session memory list (${projectName}):\n${JSON.stringify(sessions, null, 2)}`;
+            }
+
+            case 'discard': {
+              let targetSessionID = '';
+              let aggressive = false;
+              if (!args.length || args[0] === 'current') {
+                targetSessionID = '';
+              } else if (args[0] === 'session') {
+                targetSessionID = args[1] || '';
+                if (!targetSessionID) return 'Usage: /memory discard [session <id>|current] [aggressive]';
+                aggressive = args.includes('aggressive');
+              } else {
+                aggressive = args.includes('aggressive');
+              }
+
+              const sid = targetSessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
+              if (!sid) return 'No active session id found. Use: /memory discard session <id>';
+              const sess = loadSessionMemory(sid, projectName);
+              const res = discardLowValueToolEvents(sess, {
+                keepRecent: aggressive ? 4 : AUTO_DISCARD_KEEP_RECENT_TOOL_EVENTS,
+                maxRemovals: aggressive ? 60 : AUTO_DISCARD_MAX_REMOVALS_PER_PASS
+              });
+              const c = compactConversationByBudget(sess) || { extracted: 0 };
+              const est = estimateBodyTokens(sess);
+              recordPruneAudit(sess, {
+                source: 'manual-discard',
+                discardRemoved: Number(res.removed || 0),
+                extractMoved: Number(c.extracted || 0),
+                estimatedTokens: est
+              });
+              persistSessionMemory(sess, projectName);
+              writeDashboardFiles();
+              if ((res.removed || 0) > 0) {
+                await emitVisibleNotice(
+                  sid,
+                  `已裁剪 ${res.removed} 条低信号工具输出，正文估算 ~${est} tokens`,
+                  'discard:manual'
+                );
+              }
+              return `Discard completed for ${sid}: removed=${res.removed || 0}` + (res.removedByTool?.length ? ` tools=${JSON.stringify(res.removedByTool)}` : '');
+            }
+
+            case 'extract': {
+              let targetSessionID = '';
+              let maxEvents = AUTO_EXTRACT_EVENTS_PER_PASS;
+              if (!args.length || args[0] === 'current') {
+                targetSessionID = '';
+                if (args[1] && /^\d+$/.test(args[1])) maxEvents = Number(args[1]);
+              } else if (args[0] === 'session') {
+                targetSessionID = args[1] || '';
+                if (!targetSessionID) return 'Usage: /memory extract [session <id>|current] [maxEvents]';
+                if (args[2] && /^\d+$/.test(args[2])) maxEvents = Number(args[2]);
+              } else if (/^\d+$/.test(args[0])) {
+                maxEvents = Number(args[0]);
+              }
+
+              const sid = targetSessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
+              if (!sid) return 'No active session id found. Use: /memory extract session <id> 24';
+              const sess = loadSessionMemory(sid, projectName);
+              const res = extractSessionContext(sess, { maxExtract: maxEvents });
+              const c = compactConversationByBudget(sess) || { extracted: 0 };
+              const est = estimateBodyTokens(sess);
+              recordPruneAudit(sess, {
+                source: 'manual-extract',
+                discardRemoved: 0,
+                extractMoved: Number(res.extracted || 0) + Number(c.extracted || 0),
+                estimatedTokens: est
+              });
+              persistSessionMemory(sess, projectName);
+              writeDashboardFiles();
+              if ((res.extracted || 0) > 0) {
+                await emitVisibleNotice(
+                  sid,
+                  `已蒸馏 ${res.extracted} 条历史对话到结构化摘要，正文估算 ~${est} tokens`,
+                  'extract:manual'
+                );
+              }
+              return `Extract completed for ${sid}: extracted=${res.extracted || 0} (into compressed summary)`;
+            }
+
+            case 'prune': {
+              let targetSessionID = '';
+              if (args[0] === 'session') targetSessionID = args[1] || '';
+              const sid = targetSessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
+              if (!sid) return 'No active session id found. Use: /memory prune session <id>';
+              const sess = loadSessionMemory(sid, projectName);
+              const d = discardLowValueToolEvents(sess);
+              const e = extractSessionContext(sess);
+              const c = compactConversationByBudget(sess) || { extracted: 0 };
+              const est = estimateBodyTokens(sess);
+              recordPruneAudit(sess, {
+                source: 'manual-prune',
+                discardRemoved: Number(d.removed || 0),
+                extractMoved: Number(e.extracted || 0) + Number(c.extracted || 0),
+                estimatedTokens: est
+              });
+              persistSessionMemory(sess, projectName);
+              writeDashboardFiles();
+              if ((d.removed || 0) > 0 || (e.extracted || 0) > 0) {
+                await emitVisibleNotice(
+                  sid,
+                  `已执行裁剪：discard=${d.removed || 0}，extract=${e.extracted || 0}，正文估算 ~${est} tokens`,
+                  'prune:manual'
+                );
+              }
+              return `Prune completed for ${sid}: discard=${d.removed || 0}, extract=${e.extracted || 0}, estBodyTokens=${est}`;
             }
 
             case 'recall': {
@@ -2008,6 +2397,79 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
         parameters: { type: 'object', properties: {} },
         execute: async () => {
           return 'Context compacted. Redundant details removed.';
+        }
+      },
+      discard: {
+        description: 'Discard low-value tool outputs from current session memory body while keeping key outcomes',
+        parameters: {
+          type: 'object',
+          properties: {
+            sessionID: { type: 'string' },
+            aggressive: { type: 'boolean' }
+          }
+        },
+        execute: async ({ sessionID = '', aggressive = false } = {}) => {
+          const projectName = getProjectName();
+          const sid = sessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
+          if (!sid) return 'No active session id found.';
+          const sess = loadSessionMemory(sid, projectName);
+          const d = discardLowValueToolEvents(sess, {
+            keepRecent: aggressive ? 4 : AUTO_DISCARD_KEEP_RECENT_TOOL_EVENTS,
+            maxRemovals: aggressive ? 60 : AUTO_DISCARD_MAX_REMOVALS_PER_PASS
+          });
+          const c = compactConversationByBudget(sess) || { extracted: 0 };
+          const est = estimateBodyTokens(sess);
+          recordPruneAudit(sess, {
+            source: 'tool-discard',
+            discardRemoved: Number(d.removed || 0),
+            extractMoved: Number(c.extracted || 0),
+            estimatedTokens: est
+          });
+          persistSessionMemory(sess, projectName);
+          writeDashboardFiles();
+          if ((d.removed || 0) > 0) {
+            await emitVisibleNotice(
+              sid,
+              `已裁剪 ${d.removed} 条低信号工具输出，正文估算 ~${est} tokens`,
+              'discard:tool'
+            );
+          }
+          return `discard ok: session=${sid}, removed=${d.removed || 0}, estBodyTokens=${est}`;
+        }
+      },
+      extract: {
+        description: 'Extract older conversation context into compressed summary and keep recent dialog body',
+        parameters: {
+          type: 'object',
+          properties: {
+            sessionID: { type: 'string' },
+            maxEvents: { type: 'number' }
+          }
+        },
+        execute: async ({ sessionID = '', maxEvents = AUTO_EXTRACT_EVENTS_PER_PASS } = {}) => {
+          const projectName = getProjectName();
+          const sid = sessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
+          if (!sid) return 'No active session id found.';
+          const sess = loadSessionMemory(sid, projectName);
+          const e = extractSessionContext(sess, { maxExtract: Number(maxEvents || AUTO_EXTRACT_EVENTS_PER_PASS) });
+          const c = compactConversationByBudget(sess) || { extracted: 0 };
+          const est = estimateBodyTokens(sess);
+          recordPruneAudit(sess, {
+            source: 'tool-extract',
+            discardRemoved: 0,
+            extractMoved: Number(e.extracted || 0) + Number(c.extracted || 0),
+            estimatedTokens: est
+          });
+          persistSessionMemory(sess, projectName);
+          writeDashboardFiles();
+          if ((e.extracted || 0) > 0) {
+            await emitVisibleNotice(
+              sid,
+              `已蒸馏 ${e.extracted} 条历史对话到结构化摘要，正文估算 ~${est} tokens`,
+              'extract:tool'
+            );
+          }
+          return `extract ok: session=${sid}, extracted=${e.extracted || 0}, estBodyTokens=${est}`;
         }
       }
     },
