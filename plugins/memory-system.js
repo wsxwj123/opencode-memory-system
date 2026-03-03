@@ -1,0 +1,1486 @@
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { fileURLToPath } from 'url';
+import { spawnSync } from 'child_process';
+
+export const MemorySystemPlugin = ({ client }) => {
+  const AUTO_MEMORY_VERSION = '2.0.0';
+
+  // Storage and retention controls
+  const AUTO_MAX_EVENTS_PER_SESSION = 120;
+  const AUTO_MAX_EVENT_TEXT = 800;
+  const AUTO_MAX_SESSIONS_PER_PROJECT = 60;
+  const AUTO_SUMMARY_TRIGGER_EVENTS = 40;
+  const AUTO_SUMMARY_KEEP_RECENT_EVENTS = 18;
+  const AUTO_SUMMARY_MAX_CHARS = 2400;
+  const AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE = 1600;
+  const AUTO_BODY_TOKEN_BUDGET = 50_000;
+  const AUTO_BODY_BUDGET_SOFT_RATIO = 0.7;
+  const AUTO_BODY_BUDGET_HARD_RATIO = 0.9;
+  const AUTO_BODY_BUDGET_TARGET_RATIO = 0.75;
+  const AUTO_BODY_KEEP_RECENT_CONVO_EVENTS = 12;
+
+  // Injection strategy (token-saving defaults)
+  const AUTO_INJECT_MEMORY_DOCS = false;
+  const AUTO_INJECT_GLOBAL_PREFS_ON_SESSION_START = true;
+  const AUTO_INJECT_GLOBAL_PREFS_MAX_CHARS = 500;
+  const AUTO_INJECT_GLOBAL_PREFS_MAX_ITEMS = 8;
+
+  // Semi-auto recall
+  const AUTO_RECALL_ENABLED = true;
+  const AUTO_RECALL_TOP_SESSIONS = 2;
+  const AUTO_RECALL_MAX_EVENTS_PER_SESSION = 4;
+  const AUTO_RECALL_MAX_CHARS = 1800;
+  const AUTO_RECALL_TOKEN_BUDGET = 450;
+  const AUTO_RECALL_COOLDOWN_MS = 45_000;
+  const AUTO_RECALL_MIN_QUERY_LEN = 2;
+
+  // Hard budget controls
+  const AUTO_SESSION_FILE_MAX_BYTES = 96 * 1024;
+  const AUTO_SESSION_FILE_TARGET_BYTES = 72 * 1024;
+
+  // Current-session refresh injection (semi-auto, token-bounded)
+  const AUTO_CURRENT_SESSION_SUMMARY_ENABLED = true;
+  const AUTO_CURRENT_SESSION_REFRESH_EVERY = 5;
+  const AUTO_CURRENT_SESSION_SUMMARY_TOKEN_BUDGET = 500;
+  const AUTO_CURRENT_SESSION_SUMMARY_MAX_CHARS = 2200;
+  const AUTO_CURRENT_SESSION_SUMMARY_MAX_EVENTS = 6;
+
+  // Dashboard controls
+  const DASHBOARD_MAX_EVENTS_PER_SESSION_VIEW = 30;
+  const AUTO_DASHBOARD_AUTOSTART = true;
+  const AUTO_DASHBOARD_PORT = 37777;
+  const AUTO_OPENCODE_WEB_PORT = 4096;
+
+  // --- Storage paths ---
+  const memoryDir = path.join(os.homedir(), '.opencode', 'memory');
+  const projectsDir = path.join(memoryDir, 'projects');
+  const globalMemoryPath = path.join(memoryDir, 'global.json');
+  const dashboardDir = path.join(memoryDir, 'dashboard');
+  const dashboardHtmlPath = path.join(dashboardDir, 'index.html');
+  const dashboardDataPath = path.join(dashboardDir, 'data.json');
+  const pluginDir = path.dirname(fileURLToPath(import.meta.url));
+  const dashboardServiceScript = path.join(pluginDir, 'scripts', 'opencode_memory_dashboard.mjs');
+
+  // Runtime state
+  const sessionRecallState = new Map();
+  const sessionUserMessageCounters = new Map();
+
+  // Recall trigger patterns
+  const RECALL_TRIGGER_PATTERNS = [
+    /另一个对话|另外一个对话|上一个对话|上次那个对话|之前那个对话|跨对话/i,
+    /另外的session|上一个session|之前的session|那个session/i,
+    /in another chat|in previous chat|from previous session|other session/i
+  ];
+
+  if (!fs.existsSync(memoryDir)) fs.mkdirSync(memoryDir, { recursive: true });
+  if (!fs.existsSync(projectsDir)) fs.mkdirSync(projectsDir, { recursive: true });
+  if (!fs.existsSync(globalMemoryPath)) {
+    fs.writeFileSync(globalMemoryPath, JSON.stringify({ preferences: {}, snippets: {} }, null, 2));
+  }
+  ensureDashboardDir();
+  if (AUTO_DASHBOARD_AUTOSTART) {
+    ensureDashboardServiceStarted();
+    process.once('exit', () => ensureDashboardServiceStopped());
+  }
+
+  function ensureDashboardServiceStarted() {
+    try {
+      if (!fs.existsSync(dashboardServiceScript)) return;
+
+      const args = [
+        dashboardServiceScript,
+        'start',
+        String(AUTO_DASHBOARD_PORT),
+        String(process.pid),
+        String(AUTO_OPENCODE_WEB_PORT)
+      ];
+
+      // Normal start (dashboard service handles already-running as success).
+      const started = spawnSync('node', args, { stdio: 'ignore' });
+      if (started.status !== 0) {
+        // Avoid aggressive recovery here; plugin may initialize concurrently.
+        // If another initializer won the race, service is already running.
+      }
+    } catch (err) {
+      console.error('memory-system dashboard autostart failed:', err);
+    }
+  }
+
+  function ensureDashboardServiceStopped() {
+    try {
+      if (!fs.existsSync(dashboardServiceScript)) return;
+      spawnSync('node', [dashboardServiceScript, 'stop', String(AUTO_DASHBOARD_PORT)], { stdio: 'ignore' });
+    } catch (err) {
+      console.error('memory-system dashboard stop failed:', err);
+    }
+  }
+
+  function getProjectName() {
+    return path.basename(process.cwd());
+  }
+
+  function getProjectDir(projectName = getProjectName()) {
+    const projectDir = path.join(projectsDir, projectName);
+    if (!fs.existsSync(projectDir)) fs.mkdirSync(projectDir, { recursive: true });
+    return projectDir;
+  }
+
+  function getProjectMemoryPath(projectName = getProjectName()) {
+    return path.join(getProjectDir(projectName), 'memory.json');
+  }
+
+  function getProjectSessionsDir(projectName = getProjectName()) {
+    const sessionsDir = path.join(getProjectDir(projectName), 'sessions');
+    if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir, { recursive: true });
+    return sessionsDir;
+  }
+
+  function sessionFileName(sessionID) {
+    return `${encodeURIComponent(sessionID)}.json`;
+  }
+
+  function getSessionMemoryPath(sessionID, projectName = getProjectName()) {
+    return path.join(getProjectSessionsDir(projectName), sessionFileName(sessionID));
+  }
+
+  function hasSessionMemoryFile(sessionID, projectName = getProjectName()) {
+    return fs.existsSync(getSessionMemoryPath(sessionID, projectName));
+  }
+
+  function readJson(filePath) {
+    if (!fs.existsSync(filePath)) return {};
+    try {
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch {
+      return {};
+    }
+  }
+
+  function writeJson(filePath, data) {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  }
+
+  function truncateText(value, max = AUTO_MAX_EVENT_TEXT) {
+    if (typeof value !== 'string') return '';
+    if (value.length <= max) return value;
+    return `${value.slice(0, max)}...`;
+  }
+
+  function normalizeText(value) {
+    if (typeof value !== 'string') return '';
+    return value.replace(/\s+/g, ' ').trim();
+  }
+
+  function estimateTokensFromText(text) {
+    const chars = String(text || '').length;
+    if (chars <= 0) return 0;
+    return Math.ceil(chars / 4);
+  }
+
+  function deriveSessionTitleFromEvents(sessionData) {
+    const events = Array.isArray(sessionData?.recentEvents) ? sessionData.recentEvents : [];
+    const firstUser = events.find((ev) => ev?.kind === 'user-message' && normalizeText(String(ev?.summary || '')));
+    if (firstUser) return truncateText(normalizeText(String(firstUser.summary || '')), 60);
+
+    const firstAssistant = events.find((ev) => ev?.kind === 'assistant-message' && normalizeText(String(ev?.summary || '')));
+    if (firstAssistant) return truncateText(normalizeText(String(firstAssistant.summary || '')), 60);
+
+    return '';
+  }
+
+  function charsFromTokenBudget(tokenBudget) {
+    return Math.max(200, Number(tokenBudget || 0) * 4);
+  }
+
+  function isConversationEvent(ev) {
+    return ev?.kind === 'user-message' || ev?.kind === 'assistant-message';
+  }
+
+  function tokenize(text) {
+    const clean = normalizeText(String(text || '')).toLowerCase();
+    if (!clean) return [];
+    return clean.split(/[^a-z0-9\u4e00-\u9fff]+/i).filter((t) => t.length >= AUTO_RECALL_MIN_QUERY_LEN);
+  }
+
+  function extractContentText(content) {
+    if (typeof content === 'string') return normalizeText(content);
+    if (Array.isArray(content)) {
+      return normalizeText(
+        content
+          .map((item) => {
+            if (typeof item === 'string') return item;
+            if (item && typeof item.text === 'string') return item.text;
+            if (item && typeof item.content === 'string') return item.content;
+            return '';
+          })
+          .filter(Boolean)
+          .join(' ')
+      );
+    }
+    if (content && typeof content === 'object') {
+      if (typeof content.text === 'string') return normalizeText(content.text);
+      if (typeof content.content === 'string') return normalizeText(content.content);
+    }
+    return '';
+  }
+
+  function stableFingerprint(kind, summary, sessionId, toolName = '') {
+    return `${sessionId || 'unknown'}|${kind}|${toolName}|${summary}`;
+  }
+
+  function emptyStats() {
+    return {
+      userMessages: 0,
+      assistantMessages: 0,
+      toolResults: 0,
+      systemEvents: 0
+    };
+  }
+
+  function sortByUpdated(items) {
+    return [...items].sort((a, b) => {
+      const ta = Date.parse(a?.updatedAt || a?.createdAt || 0) || 0;
+      const tb = Date.parse(b?.updatedAt || b?.createdAt || 0) || 0;
+      return tb - ta;
+    });
+  }
+
+  function extractSessionID(event) {
+    return (
+      event?.properties?.info?.id ||
+      event?.properties?.sessionID ||
+      event?.session?.id ||
+      event?.data?.sessionID ||
+      null
+    );
+  }
+
+  function extractSessionTitle(event) {
+    return normalizeText(
+      event?.properties?.info?.title ||
+      event?.session?.title ||
+      event?.data?.title ||
+      event?.title ||
+      ''
+    );
+  }
+
+  function ensureDashboardDir() {
+    if (!fs.existsSync(dashboardDir)) fs.mkdirSync(dashboardDir, { recursive: true });
+  }
+
+  function pushLineWithLimit(lines, line, state) {
+    if (!line) return;
+    const next = `${line}\n`;
+    if (state.chars + next.length > state.maxChars) return;
+    lines.push(line);
+    state.chars += next.length;
+  }
+
+  function readProjectMeta(projectName = getProjectName()) {
+    return readJson(getProjectMemoryPath(projectName)) || {};
+  }
+
+  function writeProjectMeta(projectMeta, projectName = getProjectName()) {
+    writeJson(getProjectMemoryPath(projectName), projectMeta || {});
+  }
+
+  function readLegacySessionFromMeta(sessionID, projectName = getProjectName()) {
+    const meta = readProjectMeta(projectName);
+    const legacy = meta?.autoMemory?.sessions?.[sessionID];
+    if (!legacy || typeof legacy !== 'object') return null;
+    return {
+      sessionID,
+      project: projectName,
+      createdAt: legacy.createdAt || new Date().toISOString(),
+      updatedAt: legacy.updatedAt || new Date().toISOString(),
+      stats: legacy.stats || emptyStats(),
+      recentEvents: Array.isArray(legacy.recentEvents) ? legacy.recentEvents : [],
+      summary: {
+        compressedText: normalizeText(String(legacy.summary?.compressedText || legacy.lastSummary || '')),
+        compressedEvents: Number(legacy.summary?.compressedEvents || 0),
+        lastCompressedAt: legacy.summary?.lastCompressedAt || null
+      },
+      lastFingerprint: legacy.lastFingerprint || ''
+    };
+  }
+
+  function createEmptySessionMemory(sessionID, projectName = getProjectName()) {
+    const now = new Date().toISOString();
+    return {
+      sessionID,
+      sessionTitle: '',
+      project: projectName,
+      createdAt: now,
+      updatedAt: now,
+      stats: emptyStats(),
+      recentEvents: [],
+      summary: {
+        compressedText: '',
+        compressedEvents: 0,
+        lastCompressedAt: null
+      },
+      recall: {
+        count: 0,
+        lastAt: null,
+        lastQuery: ''
+      },
+      budget: {
+        bodyTokenBudget: AUTO_BODY_TOKEN_BUDGET,
+        lastEstimatedBodyTokens: 0,
+        lastCompactedAt: null,
+        lastCompactionReason: ''
+      },
+      lastFingerprint: ''
+    };
+  }
+
+  function loadSessionMemory(sessionID, projectName = getProjectName()) {
+    const filePath = getSessionMemoryPath(sessionID, projectName);
+    if (fs.existsSync(filePath)) {
+      const data = readJson(filePath);
+      if (data && typeof data === 'object' && data.sessionID) {
+        if (!normalizeText(data.sessionTitle || '')) {
+          data.sessionTitle = deriveSessionTitleFromEvents(data);
+        }
+        return data;
+      }
+    }
+
+    const legacy = readLegacySessionFromMeta(sessionID, projectName);
+    if (legacy) return legacy;
+
+    return createEmptySessionMemory(sessionID, projectName);
+  }
+
+  function listSessionMemories(projectName = getProjectName()) {
+    const results = [];
+    const sessionsDir = getProjectSessionsDir(projectName);
+
+    let files = [];
+    try {
+      files = fs.readdirSync(sessionsDir).filter((f) => f.endsWith('.json'));
+    } catch {
+      files = [];
+    }
+
+    for (const file of files) {
+      const p = path.join(sessionsDir, file);
+      const data = readJson(p);
+      if (data && typeof data === 'object' && data.sessionID) {
+        results.push(data);
+      }
+    }
+
+    // Backward compatibility: include legacy sessions not yet migrated.
+    const meta = readProjectMeta(projectName);
+    const legacySessions = meta?.autoMemory?.sessions && typeof meta.autoMemory.sessions === 'object'
+      ? meta.autoMemory.sessions
+      : {};
+
+    for (const [sid] of Object.entries(legacySessions)) {
+      if (results.some((r) => r.sessionID === sid)) continue;
+      const legacy = readLegacySessionFromMeta(sid, projectName);
+      if (legacy) results.push(legacy);
+    }
+
+    return sortByUpdated(results);
+  }
+
+  function pruneSessionFiles(projectName = getProjectName(), keepSessionID = '') {
+    const all = listSessionMemories(projectName);
+    if (all.length <= AUTO_MAX_SESSIONS_PER_PROJECT) return;
+
+    const removable = all
+      .filter((s) => s.sessionID !== keepSessionID)
+      .slice(AUTO_MAX_SESSIONS_PER_PROJECT - 1);
+
+    for (const s of removable) {
+      const p = getSessionMemoryPath(s.sessionID, projectName);
+      if (fs.existsSync(p)) {
+        try {
+          fs.unlinkSync(p);
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+    }
+  }
+
+  function updateProjectMetaFromSession(sessionData, projectName = getProjectName()) {
+    const metaPath = getProjectMemoryPath(projectName);
+    const meta = readJson(metaPath) || {};
+
+    if (!meta.autoMemory || typeof meta.autoMemory !== 'object') {
+      meta.autoMemory = {
+        enabled: true,
+        version: AUTO_MEMORY_VERSION,
+        createdAt: new Date().toISOString(),
+        sessions: {}
+      };
+    }
+
+    if (!meta.autoMemory.sessions || typeof meta.autoMemory.sessions !== 'object') {
+      meta.autoMemory.sessions = {};
+    }
+
+    meta.autoMemory.version = AUTO_MEMORY_VERSION;
+    meta.autoMemory.updatedAt = new Date().toISOString();
+
+    meta.autoMemory.sessions[sessionData.sessionID] = {
+      sessionID: sessionData.sessionID,
+      createdAt: sessionData.createdAt,
+      updatedAt: sessionData.updatedAt,
+      stats: sessionData.stats || emptyStats(),
+      // keep only short recent tail in meta to avoid giant file
+      recentEvents: Array.isArray(sessionData.recentEvents)
+        ? sessionData.recentEvents.slice(-12)
+        : [],
+      summary: {
+        compressedEvents: Number(sessionData?.summary?.compressedEvents || 0),
+        lastCompressedAt: sessionData?.summary?.lastCompressedAt || null,
+        compressedText: truncateText(normalizeText(String(sessionData?.summary?.compressedText || '')), 600)
+      },
+      lastFingerprint: sessionData.lastFingerprint || ''
+    };
+
+    // prune legacy map to avoid growth
+    const entries = Object.entries(meta.autoMemory.sessions || {});
+    const sorted = entries.sort((a, b) => {
+      const ta = Date.parse(a[1]?.updatedAt || a[1]?.createdAt || 0) || 0;
+      const tb = Date.parse(b[1]?.updatedAt || b[1]?.createdAt || 0) || 0;
+      return tb - ta;
+    });
+    for (const [sid] of sorted.slice(AUTO_MAX_SESSIONS_PER_PROJECT)) {
+      delete meta.autoMemory.sessions[sid];
+    }
+
+    writeJson(metaPath, meta);
+  }
+
+  function buildCompressedChunk(events) {
+    if (!Array.isArray(events) || events.length === 0) return '';
+
+    const counts = {
+      user: 0,
+      assistant: 0,
+      tool: 0,
+      other: 0
+    };
+    const highlights = [];
+
+    for (const ev of events) {
+      if (ev?.kind === 'user-message') counts.user += 1;
+      else if (ev?.kind === 'assistant-message') counts.assistant += 1;
+      else if (ev?.kind === 'tool-result') counts.tool += 1;
+      else counts.other += 1;
+
+      if (highlights.length < 8) {
+        const msg = truncateText(normalizeText(String(ev?.summary || '')), 140);
+        if (msg) highlights.push(`- ${ev?.kind || 'event'}: ${msg}`);
+      }
+    }
+
+    const header = `[${new Date().toISOString()}] compressed ${events.length} events (u=${counts.user}, a=${counts.assistant}, t=${counts.tool}, o=${counts.other})`;
+    return [header, ...highlights].join('\n');
+  }
+
+  function compressSessionMemory(sessionData) {
+    if (!Array.isArray(sessionData.recentEvents)) sessionData.recentEvents = [];
+
+    if (sessionData.recentEvents.length <= AUTO_SUMMARY_TRIGGER_EVENTS) return;
+
+    const toCompress = sessionData.recentEvents.slice(
+      0,
+      Math.max(0, sessionData.recentEvents.length - AUTO_SUMMARY_KEEP_RECENT_EVENTS)
+    );
+    if (!toCompress.length) return;
+
+    const chunk = buildCompressedChunk(toCompress);
+    const current = normalizeText(String(sessionData?.summary?.compressedText || ''));
+    const merged = [current, chunk].filter(Boolean).join('\n\n');
+
+    sessionData.summary = {
+      compressedText: truncateText(merged, AUTO_SUMMARY_MAX_CHARS),
+      compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + toCompress.length,
+      lastCompressedAt: new Date().toISOString()
+    };
+
+    sessionData.recentEvents = sessionData.recentEvents.slice(-AUTO_SUMMARY_KEEP_RECENT_EVENTS);
+  }
+
+  function estimateBodyTokens(sessionData) {
+    const events = Array.isArray(sessionData?.recentEvents) ? sessionData.recentEvents : [];
+    let tokens = 0;
+    for (const ev of events) {
+      if (!isConversationEvent(ev)) continue;
+      tokens += estimateTokensFromText(ev?.summary || '');
+    }
+    tokens += estimateTokensFromText(sessionData?.summary?.compressedText || '');
+    return tokens;
+  }
+
+  function appendCompressedSummaryChunk(sessionData, eventsToCompress) {
+    const chunk = buildCompressedChunk(eventsToCompress);
+    const current = normalizeText(String(sessionData?.summary?.compressedText || ''));
+    const merged = [current, chunk].filter(Boolean).join('\n\n');
+    sessionData.summary = {
+      compressedText: truncateText(merged, AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE),
+      compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + eventsToCompress.length,
+      lastCompressedAt: new Date().toISOString()
+    };
+  }
+
+  function compactConversationByBudget(sessionData) {
+    if (!Array.isArray(sessionData.recentEvents) || !sessionData.recentEvents.length) return;
+
+    const budget = AUTO_BODY_TOKEN_BUDGET;
+    const softLimit = Math.floor(budget * AUTO_BODY_BUDGET_SOFT_RATIO);
+    const hardLimit = Math.floor(budget * AUTO_BODY_BUDGET_HARD_RATIO);
+    const target = Math.floor(budget * AUTO_BODY_BUDGET_TARGET_RATIO);
+    let estimated = estimateBodyTokens(sessionData);
+
+    sessionData.budget = sessionData.budget || {
+      bodyTokenBudget: budget,
+      lastEstimatedBodyTokens: 0,
+      lastCompactedAt: null,
+      lastCompactionReason: ''
+    };
+    sessionData.budget.bodyTokenBudget = budget;
+    sessionData.budget.lastEstimatedBodyTokens = estimated;
+
+    if (estimated <= softLimit) return;
+
+    let guard = 0;
+    while (estimated > target && guard < 12) {
+      guard += 1;
+      const convoIndices = [];
+      for (let i = 0; i < sessionData.recentEvents.length; i += 1) {
+        if (isConversationEvent(sessionData.recentEvents[i])) convoIndices.push(i);
+      }
+      if (convoIndices.length <= AUTO_BODY_KEEP_RECENT_CONVO_EVENTS) break;
+
+      const keepFrom = convoIndices.length - AUTO_BODY_KEEP_RECENT_CONVO_EVENTS;
+      const compactable = convoIndices.slice(0, keepFrom);
+      if (!compactable.length) break;
+
+      const batchSize = estimated >= hardLimit ? 16 : 8;
+      const selected = compactable.slice(0, batchSize);
+      const selectedSet = new Set(selected);
+      const toCompress = selected.map((idx) => sessionData.recentEvents[idx]).filter(Boolean);
+      if (!toCompress.length) break;
+
+      appendCompressedSummaryChunk(sessionData, toCompress);
+      sessionData.recentEvents = sessionData.recentEvents.filter((_, idx) => !selectedSet.has(idx));
+      estimated = estimateBodyTokens(sessionData);
+    }
+
+    sessionData.budget.lastEstimatedBodyTokens = estimated;
+    if (estimated > softLimit) {
+      sessionData.budget.lastCompactedAt = new Date().toISOString();
+      sessionData.budget.lastCompactionReason = `conversation_budget_over_soft_limit(${softLimit})`;
+    }
+  }
+
+  function enforceSessionFileBudget(sessionData, sessionPath) {
+    let guard = 0;
+    while (fs.existsSync(sessionPath) && fs.statSync(sessionPath).size > AUTO_SESSION_FILE_MAX_BYTES && guard < 8) {
+      guard += 1;
+
+      const events = Array.isArray(sessionData.recentEvents) ? sessionData.recentEvents : [];
+      if (events.length > 6) {
+        const cut = Math.max(1, events.length - 6);
+        const chunk = buildCompressedChunk(events.slice(0, cut));
+        const merged = [
+          normalizeText(String(sessionData?.summary?.compressedText || '')),
+          chunk
+        ].filter(Boolean).join('\n\n');
+        sessionData.summary = {
+          compressedText: truncateText(merged, AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE),
+          compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + cut,
+          lastCompressedAt: new Date().toISOString()
+        };
+        sessionData.recentEvents = events.slice(cut);
+      } else {
+        sessionData.summary = {
+          compressedText: truncateText(
+            normalizeText(String(sessionData?.summary?.compressedText || '')),
+            Math.min(AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE, 1000)
+          ),
+          compressedEvents: Number(sessionData?.summary?.compressedEvents || 0),
+          lastCompressedAt: new Date().toISOString()
+        };
+        sessionData.recentEvents = events.slice(-4).map((ev) => ({
+          ts: ev?.ts || new Date().toISOString(),
+          kind: ev?.kind || 'event',
+          tool: ev?.tool,
+          summary: truncateText(normalizeText(String(ev?.summary || '')), 160)
+        }));
+      }
+
+      if (sessionData?.recall?.lastQuery) {
+        sessionData.recall.lastQuery = truncateText(normalizeText(String(sessionData.recall.lastQuery)), 120);
+      }
+
+      sessionData.budget = sessionData.budget || {};
+      sessionData.budget.lastCompactedAt = new Date().toISOString();
+      sessionData.budget.lastCompactionReason = `session_file_size_over_limit(${AUTO_SESSION_FILE_MAX_BYTES})`;
+
+      writeJson(sessionPath, sessionData);
+      if (fs.statSync(sessionPath).size <= AUTO_SESSION_FILE_TARGET_BYTES) break;
+    }
+  }
+
+  function persistSessionMemory(sessionData, projectName = getProjectName()) {
+    sessionData.updatedAt = new Date().toISOString();
+    const sessionPath = getSessionMemoryPath(sessionData.sessionID, projectName);
+    writeJson(sessionPath, sessionData);
+    enforceSessionFileBudget(sessionData, sessionPath);
+    updateProjectMetaFromSession(sessionData, projectName);
+    pruneSessionFiles(projectName, sessionData.sessionID);
+  }
+
+  function appendAutoEvent({ sessionID, kind, summary, rawEvent = null, toolName = '' }) {
+    try {
+      if (!sessionID || !kind) return;
+
+      const projectName = getProjectName();
+      const sessionData = loadSessionMemory(sessionID, projectName);
+      const titleFromEvent = extractSessionTitle(rawEvent);
+      if (titleFromEvent) sessionData.sessionTitle = titleFromEvent;
+      const cleanSummary = truncateText(normalizeText(summary || ''));
+      const fp = stableFingerprint(kind, cleanSummary, sessionID, toolName);
+
+      if (sessionData.lastFingerprint === fp) return;
+
+      const eventRecord = {
+        ts: new Date().toISOString(),
+        kind,
+        summary: cleanSummary
+      };
+
+      if (toolName) eventRecord.tool = toolName;
+      if (rawEvent?.type) eventRecord.eventType = rawEvent.type;
+
+      sessionData.recentEvents = Array.isArray(sessionData.recentEvents) ? sessionData.recentEvents : [];
+      sessionData.recentEvents.push(eventRecord);
+      if (!normalizeText(sessionData.sessionTitle || '')) {
+        const derivedTitle = deriveSessionTitleFromEvents(sessionData);
+        if (derivedTitle) sessionData.sessionTitle = derivedTitle;
+      }
+      if (sessionData.recentEvents.length > AUTO_MAX_EVENTS_PER_SESSION) {
+        sessionData.recentEvents = sessionData.recentEvents.slice(-AUTO_MAX_EVENTS_PER_SESSION);
+      }
+
+      sessionData.stats = sessionData.stats || emptyStats();
+      if (kind === 'user-message') sessionData.stats.userMessages = (sessionData.stats.userMessages || 0) + 1;
+      else if (kind === 'assistant-message') sessionData.stats.assistantMessages = (sessionData.stats.assistantMessages || 0) + 1;
+      else if (kind === 'tool-result') sessionData.stats.toolResults = (sessionData.stats.toolResults || 0) + 1;
+      else sessionData.stats.systemEvents = (sessionData.stats.systemEvents || 0) + 1;
+
+      sessionData.lastFingerprint = fp;
+      compressSessionMemory(sessionData);
+      compactConversationByBudget(sessionData);
+      persistSessionMemory(sessionData, projectName);
+      writeDashboardFiles();
+    } catch (err) {
+      console.error('memory-system auto event write failed:', err);
+    }
+  }
+
+  function shouldTriggerRecall(text) {
+    const t = normalizeText(String(text || ''));
+    if (!t) return false;
+    return RECALL_TRIGGER_PATTERNS.some((re) => re.test(t));
+  }
+
+  function scoreSessionForQuery(sessionData, queryTokens) {
+    if (!sessionData || !queryTokens.length) return 0;
+    const recent = Array.isArray(sessionData.recentEvents)
+      ? sessionData.recentEvents.map((e) => normalizeText(String(e?.summary || ''))).join(' ')
+      : '';
+    const compressed = normalizeText(String(sessionData?.summary?.compressedText || ''));
+    const blob = `${recent} ${compressed}`.toLowerCase();
+
+    let score = 0;
+    for (const token of queryTokens) {
+      if (blob.includes(token)) score += 2;
+    }
+
+    // Slight recency bias
+    const updated = Date.parse(sessionData?.updatedAt || 0) || 0;
+    if (updated > 0) score += 0.1;
+
+    return score;
+  }
+
+  function buildRecallContextText(query, sessions, options = {}) {
+    const budgetChars = charsFromTokenBudget(options.tokenBudget || AUTO_RECALL_TOKEN_BUDGET);
+    const maxChars = Math.min(Number(options.maxChars || AUTO_RECALL_MAX_CHARS), budgetChars);
+    const maxEventsPerSession = Number(options.maxEventsPerSession || AUTO_RECALL_MAX_EVENTS_PER_SESSION);
+
+    const lines = [];
+    const state = { chars: 0, maxChars };
+
+    pushLineWithLimit(lines, `<OPENCODE_MEMORY_RECALL query="${truncateText(normalizeText(query), 120)}">`, state);
+
+    for (const s of sessions) {
+      const stats = s?.stats || emptyStats();
+      pushLineWithLimit(
+        lines,
+        `Session ${s.sessionID} (updated=${s.updatedAt || 'unknown'}, u=${stats.userMessages || 0}, a=${stats.assistantMessages || 0}, t=${stats.toolResults || 0}):`,
+        state
+      );
+
+      const summary = truncateText(normalizeText(String(s?.summary?.compressedText || '')), 360);
+      if (summary) pushLineWithLimit(lines, `- compressed: ${summary}`, state);
+
+      const events = Array.isArray(s?.recentEvents)
+        ? s.recentEvents.slice(-maxEventsPerSession)
+        : [];
+
+      for (const ev of events) {
+        const toolTag = ev?.tool ? ` [${ev.tool}]` : '';
+        const msg = truncateText(normalizeText(String(ev?.summary || '')), 220);
+        if (msg) pushLineWithLimit(lines, `- ${ev?.kind || 'event'}${toolTag}: ${msg}`, state);
+      }
+    }
+
+    pushLineWithLimit(lines, '</OPENCODE_MEMORY_RECALL>', state);
+
+    if (lines.length <= 2) return '';
+    return lines.join('\n');
+  }
+
+  function recallProjectMemories(query, options = {}) {
+    const projectName = options.projectName || getProjectName();
+    const currentSessionID = options.currentSessionID || null;
+    const includeCurrent = Boolean(options.includeCurrent || false);
+    const maxSessions = Number(options.maxSessions || AUTO_RECALL_TOP_SESSIONS);
+
+    const queryText = normalizeText(String(query || ''));
+    const tokens = tokenize(queryText);
+    if (!tokens.length) {
+      return { text: '', hits: [] };
+    }
+
+    const allSessions = listSessionMemories(projectName);
+    const scored = [];
+
+    for (const s of allSessions) {
+      if (!includeCurrent && currentSessionID && s.sessionID === currentSessionID) continue;
+      const score = scoreSessionForQuery(s, tokens);
+      if (score > 0) scored.push({ score, session: s });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const hits = scored.slice(0, maxSessions).map((x) => x.session);
+
+    const text = buildRecallContextText(queryText, hits, {
+      maxChars: options.maxChars,
+      maxEventsPerSession: options.maxEventsPerSession,
+      tokenBudget: options.tokenBudget
+    });
+
+    return { text, hits, estimatedTokens: estimateTokensFromText(text) };
+  }
+
+  async function injectMemoryText(sessionID, text, reason = 'memory-inject') {
+    try {
+      if (!sessionID || !text) return;
+      await client.session.prompt({
+        path: { id: sessionID },
+        body: {
+          noReply: true,
+          parts: [{ type: 'text', text, synthetic: true }]
+        }
+      });
+    } catch (err) {
+      console.error(`memory-system inject failed (${reason}):`, err);
+    }
+  }
+
+  function buildGlobalPrefsContextText() {
+    const globalMemory = readJson(globalMemoryPath) || {};
+    const prefs = globalMemory?.preferences && typeof globalMemory.preferences === 'object'
+      ? globalMemory.preferences
+      : {};
+
+    const entries = Object.entries(prefs).slice(0, AUTO_INJECT_GLOBAL_PREFS_MAX_ITEMS);
+    if (!entries.length) return '';
+
+    const lines = [];
+    const state = { chars: 0, maxChars: AUTO_INJECT_GLOBAL_PREFS_MAX_CHARS };
+    pushLineWithLimit(lines, '<OPENCODE_GLOBAL_PREFERENCES>', state);
+    for (const [k, v] of entries) {
+      pushLineWithLimit(lines, `- ${k}: ${truncateText(normalizeText(String(v)), 120)}`, state);
+    }
+    pushLineWithLimit(lines, '</OPENCODE_GLOBAL_PREFERENCES>', state);
+
+    if (lines.length <= 2) return '';
+    return lines.join('\n');
+  }
+
+  function buildCurrentSessionSummaryText(sessionID) {
+    if (!sessionID) return '';
+    const s = loadSessionMemory(sessionID);
+    if (!s || !Array.isArray(s.recentEvents)) return '';
+
+    const maxChars = Math.min(
+      charsFromTokenBudget(AUTO_CURRENT_SESSION_SUMMARY_TOKEN_BUDGET),
+      AUTO_CURRENT_SESSION_SUMMARY_MAX_CHARS
+    );
+    const state = { chars: 0, maxChars };
+    const lines = [];
+
+    pushLineWithLimit(lines, `<OPENCODE_CURRENT_SESSION_SUMMARY session="${sessionID}">`, state);
+
+    const stats = s?.stats || emptyStats();
+    pushLineWithLimit(
+      lines,
+      `stats: user=${stats.userMessages || 0}, assistant=${stats.assistantMessages || 0}, tools=${stats.toolResults || 0}`,
+      state
+    );
+
+    const summary = truncateText(normalizeText(String(s?.summary?.compressedText || '')), 260);
+    if (summary) pushLineWithLimit(lines, `compressed: ${summary}`, state);
+
+    const recent = s.recentEvents.slice(-AUTO_CURRENT_SESSION_SUMMARY_MAX_EVENTS);
+    for (const ev of recent) {
+      const msg = truncateText(normalizeText(String(ev?.summary || '')), 160);
+      if (!msg) continue;
+      pushLineWithLimit(lines, `- ${ev?.kind || 'event'}: ${msg}`, state);
+    }
+
+    pushLineWithLimit(lines, '</OPENCODE_CURRENT_SESSION_SUMMARY>', state);
+    if (lines.length <= 2) return '';
+    return lines.join('\n');
+  }
+
+  async function maybeInjectTriggerRecall(sessionID, query) {
+    if (!AUTO_RECALL_ENABLED || !sessionID) return;
+
+    const now = Date.now();
+    const normQuery = normalizeText(query).toLowerCase();
+    const state = sessionRecallState.get(sessionID) || { lastAt: 0, lastQuery: '' };
+
+    if (now - state.lastAt < AUTO_RECALL_COOLDOWN_MS && state.lastQuery === normQuery) {
+      return;
+    }
+
+    const { text, hits } = recallProjectMemories(query, {
+      currentSessionID: sessionID,
+      includeCurrent: false,
+      maxSessions: AUTO_RECALL_TOP_SESSIONS,
+      maxEventsPerSession: AUTO_RECALL_MAX_EVENTS_PER_SESSION,
+      maxChars: AUTO_RECALL_MAX_CHARS,
+      tokenBudget: AUTO_RECALL_TOKEN_BUDGET
+    });
+
+    if (!text || !hits.length) return;
+
+    await injectMemoryText(sessionID, text, 'trigger-recall');
+
+    const mem = loadSessionMemory(sessionID);
+    mem.recall = mem.recall || { count: 0, lastAt: null, lastQuery: '' };
+    mem.recall.count = (mem.recall.count || 0) + 1;
+    mem.recall.lastAt = new Date().toISOString();
+    mem.recall.lastQuery = truncateText(normQuery, 180);
+    persistSessionMemory(mem);
+
+    sessionRecallState.set(sessionID, { lastAt: now, lastQuery: normQuery });
+    writeDashboardFiles();
+  }
+
+  function buildDashboardData() {
+    const globalMemory = readJson(globalMemoryPath) || {};
+    const projects = [];
+
+    let projectDirs = [];
+    try {
+      projectDirs = fs.readdirSync(projectsDir, { withFileTypes: true }).filter((d) => d.isDirectory());
+    } catch {
+      projectDirs = [];
+    }
+
+    for (const d of projectDirs) {
+      const projectName = d.name;
+      const meta = readProjectMeta(projectName);
+      const sessionsRaw = listSessionMemories(projectName);
+
+      const sessionList = sessionsRaw.map((sess) => ({
+        sessionID: sess.sessionID,
+        sessionTitle: normalizeText(sess.sessionTitle || '') || deriveSessionTitleFromEvents(sess) || '',
+        createdAt: sess.createdAt || null,
+        updatedAt: sess.updatedAt || null,
+        stats: sess.stats || emptyStats(),
+        recentEvents: Array.isArray(sess.recentEvents)
+          ? sess.recentEvents.slice(-DASHBOARD_MAX_EVENTS_PER_SESSION_VIEW)
+          : [],
+        summary: {
+          compressedEvents: Number(sess?.summary?.compressedEvents || 0),
+          lastCompressedAt: sess?.summary?.lastCompressedAt || null,
+          compressedText: truncateText(normalizeText(String(sess?.summary?.compressedText || '')), 240)
+        },
+        recall: {
+          count: Number(sess?.recall?.count || 0),
+          lastAt: sess?.recall?.lastAt || null
+        },
+        budget: {
+          bodyTokenBudget: Number(sess?.budget?.bodyTokenBudget || AUTO_BODY_TOKEN_BUDGET),
+          lastEstimatedBodyTokens: Number(sess?.budget?.lastEstimatedBodyTokens || 0),
+          lastCompactedAt: sess?.budget?.lastCompactedAt || null,
+          lastCompactionReason: sess?.budget?.lastCompactionReason || ''
+        }
+      }));
+
+      const totalEvents = sessionList.reduce(
+        (acc, it) => acc + (it.recentEvents?.length || 0) + Number(it?.summary?.compressedEvents || 0),
+        0
+      );
+
+      projects.push({
+        name: projectName,
+        path: getProjectMemoryPath(projectName),
+        lastLearned: meta?.lastLearned || null,
+        techStack: Array.isArray(meta?.techStack) ? meta.techStack : [],
+        sessionCount: sessionList.length,
+        totalEvents,
+        sessions: sortByUpdated(sessionList)
+      });
+    }
+
+    projects.sort((a, b) => {
+      const ta = Date.parse((a.sessions[0] && a.sessions[0].updatedAt) || a.lastLearned || 0) || 0;
+      const tb = Date.parse((b.sessions[0] && b.sessions[0].updatedAt) || b.lastLearned || 0) || 0;
+      return tb - ta;
+    });
+
+    return {
+      generatedAt: new Date().toISOString(),
+      global: {
+        preferences: globalMemory?.preferences && typeof globalMemory.preferences === 'object' ? globalMemory.preferences : {},
+        snippets: globalMemory?.snippets && typeof globalMemory.snippets === 'object' ? globalMemory.snippets : {},
+        feedback: Array.isArray(globalMemory?.feedback) ? globalMemory.feedback : []
+      },
+      projects,
+      summary: {
+        projectCount: projects.length,
+        sessionCount: projects.reduce((acc, p) => acc + p.sessionCount, 0),
+        eventCount: projects.reduce((acc, p) => acc + p.totalEvents, 0)
+      }
+    };
+  }
+
+  function buildDashboardHtml(data) {
+    const payload = JSON.stringify(data).replace(/</g, '\\u003c');
+    const html = [
+      '<!doctype html>',
+      '<html lang="zh-CN">',
+      '<head>',
+      '  <meta charset="UTF-8" />',
+      '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+      '  <title>Memory Dashboard</title>',
+      '  <style>',
+      '    :root { --bg:#f4f6f8; --panel:#fff; --ink:#17212b; --muted:#5f6b76; --accent:#0f766e; --line:#d9e2ea; }',
+      '    * { box-sizing: border-box; }',
+      '    body { margin:0; font-family:"IBM Plex Sans","Noto Sans SC","PingFang SC","Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at 15% 10%, #e0f2fe 0%, var(--bg) 45%), var(--bg); }',
+      '    .layout { display:grid; grid-template-columns:320px 1fr; min-height:100vh; }',
+      '    .sidebar { border-right:1px solid var(--line); background:#fbfdff; padding:16px; overflow:auto; }',
+      '    .main { padding:20px; overflow:auto; }',
+      '    h1 { margin:0 0 12px; font-size:20px; letter-spacing:.2px; }',
+      '    .sub { color:var(--muted); font-size:13px; margin-bottom:12px; }',
+      '    .metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-bottom:14px; }',
+      '    .metric { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px; box-shadow:0 3px 10px rgba(15,23,42,.04); }',
+      '    .metric .k { font-size:11px; color:var(--muted); text-transform:uppercase; }',
+      '    .metric .v { font-size:18px; font-weight:650; margin-top:2px; }',
+      '    .project-item { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px; margin-bottom:8px; cursor:pointer; transition:120ms ease; }',
+      '    .project-item:hover { border-color:#b6c8d6; transform:translateY(-1px); }',
+      '    .project-item.active { border-color:var(--accent); background:#f0fdfa; box-shadow:0 0 0 2px rgba(15,118,110,.08) inset; }',
+      '    .project-item .name { font-weight:650; }',
+      '    .project-item .meta { color:var(--muted); font-size:12px; margin-top:4px; }',
+      '    .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; box-shadow:0 4px 14px rgba(15,23,42,.05); }',
+      '    .session { border:1px solid var(--line); border-radius:10px; margin-bottom:10px; overflow:hidden; background:#fff; }',
+      '    .session-h { padding:10px 12px; display:flex; justify-content:space-between; align-items:center; background:linear-gradient(180deg,#f8fafc,#f1f5f9); border-bottom:1px solid var(--line); cursor:pointer; }',
+      '    .session-id { font-family:"IBM Plex Mono","JetBrains Mono",monospace; font-size:12px; }',
+      '    .stats { font-size:12px; color:var(--muted); }',
+      '    .events { padding:10px 12px; display:none; }',
+      '    .events.open { display:block; }',
+      '    .ev { border-left:3px solid #cbd5e1; padding:6px 8px; margin-bottom:8px; background:#f8fafc; border-radius:6px; }',
+      '    .ev.user-message { border-left-color:#2563eb; }',
+      '    .ev.assistant-message { border-left-color:#7c3aed; }',
+      '    .ev.tool-result { border-left-color:#0f766e; }',
+      '    .ev.session-start, .ev.session-end { border-left-color:#64748b; }',
+      '    .ev .meta { color:var(--muted); font-size:11px; margin-bottom:4px; }',
+      '    .ev .txt { white-space:pre-wrap; font-size:13px; line-height:1.4; }',
+      '    .pref { font-size:13px; color:var(--ink); margin-bottom:4px; }',
+      '    .empty { color:var(--muted); font-size:13px; }',
+      '    @media (max-width:920px) { .layout { grid-template-columns:1fr; } .sidebar { border-right:none; border-bottom:1px solid var(--line); } }',
+      '  </style>',
+      '</head>',
+      '<body>',
+      '  <div class="layout">',
+      '    <aside class="sidebar">',
+      '      <h1 id="titleMain">Memory Dashboard</h1>',
+      '      <div class="sub" id="genAt"></div>',
+      '      <div class="sub"><label id="langLabel" for="langSel">Language</label>: <select id="langSel"><option value="zh">中文</option><option value="en">English</option></select></div>',
+      '      <div class="metrics">',
+      '        <div class="metric"><div class="k">Projects</div><div class="v" id="mProjects">0</div></div>',
+      '        <div class="metric"><div class="k">Sessions</div><div class="v" id="mSessions">0</div></div>',
+      '        <div class="metric"><div class="k">Events</div><div class="v" id="mEvents">0</div></div>',
+      '      </div>',
+      '      <div id="projectList"></div>',
+      '    </aside>',
+      '    <main class="main">',
+      '      <div class="panel"><h1 id="projectTitle" style="font-size:18px;">No project selected</h1><div class="sub" id="projectMeta"></div></div>',
+      '      <div class="panel"><h1 id="globalTitle" style="font-size:16px;">Global Preferences</h1><div class="sub" id="tokenHint">Token estimate is approximate (chars/4).</div><div id="globalPrefs" class="empty">No global preferences.</div></div>',
+      '      <div class="panel"><h1 style="font-size:16px;">Sessions</h1><div id="sessionList" class="empty">No sessions.</div></div>',
+      '    </main>',
+      '  </div>',
+      '  <div id="editModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9999;align-items:center;justify-content:center;">',
+      '    <div style="width:min(900px,92vw);background:#fff;border-radius:12px;padding:14px;border:1px solid #d9e2ea;">',
+      '      <div style="font-weight:650;margin-bottom:8px;" id="editTitle">Edit summary</div>',
+      '      <textarea id="editTextarea" style="width:100%;height:280px;border:1px solid #d9e2ea;border-radius:8px;padding:10px;font-family:IBM Plex Mono,monospace;"></textarea>',
+      '      <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end;">',
+      '        <button id="editCancelBtn">Cancel</button>',
+      '        <button id="editSaveBtn">Save</button>',
+      '      </div>',
+      '    </div>',
+      '  </div>',
+      '  <script>',
+      '    const DATA = ' + payload + ';',
+      '    const $ = (id) => document.getElementById(id);',
+      '    const projectList = $("projectList");',
+      '    const sessionList = $("sessionList");',
+      '    const projectTitle = $("projectTitle");',
+      '    const projectMeta = $("projectMeta");',
+      '    const globalPrefs = $("globalPrefs");',
+      '    const langSel = $("langSel");',
+      '    const I18N = { zh:{title:"记忆看板",lang:"语言",global:"全局偏好",token:"Token 估算为近似值（chars/4）",edit:"编辑摘要",del:"删除会话",nos:"暂无会话",noproj:"暂无项目记忆",save:"保存",cancel:"取消"}, en:{title:"Memory Dashboard",lang:"Language",global:"Global Preferences",token:"Token estimate is approximate (chars/4).",edit:"Edit summary",del:"Delete session",nos:"No sessions.",noproj:"No project memory yet.",save:"Save",cancel:"Cancel"} };',
+      '    let LANG = localStorage.getItem("memory_dashboard_lang") || "zh";',
+      '    function t(k){ return (I18N[LANG]&&I18N[LANG][k]) || (I18N.en&&I18N.en[k]) || k; }',
+      '    $("genAt").textContent = "Generated: " + new Date(DATA.generatedAt).toLocaleString();',
+      '    $("mProjects").textContent = DATA.summary.projectCount;',
+      '    $("mSessions").textContent = DATA.summary.sessionCount;',
+      '    $("mEvents").textContent = DATA.summary.eventCount;',
+      '    async function apiPost(url,payload){ const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); if(!r.ok) throw new Error(await r.text()); return r.json(); }',
+      '    async function editSummary(projectName,sessionID,current){ const modal=$("editModal"); const ta=$("editTextarea"); const saveBtn=$("editSaveBtn"); const cancelBtn=$("editCancelBtn"); $("editTitle").textContent=t("edit")+" - "+sessionID; ta.value=current||""; $("editCancelBtn").textContent=t("cancel"); $("editSaveBtn").textContent=t("save"); modal.style.display="flex"; const close=()=>{ modal.style.display="none"; }; cancelBtn.onclick=close; saveBtn.onclick=async()=>{ if(!window.confirm("Apply summary update and write audit log?")) return; try{ await apiPost("/api/memory/session/summary",{projectName,sessionID,summaryText:ta.value,confirm:true,source:"dashboard"}); close(); window.location.reload(); }catch(e){ alert("Update failed: "+e.message);} }; }',
+      '    async function deleteSession(projectName,sessionID){ if(!window.confirm("Delete this session memory file? This writes an audit log.")) return; try{ await apiPost("/api/memory/session/delete",{projectName,sessionID,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Delete failed: "+e.message);} }',
+      '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); }',
+      '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); if(!entries.length){globalPrefs.textContent=t("noproj")==="No project memory yet."?"No global preferences.":"暂无全局偏好"; return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
+      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sid=document.createElement("div"); sid.className="session-id"; sid.textContent=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:s.sessionID||""; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; st.textContent="id:"+(s.sessionID||"")+" · u:"+(s.stats.userMessages||0)+" · a:"+(s.stats.assistantMessages||0)+" · t:"+(s.stats.toolResults||0)+" · r:"+((s.recall&&s.recall.count)||0)+" · body~"+bt+" tokens"; head.appendChild(sid); head.appendChild(st); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; meta.textContent="compressed summary"+reason; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); }',
+      '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent="sessions="+project.sessionCount+" · events="+project.totalEvents+" · tech="+ts; renderSessions(project); }',
+      '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent="sessions="+p.sessionCount+" · events="+p.totalEvents; item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
+      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=langSel.value; localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); }; applyLang(); renderGlobalPrefs(); renderProjects();',
+      '  </script>',
+      '</body>',
+      '</html>'
+    ];
+    return html.join('\n');
+  }
+
+  function writeDashboardFiles() {
+    try {
+      ensureDashboardDir();
+      const data = buildDashboardData();
+      const html = buildDashboardHtml(data);
+      fs.writeFileSync(dashboardDataPath, JSON.stringify(data, null, 2), 'utf8');
+      fs.writeFileSync(dashboardHtmlPath, html, 'utf8');
+      return {
+        dashboardPath: dashboardHtmlPath,
+        dashboardDataPath,
+        generatedAt: data.generatedAt,
+        summary: data.summary
+      };
+    } catch (err) {
+      console.error('memory-system dashboard write failed:', err);
+      return {
+        dashboardPath: dashboardHtmlPath,
+        generatedAt: null,
+        summary: { projectCount: 0, sessionCount: 0, eventCount: 0 },
+        error: err?.message || String(err)
+      };
+    }
+  }
+
+  const memoryDocs = `
+<OPENCODE_KNOWLEDGE_BASE topic="Memory System">
+# OpenCode Memory System
+Use /memory recall <query> to manually retrieve relevant memory from previous sessions.
+</OPENCODE_KNOWLEDGE_BASE>
+`;
+
+  return {
+    name: 'memory-system',
+    tool: {
+      memory: {
+        description: 'Manage OpenCode memory system (learn, project, global, set, save, export, import, clear, edit, feedback, recall, sessions, dashboard)',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: {
+              type: 'string',
+              enum: ['learn', 'project', 'global', 'set', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard'],
+              description: 'The memory command to execute'
+            },
+            args: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Arguments for the command'
+            }
+          },
+          required: ['command']
+        },
+        execute: async ({ command, args = [] }) => {
+          const projectMemoryPath = getProjectMemoryPath();
+          const projectName = getProjectName();
+
+          switch (command) {
+            case 'learn': {
+              let claudeMdContent = '';
+              const claudeMdPath = path.join(process.cwd(), 'CLAUDE.md');
+              if (fs.existsSync(claudeMdPath)) {
+                claudeMdContent = fs.readFileSync(claudeMdPath, 'utf8');
+              }
+
+              const techStack = [];
+              if (fs.existsSync(path.join(process.cwd(), 'package.json'))) techStack.push('Node.js');
+              if (fs.existsSync(path.join(process.cwd(), 'tsconfig.json'))) techStack.push('TypeScript');
+              if (fs.existsSync(path.join(process.cwd(), 'pom.xml'))) techStack.push('Java/Maven');
+              if (fs.existsSync(path.join(process.cwd(), 'requirements.txt'))) techStack.push('Python');
+              if (fs.existsSync(path.join(process.cwd(), 'go.mod'))) techStack.push('Go');
+
+              const projectMemory = readJson(projectMemoryPath) || {};
+              projectMemory.techStack = techStack;
+              projectMemory.claudeMd = claudeMdContent;
+              projectMemory.lastLearned = new Date().toISOString();
+
+              writeJson(projectMemoryPath, projectMemory);
+              writeDashboardFiles();
+
+              return `Memory learned for project "${projectName}".\nTech Stack detected: ${techStack.join(', ')}\nCLAUDE.md: ${claudeMdContent ? 'Found and indexed' : 'Not found'}`;
+            }
+
+            case 'project': {
+              const memory = readJson(projectMemoryPath);
+              const sessionCount = listSessionMemories(projectName).length;
+              return `Project Memory for "${projectName}":\n${JSON.stringify(memory, null, 2)}\n\nSession files: ${sessionCount}`;
+            }
+
+            case 'global': {
+              const memory = readJson(globalMemoryPath);
+              return `Global Memory:\n${JSON.stringify(memory, null, 2)}`;
+            }
+
+            case 'set': {
+              if (args.length < 2) return 'Usage: /memory set <key> <value>';
+              const key = args[0];
+              const value = args.slice(1).join(' ');
+
+              const globalMemory = readJson(globalMemoryPath);
+              const parts = key.split('.');
+              let current = globalMemory;
+              for (let i = 0; i < parts.length - 1; i++) {
+                if (!current[parts[i]]) current[parts[i]] = {};
+                current = current[parts[i]];
+              }
+              current[parts[parts.length - 1]] = value;
+
+              writeJson(globalMemoryPath, globalMemory);
+              writeDashboardFiles();
+              return `Global setting updated: ${key} = ${value}`;
+            }
+
+            case 'save': {
+              if (args.length < 2 || args[0] !== 'snippet') return 'Usage: /memory save snippet <name>';
+              const snippetName = args[1];
+
+              const globalMemory = readJson(globalMemoryPath);
+              if (!globalMemory.snippets) globalMemory.snippets = {};
+              globalMemory.snippets[snippetName] = 'Snippet content placeholder';
+
+              writeJson(globalMemoryPath, globalMemory);
+              writeDashboardFiles();
+              return `Snippet "${snippetName}" saved to global memory.`;
+            }
+
+            case 'export': {
+              if (args[0] === 'project') {
+                const memory = readJson(projectMemoryPath);
+                return JSON.stringify(memory, null, 2);
+              }
+              return 'Usage: /memory export project';
+            }
+
+            case 'import': {
+              const filePath = args[0];
+              if (!filePath) return 'Usage: /memory import <filepath>';
+
+              try {
+                const content = fs.readFileSync(filePath, 'utf8');
+                const data = JSON.parse(content);
+                writeJson(projectMemoryPath, data);
+                writeDashboardFiles();
+                return `Project memory imported from ${filePath}`;
+              } catch (e) {
+                return `Failed to import: ${e.message}`;
+              }
+            }
+
+            case 'clear': {
+              const target = args[0];
+              if (target === 'project') {
+                writeJson(projectMemoryPath, {});
+                const sessionsDir = getProjectSessionsDir(projectName);
+                try {
+                  for (const f of fs.readdirSync(sessionsDir)) {
+                    if (f.endsWith('.json')) fs.unlinkSync(path.join(sessionsDir, f));
+                  }
+                } catch {
+                  // ignore
+                }
+                writeDashboardFiles();
+                return `Project memory for "${projectName}" cleared.`;
+              }
+              if (target === 'all') {
+                writeJson(projectMemoryPath, {});
+                writeJson(globalMemoryPath, { preferences: {}, snippets: {} });
+                const sessionsDir = getProjectSessionsDir(projectName);
+                try {
+                  for (const f of fs.readdirSync(sessionsDir)) {
+                    if (f.endsWith('.json')) fs.unlinkSync(path.join(sessionsDir, f));
+                  }
+                } catch {
+                  // ignore
+                }
+                writeDashboardFiles();
+                return 'All memory (project and global) cleared.';
+              }
+              if (target === 'session') {
+                const sid = args[1];
+                if (!sid) return 'Usage: /memory clear session <sessionID>';
+                const p = getSessionMemoryPath(sid, projectName);
+                if (fs.existsSync(p)) fs.unlinkSync(p);
+                const meta = readProjectMeta(projectName);
+                if (meta?.autoMemory?.sessions?.[sid]) {
+                  delete meta.autoMemory.sessions[sid];
+                  writeProjectMeta(meta, projectName);
+                }
+                writeDashboardFiles();
+                return `Session memory cleared: ${sid}`;
+              }
+              return 'Usage: /memory clear [session <id>|project|all]';
+            }
+
+            case 'edit': {
+              if (args[0] === 'project') {
+                return `Please edit the file directly: ${projectMemoryPath}`;
+              }
+              return 'Usage: /memory edit project';
+            }
+
+            case 'feedback': {
+              const message = args.join(' ');
+              const globalMemory = readJson(globalMemoryPath);
+              if (!globalMemory.feedback) globalMemory.feedback = [];
+              globalMemory.feedback.push({ date: new Date().toISOString(), message });
+              writeJson(globalMemoryPath, globalMemory);
+              writeDashboardFiles();
+              return 'Thank you for your feedback. It has been recorded.';
+            }
+
+            case 'sessions': {
+              const sessions = listSessionMemories(projectName)
+                .slice(0, 20)
+                .map((s) => ({
+                  sessionID: s.sessionID,
+                  updatedAt: s.updatedAt,
+                  stats: s.stats || emptyStats(),
+                  compressedEvents: Number(s?.summary?.compressedEvents || 0)
+                }));
+              return `Session memory list (${projectName}):\n${JSON.stringify(sessions, null, 2)}`;
+            }
+
+            case 'recall': {
+              const query = args.join(' ').trim();
+              if (!query) return 'Usage: /memory recall <query>';
+
+              const { text, hits, estimatedTokens } = recallProjectMemories(query, {
+                includeCurrent: true,
+                maxSessions: 3,
+                maxEventsPerSession: 5,
+                maxChars: 2200,
+                tokenBudget: AUTO_RECALL_TOKEN_BUDGET
+              });
+
+              if (!text || !hits.length) return `No relevant memory found for query: ${query}`;
+
+              return `Recall matches: ${hits.map((h) => h.sessionID).join(', ')}\nEstimated recall tokens: ${estimatedTokens}\n\n${text}`;
+            }
+
+            case 'dashboard': {
+              const action = (args[0] || 'path').toLowerCase();
+              const result = writeDashboardFiles();
+              if (action === 'json') {
+                return JSON.stringify({
+                  dashboard: result,
+                  data: buildDashboardData()
+                }, null, 2);
+              }
+              if (action === 'build') {
+                return `Dashboard rebuilt at: ${result.dashboardPath}\nProjects=${result.summary.projectCount}, Sessions=${result.summary.sessionCount}, Events=${result.summary.eventCount}`;
+              }
+              return `Dashboard path: ${result.dashboardPath}`;
+            }
+
+            default:
+              return `Unknown memory command: ${command}`;
+          }
+        }
+      },
+      context: {
+        description: 'Manage session context (add, view, clear)',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: {
+              type: 'string',
+              enum: ['add', 'view', 'clear'],
+              description: 'The context command'
+            },
+            args: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Arguments for the command'
+            }
+          },
+          required: ['command']
+        },
+        execute: async ({ command, args = [] }) => {
+          switch (command) {
+            case 'add':
+              return `Added to context: ${args.join(' ')}`;
+            case 'view':
+              return 'Current Session Context:\n- (Mock) Active File: None\n- (Mock) Recent Changes: None';
+            case 'clear':
+              return 'Session context cleared.';
+            default:
+              return `Unknown context command: ${command}`;
+          }
+        }
+      },
+      compact: {
+        description: 'Compact the current session context',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => {
+          return 'Context compacted. Redundant details removed.';
+        }
+      }
+    },
+    event: async ({ event }) => {
+      const sessionID = extractSessionID(event);
+
+      if (event.type === 'session.created' && sessionID) {
+        sessionUserMessageCounters.set(sessionID, 0);
+        return;
+      }
+
+      if (!sessionID) return;
+
+      if (event.type === 'user.message') {
+        const text = extractContentText(event?.data?.content || event?.content || event?.data?.text || '');
+        const isFirstUserMessageForSession = !hasSessionMemoryFile(sessionID);
+
+        if (isFirstUserMessageForSession) {
+          appendAutoEvent({
+            sessionID,
+            kind: 'session-start',
+            summary: 'Session created',
+            rawEvent: event
+          });
+
+          if (AUTO_INJECT_MEMORY_DOCS) {
+            await injectMemoryText(sessionID, memoryDocs, 'memory-docs');
+          }
+
+          if (AUTO_INJECT_GLOBAL_PREFS_ON_SESSION_START) {
+            const globalText = buildGlobalPrefsContextText();
+            if (globalText) await injectMemoryText(sessionID, globalText, 'global-prefs');
+          }
+        }
+
+        appendAutoEvent({
+          sessionID,
+          kind: 'user-message',
+          summary: text || 'User message event',
+          rawEvent: event
+        });
+
+        const currentCount = (sessionUserMessageCounters.get(sessionID) || 0) + 1;
+        sessionUserMessageCounters.set(sessionID, currentCount);
+
+        if (
+          AUTO_CURRENT_SESSION_SUMMARY_ENABLED &&
+          currentCount >= AUTO_CURRENT_SESSION_REFRESH_EVERY &&
+          currentCount % AUTO_CURRENT_SESSION_REFRESH_EVERY === 0
+        ) {
+          const currentSummary = buildCurrentSessionSummaryText(sessionID);
+          if (currentSummary) {
+            await injectMemoryText(sessionID, currentSummary, 'current-session-refresh');
+          }
+        }
+
+        if (AUTO_RECALL_ENABLED && shouldTriggerRecall(text)) {
+          await maybeInjectTriggerRecall(sessionID, text);
+        }
+        return;
+      }
+
+      if (event.type === 'assistant.message') {
+        const text = extractContentText(event?.data?.content || event?.content || event?.data?.text || '');
+        appendAutoEvent({
+          sessionID,
+          kind: 'assistant-message',
+          summary: text || 'Assistant message event',
+          rawEvent: event
+        });
+        return;
+      }
+
+      if (event.type === 'tool.result') {
+        const toolName = event?.data?.tool || event?.tool || 'unknown-tool';
+        const inputPreview = truncateText(normalizeText(JSON.stringify(event?.data?.input ?? event?.input ?? {})), 220);
+        const resultPreview = truncateText(
+          normalizeText(
+            typeof (event?.data?.result ?? event?.result) === 'string'
+              ? (event?.data?.result ?? event?.result)
+              : JSON.stringify(event?.data?.result ?? event?.result ?? event?.data?.error ?? event?.error ?? {})
+          ),
+          260
+        );
+
+        appendAutoEvent({
+          sessionID,
+          kind: 'tool-result',
+          toolName,
+          summary: `[${toolName}] input=${inputPreview} output=${resultPreview}`,
+          rawEvent: event
+        });
+        return;
+      }
+
+      if (event.type === 'session.ended') {
+        appendAutoEvent({
+          sessionID,
+          kind: 'session-end',
+          summary: 'Session ended',
+          rawEvent: event
+        });
+        sessionUserMessageCounters.delete(sessionID);
+        sessionRecallState.delete(sessionID);
+      }
+    }
+  };
+};
