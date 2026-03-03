@@ -1170,7 +1170,7 @@ export const MemorySystemPlugin = ({ client }) => {
     for (const token of queryTokens) {
       if (blob.includes(token)) score += 2;
     }
-    if (/路径|path|目录|folder|workdir/i.test(queryJoined) && /\/|[a-z]:\\/i.test(blob)) score += 2;
+    if (/路径|path|目录|folder|workdir/i.test(queryJoined) && /\/|[a-z]:\\/i.test(blob)) score += 1;
     if (/审稿|review|reviewer|投稿|response/i.test(queryJoined) && /审稿|review|response/i.test(blob)) score += 2;
     if (/另一个|之前|上次|session|对话/i.test(queryJoined)) score += 1;
 
@@ -1191,9 +1191,9 @@ export const MemorySystemPlugin = ({ client }) => {
 
     pushLineWithLimit(lines, `<OPENCODE_MEMORY_RECALL query="${truncateText(normalizeText(query), 120)}">`, state);
     pushLineWithLimit(lines, 'Execution policy:', state);
-    pushLineWithLimit(lines, '- If recalled memory contains concrete paths, answer directly from memory first.', state);
-    pushLineWithLimit(lines, '- STRONG RULE: Do NOT run file search/read/list tools unless user explicitly asks to verify/re-check.', state);
-    pushLineWithLimit(lines, '- If answering from memory, say it is from recalled memory and provide the exact path.', state);
+    pushLineWithLimit(lines, '- If recalled memory already contains enough facts to answer the user question, answer directly from recalled memory first.', state);
+    pushLineWithLimit(lines, '- STRONG RULE: Do NOT run file search/read/list tools unless user explicitly asks to verify/re-check, or recalled memory is insufficient/ambiguous.', state);
+    pushLineWithLimit(lines, '- If answering from memory, clearly state it is based on recalled memory and include the key evidence (facts/paths/decisions).', state);
 
     for (const s of sessions) {
       const stats = s?.stats || emptyStats();
@@ -1219,6 +1219,24 @@ export const MemorySystemPlugin = ({ client }) => {
       if (topPaths.length) {
         pushLineWithLimit(lines, '- candidate_paths:', state);
         for (const p of topPaths) pushLineWithLimit(lines, `  - ${truncateText(p, 200)}`, state);
+      }
+
+      const directHints = [];
+      const comp = normalizeText(String(s?.summary?.compressedText || ''));
+      if (comp) {
+        for (const row of comp.split('\n')) {
+          const t = normalizeText(row.replace(/^- /, '').replace(/^  - /, ''));
+          if (!t) continue;
+          if (/status:|task goal:|key outcomes:|blockers:|next actions:|handoff anchor:/i.test(t)) continue;
+          if (/PASS|FAIL|WROTE|Fixed|Edit applied|blocked|done|in-progress|路径|path|目录|workdir|response_package|manuscript|units/i.test(t)) {
+            directHints.push(t);
+          }
+          if (directHints.length >= 5) break;
+        }
+      }
+      if (directHints.length) {
+        pushLineWithLimit(lines, '- direct_answer_hints:', state);
+        for (const h of directHints) pushLineWithLimit(lines, `  - ${truncateText(h, 220)}`, state);
       }
 
       const events = Array.isArray(s?.recentEvents)
@@ -1261,7 +1279,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
     scored.sort((a, b) => b.score - a.score);
     let hits = scored.slice(0, maxSessions).map((x) => x.session);
-    if (!hits.length && /路径|path|目录|folder|workdir|审稿|review|投稿/i.test(queryText)) {
+    if (!hits.length && /路径|path|目录|folder|workdir|审稿|review|投稿|怎么做|结论|决定|方案|结果/i.test(queryText)) {
       const byRecent = allSessions
         .filter((s) => includeCurrent || !currentSessionID || s.sessionID !== currentSessionID)
         .sort((a, b) => (Date.parse(b.updatedAt || 0) || 0) - (Date.parse(a.updatedAt || 0) || 0))
@@ -2124,7 +2142,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           }
         }
 
-        if (AUTO_RECALL_ENABLED && shouldTriggerRecall(text)) {
+        if (AUTO_RECALL_ENABLED && (shouldTriggerRecall(text) || referencesAnotherSessionTitle(text, sessionID))) {
           await maybeInjectTriggerRecall(sessionID, text);
         }
         return;
