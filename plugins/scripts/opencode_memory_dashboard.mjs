@@ -87,6 +87,50 @@ function sessionPathFrom(projectName, sessionID) {
   return path.join(sdir, `${encodeURIComponent(String(sessionID || ''))}.json`);
 }
 
+function rawSessionPathFrom(projectName, sessionID) {
+  const pdir = path.join(projectsDir, String(projectName || ''));
+  const sdir = path.join(pdir, 'sessions');
+  return path.join(sdir, `${String(sessionID || '')}.json`);
+}
+
+function projectMetaPathFrom(projectName) {
+  return path.join(projectsDir, String(projectName || ''), 'memory.json');
+}
+
+function deleteSessionFileVariants(projectName, sessionID) {
+  const encoded = sessionPathFrom(projectName, sessionID);
+  const raw = rawSessionPathFrom(projectName, sessionID);
+  let existed = false;
+  const deleted = [];
+
+  for (const p of [encoded, raw]) {
+    if (fs.existsSync(p)) {
+      existed = true;
+      fs.unlinkSync(p);
+      deleted.push(p);
+    }
+  }
+
+  return { existed, deleted, encoded, raw };
+}
+
+function removeLegacySessionFromMeta(projectName, sessionID) {
+  const metaPath = projectMetaPathFrom(projectName);
+  if (!fs.existsSync(metaPath)) return false;
+  const meta = safeReadJson(metaPath) || {};
+  if (
+    meta?.autoMemory &&
+    meta.autoMemory.sessions &&
+    typeof meta.autoMemory.sessions === 'object' &&
+    Object.prototype.hasOwnProperty.call(meta.autoMemory.sessions, sessionID)
+  ) {
+    delete meta.autoMemory.sessions[sessionID];
+    writeJson(metaPath, meta);
+    return true;
+  }
+  return false;
+}
+
 function mutateDashboardData(projectName, sessionID, updater) {
   if (!fs.existsSync(dataPath)) return;
   const data = safeReadJson(dataPath);
@@ -96,6 +140,23 @@ function mutateDashboardData(projectName, sessionID, updater) {
   const idx = p.sessions.findIndex((s) => s.sessionID === sessionID);
   updater({ data, project: p, sessionIndex: idx });
   writeJson(dataPath, data);
+}
+
+function removeSessionFromDashboardData(projectName, sessionID) {
+  mutateDashboardData(projectName, sessionID, ({ data, project }) => {
+    project.sessions = Array.isArray(project.sessions)
+      ? project.sessions.filter((s) => s.sessionID !== sessionID)
+      : [];
+    project.sessionCount = project.sessions.length;
+    project.totalEvents = project.sessions.reduce(
+      (acc, s) => acc + ((s.recentEvents && s.recentEvents.length) || 0) + Number(s?.summary?.compressedEvents || 0),
+      0
+    );
+
+    data.summary = data.summary || {};
+    data.summary.sessionCount = (data.projects || []).reduce((acc, p) => acc + Number(p.sessionCount || 0), 0);
+    data.summary.eventCount = (data.projects || []).reduce((acc, p) => acc + Number(p.totalEvents || 0), 0);
+  });
 }
 
 function readState() {
@@ -352,24 +413,25 @@ function serve() {
           sendJson(res, 400, { error: 'projectName and sessionID are required' });
           return;
         }
-        const target = sessionPathFrom(projectName, sessionID);
-        const existed = fs.existsSync(target);
-        if (existed) {
-          fs.unlinkSync(target);
-        }
+        const deletedInfo = deleteSessionFileVariants(projectName, sessionID);
+        const legacyRemoved = removeLegacySessionFromMeta(projectName, sessionID);
         appendAudit({
           action: 'delete_session',
           projectName,
           sessionID,
           source: body.source || 'dashboard',
-          existed
+          existed: deletedInfo.existed,
+          legacyRemoved,
+          deletedPaths: deletedInfo.deleted
         });
-        mutateDashboardData(projectName, sessionID, ({ project, sessionIndex }) => {
-          if (sessionIndex < 0) return;
-          project.sessions.splice(sessionIndex, 1);
-          project.sessionCount = Math.max(0, Number(project.sessionCount || 0) - 1);
+        removeSessionFromDashboardData(projectName, sessionID);
+        sendJson(res, 200, {
+          ok: true,
+          existed: deletedInfo.existed,
+          legacyRemoved,
+          deletedPaths: deletedInfo.deleted,
+          checkedPaths: [deletedInfo.encoded, deletedInfo.raw]
         });
-        sendJson(res, 200, { ok: true, path: target, existed });
       } catch (err) {
         sendJson(res, 500, { error: err?.message || String(err) });
       }
