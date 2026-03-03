@@ -358,6 +358,20 @@ export const MemorySystemPlugin = ({ client }) => {
     );
   }
 
+  function extractAbsolutePaths(text) {
+    const s = String(text || '');
+    if (!s) return [];
+    const out = [];
+    const quoted = [...s.matchAll(/['"]((?:\/Users\/|\/home\/|[A-Za-z]:\\)[^'"]+)['"]/g)].map((m) => m[1]);
+    const unix = s.match(/\/Users\/[^\s"'`<>|]+|\/home\/[^\s"'`<>|]+/g) || [];
+    const win = s.match(/[A-Za-z]:\\[^\s"'`<>|]+/g) || [];
+    for (const raw of [...quoted, ...unix, ...win]) {
+      const cleaned = raw.replace(/[),.;:]+$/g, '').replace(/[\\]+$/g, '');
+      if (cleaned.length > 5) out.push(cleaned);
+    }
+    return [...new Set(out)];
+  }
+
   function extractMessageID(event) {
     return (
       event?.properties?.info?.id ||
@@ -1177,8 +1191,8 @@ export const MemorySystemPlugin = ({ client }) => {
 
     pushLineWithLimit(lines, `<OPENCODE_MEMORY_RECALL query="${truncateText(normalizeText(query), 120)}">`, state);
     pushLineWithLimit(lines, 'Execution policy:', state);
-    pushLineWithLimit(lines, '- If the recalled memory already contains a concrete path or file location, answer directly from memory first.', state);
-    pushLineWithLimit(lines, '- Do NOT run file search/read tools unless the user explicitly asks to verify, re-check, or if memory is clearly ambiguous.', state);
+    pushLineWithLimit(lines, '- If recalled memory contains concrete paths, answer directly from memory first.', state);
+    pushLineWithLimit(lines, '- STRONG RULE: Do NOT run file search/read/list tools unless user explicitly asks to verify/re-check.', state);
     pushLineWithLimit(lines, '- If answering from memory, say it is from recalled memory and provide the exact path.', state);
 
     for (const s of sessions) {
@@ -1195,6 +1209,17 @@ export const MemorySystemPlugin = ({ client }) => {
 
       const summary = truncateText(normalizeText(String(s?.summary?.compressedText || '')), 360);
       if (summary) pushLineWithLimit(lines, `- compressed: ${summary}`, state);
+
+      const pathCandidates = new Set();
+      for (const p of extractAbsolutePaths(String(s?.summary?.compressedText || ''))) pathCandidates.add(p);
+      for (const ev of (Array.isArray(s?.recentEvents) ? s.recentEvents.slice(-10) : [])) {
+        for (const p of extractAbsolutePaths(String(ev?.summary || ''))) pathCandidates.add(p);
+      }
+      const topPaths = [...pathCandidates].slice(0, 5);
+      if (topPaths.length) {
+        pushLineWithLimit(lines, '- candidate_paths:', state);
+        for (const p of topPaths) pushLineWithLimit(lines, `  - ${truncateText(p, 200)}`, state);
+      }
 
       const events = Array.isArray(s?.recentEvents)
         ? s.recentEvents.slice(-maxEventsPerSession)
