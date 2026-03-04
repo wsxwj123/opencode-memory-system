@@ -22,12 +22,17 @@ const indexPath = path.join(dashboardDir, 'index.html');
 const dataPath = path.join(dashboardDir, 'data.json');
 const auditDir = path.join(memoryDir, 'audit');
 const auditPath = path.join(auditDir, 'memory-audit.jsonl');
+const trashDir = path.join(memoryDir, 'trash');
+const memoryConfigPath = path.join(memoryDir, 'config.json');
 const statePath = path.join(dashboardDir, '.dashboard-server.json');
 const dockerContainer = `opencode-memory-dashboard-${port}`;
+const RETENTION_OPTIONS = new Set([1, 3, 7, 10, 30]);
+const DEFAULT_RETENTION_DAYS = 30;
 
 function ensureDashboardDir() {
   fs.mkdirSync(dashboardDir, { recursive: true });
   fs.mkdirSync(auditDir, { recursive: true });
+  fs.mkdirSync(trashDir, { recursive: true });
   if (!fs.existsSync(indexPath)) {
     fs.writeFileSync(
       indexPath,
@@ -49,6 +54,106 @@ function safeReadJson(p) {
 
 function writeJson(p, obj) {
   fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf8');
+}
+
+function readMemoryConfig() {
+  const cfg = safeReadJson(memoryConfigPath);
+  if (!cfg || typeof cfg !== 'object') return { trashRetentionDays: DEFAULT_RETENTION_DAYS };
+  const raw = Number(cfg.trashRetentionDays || DEFAULT_RETENTION_DAYS);
+  const days = RETENTION_OPTIONS.has(raw) ? raw : DEFAULT_RETENTION_DAYS;
+  return { ...cfg, trashRetentionDays: days };
+}
+
+function getTrashRetentionDays() {
+  const cfg = readMemoryConfig();
+  return Number(cfg.trashRetentionDays || DEFAULT_RETENTION_DAYS);
+}
+
+function listTrashEntries() {
+  const out = [];
+  if (!fs.existsSync(trashDir)) return out;
+  let projects = [];
+  try {
+    projects = fs.readdirSync(trashDir, { withFileTypes: true }).filter((d) => d.isDirectory());
+  } catch {
+    projects = [];
+  }
+  for (const p of projects) {
+    const pdir = path.join(trashDir, p.name);
+    let files = [];
+    try {
+      files = fs.readdirSync(pdir, { withFileTypes: true }).filter((f) => f.isFile());
+    } catch {
+      files = [];
+    }
+    for (const f of files) {
+      const fp = path.join(pdir, f.name);
+      try {
+        const st = fs.statSync(fp);
+        out.push({
+          projectName: p.name,
+          fileName: f.name,
+          path: fp,
+          size: Number(st.size || 0),
+          mtime: st.mtime.toISOString()
+        });
+      } catch {
+        // ignore broken file
+      }
+    }
+  }
+  out.sort((a, b) => (Date.parse(b.mtime || 0) || 0) - (Date.parse(a.mtime || 0) || 0));
+  return out;
+}
+
+function cleanupTrash(options = {}) {
+  const dryRun = Boolean(options.dryRun);
+  const days = Number(options.days || getTrashRetentionDays() || DEFAULT_RETENTION_DAYS);
+  const ttl = days * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const entries = listTrashEntries();
+  const expired = entries.filter((x) => {
+    const ts = Date.parse(x.mtime || 0) || 0;
+    if (!ts) return false;
+    return now - ts > ttl;
+  });
+  if (!dryRun) {
+    for (const e of expired) {
+      try {
+        if (fs.existsSync(e.path)) fs.unlinkSync(e.path);
+      } catch {
+        // ignore per-file errors
+      }
+    }
+  }
+  return {
+    days,
+    scanned: entries.length,
+    expired: expired.length,
+    removed: dryRun ? 0 : expired.length
+  };
+}
+
+function deleteTrashEntries(entries = []) {
+  const targets = Array.isArray(entries)
+    ? entries.map((x) => String(x || '').trim()).filter(Boolean)
+    : [];
+  if (!targets.length) return { requested: 0, removed: 0 };
+
+  let removed = 0;
+  for (const item of targets) {
+    const resolved = path.resolve(item);
+    if (!resolved.startsWith(path.resolve(trashDir) + path.sep)) continue;
+    try {
+      if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+        fs.unlinkSync(resolved);
+        removed += 1;
+      }
+    } catch {
+      // ignore per-file errors
+    }
+  }
+  return { requested: targets.length, removed };
 }
 
 function appendAudit(entry) {
@@ -139,6 +244,35 @@ function readProjectSessions(projectName) {
         compressedText: sanitizeCompressedSummaryText(obj?.summary?.compressedText || ''),
         compressedPreview: truncateText(sanitizeCompressedSummaryText(obj?.summary?.compressedText || ''), 240)
       },
+      summaryBlocks: (() => {
+        const arr = Array.isArray(obj?.summaryBlocks) ? obj.summaryBlocks : [];
+        const traces = Array.isArray(obj?.sendPretrim?.traces) ? obj.sendPretrim.traces : [];
+        const traceByBlockId = new Map();
+        for (const tr of traces) {
+          const bid = Number(tr?.blockId || 0);
+          if (bid > 0 && !traceByBlockId.has(bid)) traceByBlockId.set(bid, tr);
+        }
+        const recent = arr.slice(-5).map((b) => {
+          const blockId = Number(b?.blockId || 0);
+          const tr = traceByBlockId.get(blockId);
+          const range = (b?.startMessageID && b?.endMessageID)
+            ? `range:${b.startMessageID}->${b.endMessageID}`
+            : '';
+          const saved = tr ? ` save~${Number(tr?.savedTokens || 0)}` : '';
+          const prefix = `${range}${saved}`.trim();
+          const body = normalizeText(String(b?.summary || ''));
+          return {
+            blockId,
+            createdAt: b?.createdAt || null,
+            source: b?.source || '',
+            startMessageID: b?.startMessageID || '',
+            endMessageID: b?.endMessageID || '',
+            consumedMessages: Number(b?.consumedMessages || 0),
+            summaryPreview: truncateText(prefix ? `${prefix} | ${body}` : body, 160)
+          };
+        });
+        return { count: arr.length, recent };
+      })(),
       recall: {
         count: Number(obj?.recall?.count || 0),
         lastAt: obj?.recall?.lastAt || null
@@ -168,7 +302,21 @@ function readProjectSessions(projectName) {
         lastDiscardRemoved: Number(obj?.pruneAudit?.lastDiscardRemoved || 0),
         lastExtractMoved: Number(obj?.pruneAudit?.lastExtractMoved || 0),
         lastEstimatedBodyTokens: Number(obj?.pruneAudit?.lastEstimatedBodyTokens || 0)
+      },
+      sendPretrim: {
+        autoRuns: Number(obj?.sendPretrim?.autoRuns || 0),
+        manualRuns: Number(obj?.sendPretrim?.manualRuns || 0),
+        savedTokensTotal: Number(obj?.sendPretrim?.savedTokensTotal || 0),
+        lastBeforeTokens: Number(obj?.sendPretrim?.lastBeforeTokens || 0),
+        lastAfterTokens: Number(obj?.sendPretrim?.lastAfterTokens || 0),
+        lastSavedTokens: Number(obj?.sendPretrim?.lastSavedTokens || 0),
+        lastAt: obj?.sendPretrim?.lastAt || null,
+        lastReason: obj?.sendPretrim?.lastReason || '',
+        lastStatus: obj?.sendPretrim?.lastStatus || '',
+        traces: Array.isArray(obj?.sendPretrim?.traces) ? obj.sendPretrim.traces.slice(-8) : []
       }
+      ,
+      alerts: obj?.alerts && typeof obj.alerts === 'object' ? obj.alerts : {}
     });
   }
   sessions.sort((a, b) => (Date.parse(b.updatedAt || 0) || 0) - (Date.parse(a.updatedAt || 0) || 0));
@@ -251,6 +399,22 @@ function rawSessionPathFrom(projectName, sessionID) {
   return path.join(sdir, `${String(sessionID || '')}.json`);
 }
 
+function ensureTrashProjectDir(projectName) {
+  const p = path.join(trashDir, String(projectName || 'unknown'));
+  fs.mkdirSync(p, { recursive: true });
+  return p;
+}
+
+function moveFileToTrash(filePath, projectName, sessionID) {
+  if (!fs.existsSync(filePath)) return null;
+  const projectTrash = ensureTrashProjectDir(projectName);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const base = path.basename(filePath);
+  const target = path.join(projectTrash, `${encodeURIComponent(String(sessionID || 'unknown'))}__${stamp}__${base}`);
+  fs.renameSync(filePath, target);
+  return target;
+}
+
 function projectMetaPathFrom(projectName) {
   return path.join(projectsDir, String(projectName || ''), 'memory.json');
 }
@@ -264,8 +428,8 @@ function deleteSessionFileVariants(projectName, sessionID) {
   for (const p of [encoded, raw]) {
     if (fs.existsSync(p)) {
       existed = true;
-      fs.unlinkSync(p);
-      deleted.push(p);
+      const moved = moveFileToTrash(p, projectName, sessionID);
+      deleted.push(moved || p);
     }
   }
 
@@ -481,6 +645,12 @@ function printStatus() {
 
 function serve() {
   ensureDashboardDir();
+  // Startup GC for trash retention policy.
+  cleanupTrash({ days: getTrashRetentionDays() });
+  // Periodic GC every 6 hours.
+  const trashGcTimer = setInterval(() => {
+    cleanupTrash({ days: getTrashRetentionDays() });
+  }, 6 * 60 * 60 * 1000);
   const parentPid = parentPidArg > 0 ? parentPidArg : 0;
   const opencodePort = opencodePortArg > 0 ? opencodePortArg : 4096;
   let miss = 0;
@@ -494,6 +664,7 @@ function serve() {
     }
     miss += 1;
     if (miss >= 12) {
+      clearInterval(trashGcTimer);
       clearInterval(watchdog);
       process.exit(0);
     }
@@ -506,6 +677,57 @@ function serve() {
     if (method === 'GET' && rawPath === '/api/dashboard') {
       const live = buildLiveDashboardData();
       sendJson(res, 200, live);
+      return;
+    }
+
+    if (method === 'GET' && rawPath === '/api/memory/trash') {
+      sendJson(res, 200, {
+        retentionDays: getTrashRetentionDays(),
+        entries: listTrashEntries()
+      });
+      return;
+    }
+
+    if (method === 'POST' && rawPath === '/api/memory/trash/cleanup') {
+      try {
+        const body = await readJsonBody(req);
+        const dryRun = Boolean(body?.dryRun);
+        const days = Number(body?.days || getTrashRetentionDays() || DEFAULT_RETENTION_DAYS);
+        const result = cleanupTrash({ dryRun, days });
+        appendAudit({
+          action: 'trash_cleanup',
+          source: body?.source || 'dashboard',
+          dryRun,
+          days: result.days,
+          scanned: result.scanned,
+          expired: result.expired,
+          removed: result.removed
+        });
+        sendJson(res, 200, { ok: true, ...result });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || String(err) });
+      }
+      return;
+    }
+
+    if (method === 'POST' && rawPath === '/api/memory/trash/delete') {
+      try {
+        const body = await readJsonBody(req);
+        if (!body?.confirm) {
+          sendJson(res, 400, { error: 'confirm=true required' });
+          return;
+        }
+        const result = deleteTrashEntries(body?.entries || []);
+        appendAudit({
+          action: 'trash_delete',
+          source: body?.source || 'dashboard',
+          requested: result.requested,
+          removed: result.removed
+        });
+        sendJson(res, 200, { ok: true, ...result });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || String(err) });
+      }
       return;
     }
 
@@ -664,7 +886,10 @@ function serve() {
     fs.createReadStream(target).pipe(res);
   });
   server.listen(port, '127.0.0.1');
-  server.on('close', () => clearInterval(watchdog));
+  server.on('close', () => {
+    clearInterval(watchdog);
+    clearInterval(trashGcTimer);
+  });
 }
 
 async function main() {

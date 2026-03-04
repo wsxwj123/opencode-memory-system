@@ -24,6 +24,112 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_DISCARD_MAX_REMOVALS_PER_PASS = 30;
   const AUTO_EXTRACT_EVENTS_PER_PASS = 24;
 
+  // Send-time pretrim (DCP-like, conservative)
+  const AUTO_SEND_PRETRIM_ENABLED = true;
+  const AUTO_SEND_PRETRIM_DRY_RUN = false;
+  const AUTO_SEND_PRETRIM_BUDGET = 10_000;
+  const AUTO_SEND_PRETRIM_TARGET = 7_500;
+  const AUTO_SEND_PRETRIM_HARD_RATIO = 0.9;
+  const AUTO_SEND_PRETRIM_DISTILL_TRIGGER_RATIO = 0.8;
+  const AUTO_SEND_PRETRIM_TRACE_LIMIT = 25;
+  const AUTO_SEND_PRETRIM_TURN_PROTECTION = 4;
+  const AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES = 28;
+  const AUTO_SEND_PRETRIM_PROTECTED_TOOLS = ['write', 'edit', 'bash', 'read'];
+  const AUTO_STRATEGY_DEDUP_ENABLED = true;
+  const AUTO_STRATEGY_SUPERSEDE_WRITES_ENABLED = true;
+  const AUTO_STRATEGY_PURGE_ERRORS_ENABLED = true;
+  const AUTO_STRATEGY_PURGE_ERROR_TURNS = 4;
+  const AUTO_STRATEGY_PROTECTED_TOOLS = [
+    'task', 'todowrite', 'todoread', 'distill', 'compress', 'prune', 'batch', 'plan_enter', 'plan_exit'
+  ];
+  const AUTO_STRICT_MODE_ENABLED = false;
+  const AUTO_STRICT_ANCHOR_MAX_LINES = 18;
+  const AUTO_STRICT_ANCHOR_MAX_CHARS = 1800;
+  const AUTO_STRICT_SUPPRESS_CURRENT_SUMMARY_MS = 5 * 60 * 1000;
+  const AUTO_SUMMARY_BLOCK_MAX = 48;
+  const AUTO_DISTILL_SUMMARY_MAX_CHARS = 1600;
+  const AUTO_DISTILL_INPUT_MAX_CHARS = 9000;
+  const AUTO_DISTILL_RANGE_MAX_MESSAGES = 18;
+  const AUTO_DISTILL_RANGE_MIN_MESSAGES = 2;
+
+  function isSendPretrimEnabled() {
+    return AUTO_SEND_PRETRIM_ENABLED && String(process.env.OPENCODE_MEMORY_SEND_PRETRIM || '1') !== '0';
+  }
+
+  function isStrictModeEnabled() {
+    return AUTO_STRICT_MODE_ENABLED || String(process.env.OPENCODE_MEMORY_STRICT_MODE || '0') === '1';
+  }
+
+  function getIndependentDistillConfig() {
+    const enabled = String(process.env.OPENCODE_MEMORY_DISTILL_ENABLED || '0') === '1';
+    const provider = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_PROVIDER || 'openai_compatible')).toLowerCase();
+    const baseURL = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_BASE_URL || ''));
+    const apiKey = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_API_KEY || ''));
+    const model = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_MODEL || ''));
+    const timeoutMs = Math.max(3000, Number(process.env.OPENCODE_MEMORY_DISTILL_TIMEOUT_MS || 12000));
+    const maxTokens = Math.max(128, Number(process.env.OPENCODE_MEMORY_DISTILL_MAX_TOKENS || 420));
+    const temperature = Number(process.env.OPENCODE_MEMORY_DISTILL_TEMPERATURE || 0.2);
+    const useSessionModel = String(process.env.OPENCODE_MEMORY_DISTILL_USE_SESSION_MODEL || '1') !== '0';
+    return {
+      enabled,
+      provider,
+      baseURL,
+      apiKey,
+      model,
+      timeoutMs,
+      maxTokens,
+      temperature: Number.isFinite(temperature) ? temperature : 0.2,
+      useSessionModel
+    };
+  }
+
+  function getDistillMode() {
+    // DCP-style default:
+    // "auto" => prefer independent distill when configured, else session-inline.
+    // "session" => inline structured distill in transform path.
+    // "independent" => external provider call (optional override).
+    const m = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_MODE || 'auto')).toLowerCase();
+    if (m === 'auto') return 'auto';
+    if (m === 'independent') return 'independent';
+    return 'session';
+  }
+
+  function canUseIndependentDistill(config) {
+    if (!config?.enabled) return false;
+    if (!config.baseURL || !config.apiKey) return false;
+    return ['openai_compatible', 'anthropic', 'gemini'].includes(config.provider);
+  }
+
+  function runSessionInlineDistill(candidateItems = []) {
+    const lines = [];
+    const state = { chars: 0, maxChars: AUTO_DISTILL_SUMMARY_MAX_CHARS };
+    const items = Array.isArray(candidateItems) ? candidateItems : [];
+    const snippets = items.flatMap((it) => Array.isArray(it?.snippets) ? it.snippets : []).slice(0, 18);
+    const allText = snippets.join('\n');
+    const paths = extractPathsFromTextLoose(allText).slice(0, 6);
+    const outcomes = snippets.filter((s) => /wrote|saved|fixed|done|pass|完成|已|成功|生成|输出|路径/i.test(s)).slice(0, 6);
+    const constraints = snippets.filter((s) => /必须|不要|only|should|constraint|限制|格式|语言/i.test(s)).slice(0, 4);
+    const next = snippets.filter((s) => /todo|next|后续|下一步|待办|风险|阻塞/i.test(s)).slice(0, 4);
+
+    pushLineWithLimit(lines, 'Completed outcomes:', state);
+    if (outcomes.length) outcomes.forEach((x) => pushLineWithLimit(lines, `- ${truncateText(x, 140)}`, state));
+    else snippets.slice(0, 4).forEach((x) => pushLineWithLimit(lines, `- ${truncateText(x, 140)}`, state));
+
+    pushLineWithLimit(lines, 'Key files/paths:', state);
+    if (paths.length) paths.forEach((p) => pushLineWithLimit(lines, `- ${p}`, state));
+    else pushLineWithLimit(lines, '- (not explicitly detected)', state);
+
+    pushLineWithLimit(lines, 'Decisions/constraints:', state);
+    if (constraints.length) constraints.forEach((x) => pushLineWithLimit(lines, `- ${truncateText(x, 140)}`, state));
+    else pushLineWithLimit(lines, '- keep existing workflow and tools unchanged unless user requests', state);
+
+    pushLineWithLimit(lines, 'Open risks/next steps:', state);
+    if (next.length) next.forEach((x) => pushLineWithLimit(lines, `- ${truncateText(x, 140)}`, state));
+    else pushLineWithLimit(lines, '- continue from latest completed step and verify outputs', state);
+
+    return normalizeText(lines.join('\n'));
+  }
+
   // Injection strategy (token-saving defaults)
   const AUTO_INJECT_MEMORY_DOCS = false;
   const AUTO_INJECT_GLOBAL_PREFS_ON_SESSION_START = true;
@@ -36,7 +142,7 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_RECALL_MAX_EVENTS_PER_SESSION = 4;
   const AUTO_RECALL_MAX_CHARS = 1800;
   const AUTO_RECALL_TOKEN_BUDGET = 450;
-  const AUTO_RECALL_COOLDOWN_MS = 45_000;
+  const AUTO_RECALL_COOLDOWN_MS = 0;
   const AUTO_RECALL_MIN_QUERY_LEN = 2;
 
   // Hard budget controls
@@ -49,14 +155,17 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_CURRENT_SESSION_SUMMARY_TOKEN_BUDGET = 500;
   const AUTO_CURRENT_SESSION_SUMMARY_MAX_CHARS = 2200;
   const AUTO_CURRENT_SESSION_SUMMARY_MAX_EVENTS = 6;
+  const AUTO_INJECT_DEDUPE_WINDOW_MS = 120000;
+  const AUTO_INJECT_DEDUPE_WINDOW_RECALL_MS = 15000;
+  const AUTO_INJECT_RISK_GUARD_WINDOW_MS = 5 * 60 * 1000;
 
   // Dashboard controls
   const DASHBOARD_MAX_EVENTS_PER_SESSION_VIEW = 30;
   const AUTO_DASHBOARD_AUTOSTART = true;
   const AUTO_DASHBOARD_PORT = 37777;
   const AUTO_OPENCODE_WEB_PORT = 4096;
-  const AUTO_VISIBLE_NOTICES = false;
-  const AUTO_VISIBLE_NOTICE_COOLDOWN_MS = 30000;
+  const AUTO_VISIBLE_NOTICES = true;
+  const AUTO_VISIBLE_NOTICE_COOLDOWN_MS = 120000;
   const AUTO_VISIBLE_NOTICE_FOR_DISCARD = false;
 
   // --- Storage paths ---
@@ -75,6 +184,9 @@ export const MemorySystemPlugin = ({ client }) => {
   const sessionTitleByID = new Map();
   const messageRoleByID = new Map();
   const processedMessageKeys = new Set();
+  const processedUserEventKeys = new Map();
+  const sessionUserDedupeState = new Map();
+  const sessionStrictHitAt = new Map();
   const sessionNoticeState = new Map();
 
   // Recall trigger patterns
@@ -255,6 +367,1163 @@ export const MemorySystemPlugin = ({ client }) => {
     const chars = String(text || '').length;
     if (chars <= 0) return 0;
     return Math.ceil(chars / 4);
+  }
+
+  function stableTextHash(value) {
+    const s = String(value || '');
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i += 1) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return `h${(h >>> 0).toString(16)}`;
+  }
+
+  function extractUserEventIdentity(rawEvent) {
+    return normalizeText(
+      extractMessageID(rawEvent) ||
+      rawEvent?.data?.id ||
+      rawEvent?.data?.messageID ||
+      rawEvent?.id ||
+      ''
+    );
+  }
+
+  function shouldSkipDuplicateUserEvent(sessionID, cleanText, rawEvent) {
+    const identity = extractUserEventIdentity(rawEvent);
+    const normalized = normalizeText(String(cleanText || ''));
+    const now = Date.now();
+
+    const prevSessionState = sessionUserDedupeState.get(sessionID);
+    if (prevSessionState && (now - Number(prevSessionState.at || 0)) < 15000) {
+      if (identity && prevSessionState.identity && prevSessionState.identity === identity) return true;
+      if (!identity && normalized && prevSessionState.text) {
+        const a = prevSessionState.text;
+        const b = normalized;
+        const nearSame = a === b || a.includes(b) || b.includes(a);
+        if (nearSame && (now - Number(prevSessionState.at || 0)) < 3000) return true;
+      }
+    }
+
+    const fallback = cleanText ? stableTextHash(cleanText.slice(0, 240)) : '';
+    const key = identity
+      ? `${sessionID}:id:${identity}`
+      : `${sessionID}:txt:${fallback}`;
+    if (!key) return false;
+
+    const prev = Number(processedUserEventKeys.get(key) || 0);
+    if (prev && (now - prev) < 15000) return true;
+    processedUserEventKeys.set(key, now);
+    sessionUserDedupeState.set(sessionID, { at: now, identity: identity || '', text: normalized });
+
+    if (processedUserEventKeys.size > 3000) {
+      for (const [k, ts] of processedUserEventKeys.entries()) {
+        if ((now - Number(ts || 0)) > 120000) processedUserEventKeys.delete(k);
+      }
+    }
+    if (sessionUserDedupeState.size > 1000) {
+      for (const [k, st] of sessionUserDedupeState.entries()) {
+        if ((now - Number(st?.at || 0)) > 120000) sessionUserDedupeState.delete(k);
+      }
+    }
+    return false;
+  }
+
+  function partTextForPretrim(part) {
+    if (!part || typeof part !== 'object') return '';
+    if (typeof part.text === 'string') return normalizeText(part.text);
+    if (typeof part.content === 'string') return normalizeText(part.content);
+    if (typeof part.output === 'string') return normalizeText(part.output);
+    if (part.type === 'tool' && part.state && typeof part.state === 'object') {
+      return normalizeText(
+        [
+          safeJsonPreview(part.state.input, 160),
+          typeof part.state.output === 'string' ? part.state.output : safeJsonPreview(part.state.output, 220),
+          typeof part.state.error === 'string' ? part.state.error : safeJsonPreview(part.state.error, 120)
+        ].filter(Boolean).join(' ')
+      );
+    }
+    return '';
+  }
+
+  function partToolNameForPretrim(part, text = '') {
+    if (!part || typeof part !== 'object') return '';
+    const direct = normalizeText(String(part.tool || part.name || ''));
+    if (direct) return direct.toLowerCase();
+    const m = String(text || '').match(/^\[([^\]]+)\]/);
+    return m?.[1] ? normalizeText(m[1]).toLowerCase() : '';
+  }
+
+  function isProtectedToolForPretrim(part, text = '') {
+    const tool = partToolNameForPretrim(part, text);
+    if (!tool) return false;
+    return AUTO_SEND_PRETRIM_PROTECTED_TOOLS.some((t) => tool.includes(String(t).toLowerCase()));
+  }
+
+  function isStrategyProtectedToolName(toolName = '') {
+    const t = normalizeText(String(toolName || '')).toLowerCase();
+    if (!t) return false;
+    return AUTO_STRATEGY_PROTECTED_TOOLS.some((x) => t.includes(String(x).toLowerCase()));
+  }
+
+  function stableValueSignature(value, depth = 0) {
+    if (depth > 5) return '"[depth-limit]"';
+    if (value === null || value === undefined) return String(value);
+    const t = typeof value;
+    if (t === 'number' || t === 'boolean') return String(value);
+    if (t === 'string') return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map((v) => stableValueSignature(v, depth + 1)).join(',')}]`;
+    if (t === 'object') {
+      const keys = Object.keys(value).sort();
+      const pairs = keys.map((k) => `${JSON.stringify(k)}:${stableValueSignature(value[k], depth + 1)}`);
+      return `{${pairs.join(',')}}`;
+    }
+    return JSON.stringify(String(value));
+  }
+
+  function extractToolInputForStrategy(part) {
+    if (!part || typeof part !== 'object') return {};
+    if (part?.state && typeof part.state === 'object' && part.state.input !== undefined) return part.state.input;
+    if (part.input !== undefined) return part.input;
+    if (part.parameters !== undefined) return part.parameters;
+    return {};
+  }
+
+  function extractPathCandidatesFromInput(input) {
+    const out = [];
+    const visit = (v, depth = 0, key = '') => {
+      if (depth > 4 || v === null || v === undefined) return;
+      if (typeof v === 'string') {
+        const k = normalizeText(String(key || '')).toLowerCase();
+        if (k.includes('path') || k.includes('file') || v.startsWith('/') || /^[a-zA-Z]:\\/.test(v)) {
+          const n = normalizeText(v);
+          if (n && !out.includes(n)) out.push(n);
+        }
+        return;
+      }
+      if (Array.isArray(v)) {
+        v.forEach((x) => visit(x, depth + 1, key));
+        return;
+      }
+      if (typeof v === 'object') {
+        for (const [k, val] of Object.entries(v)) visit(val, depth + 1, k);
+      }
+    };
+    visit(input, 0, '');
+    return out.slice(0, 8);
+  }
+
+  function applyAutomaticStrategies(messages, policy = null) {
+    const stats = { dedup: 0, supersedeWrites: 0, purgedErrors: 0, phaseTrim: 0 };
+    if (!Array.isArray(messages) || !messages.length) return stats;
+    const turnProtection = Math.max(1, Number(policy?.turnProtection || AUTO_SEND_PRETRIM_TURN_PROTECTION));
+    const protectedWindow = Math.max(8, turnProtection * 2 + 4);
+    const protectFrom = Math.max(0, messages.length - protectedWindow);
+
+    // Strategy 1: deduplicate identical tool calls, keep latest output.
+    if (AUTO_STRATEGY_DEDUP_ENABLED) {
+      const latestBySig = new Map();
+      for (let i = 0; i < messages.length; i += 1) {
+        if (i >= protectFrom) continue;
+        const msg = messages[i];
+        const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+        if (!Array.isArray(msg?.parts) || role === 'system' || role === 'user') continue;
+        for (let j = 0; j < msg.parts.length; j += 1) {
+          const part = msg.parts[j];
+          if (!part || part.type !== 'tool') continue;
+          const tool = partToolNameForPretrim(part);
+          if (!tool || isStrategyProtectedToolName(tool)) continue;
+          const sig = `${tool}|${stableValueSignature(extractToolInputForStrategy(part))}`;
+          latestBySig.set(sig, { i, j });
+        }
+      }
+      for (let i = 0; i < messages.length; i += 1) {
+        if (i >= protectFrom) continue;
+        const msg = messages[i];
+        const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+        if (!Array.isArray(msg?.parts) || role === 'system' || role === 'user') continue;
+        for (let j = 0; j < msg.parts.length; j += 1) {
+          const part = msg.parts[j];
+          if (!part || part.type !== 'tool') continue;
+          const tool = partToolNameForPretrim(part);
+          if (!tool || isStrategyProtectedToolName(tool)) continue;
+          const sig = `${tool}|${stableValueSignature(extractToolInputForStrategy(part))}`;
+          const latest = latestBySig.get(sig);
+          if (!latest || latest.i === i && latest.j === j) continue;
+          part.state = part.state && typeof part.state === 'object' ? part.state : {};
+          const replacement = '[pretrim-dedup: superseded by latest identical tool call]';
+          if (part.state.output !== replacement) {
+            part.state.output = replacement;
+            if (part.state.error) part.state.error = '';
+            stats.dedup += 1;
+          }
+        }
+      }
+    }
+
+    // Strategy 2: supersede writes if file is read later.
+    if (AUTO_STRATEGY_SUPERSEDE_WRITES_ENABLED) {
+      const seenReadPaths = new Set();
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const msg = messages[i];
+        const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+        if (!Array.isArray(msg?.parts) || role === 'system' || role === 'user') continue;
+        for (const part of msg.parts) {
+          if (!part || part.type !== 'tool') continue;
+          const tool = partToolNameForPretrim(part);
+          if (!tool || isStrategyProtectedToolName(tool)) continue;
+          const input = extractToolInputForStrategy(part);
+          const paths = extractPathCandidatesFromInput(input);
+          const isRead = /(^|[_-])(read|cat|list|ls|get|open)([_-]|$)/i.test(tool);
+          const isWrite = /(^|[_-])(write|edit|update|patch|append|save)([_-]|$)/i.test(tool);
+          if (isRead) {
+            paths.forEach((p) => seenReadPaths.add(p));
+            continue;
+          }
+          if (i >= protectFrom || !isWrite || !paths.length) continue;
+          const hit = paths.some((p) => seenReadPaths.has(p));
+          if (!hit) continue;
+          part.state = part.state && typeof part.state === 'object' ? part.state : {};
+          const replacement = '[pretrim-supersede: write output replaced after later read of same path]';
+          if (part.state.output !== replacement) {
+            part.state.output = replacement;
+            if (part.state.error) part.state.error = '';
+            stats.supersedeWrites += 1;
+          }
+        }
+      }
+    }
+
+    // Strategy 3: purge errored tool inputs after N user turns.
+    if (AUTO_STRATEGY_PURGE_ERRORS_ENABLED) {
+      const userSuffix = new Array(messages.length + 1).fill(0);
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const role = normalizeText(String(messages[i]?.info?.role || '')).toLowerCase();
+        userSuffix[i] = userSuffix[i + 1] + (role === 'user' ? 1 : 0);
+      }
+      for (let i = 0; i < messages.length; i += 1) {
+        if (i >= protectFrom) continue;
+        const msg = messages[i];
+        const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+        if (!Array.isArray(msg?.parts) || role === 'system' || role === 'user') continue;
+        const turnsAfter = userSuffix[i + 1] || 0;
+        if (turnsAfter < AUTO_STRATEGY_PURGE_ERROR_TURNS) continue;
+        for (const part of msg.parts) {
+          if (!part || part.type !== 'tool') continue;
+          const tool = partToolNameForPretrim(part);
+          if (!tool || isStrategyProtectedToolName(tool)) continue;
+          part.state = part.state && typeof part.state === 'object' ? part.state : {};
+          const hasError = Boolean(normalizeText(String(part.state.error || '')));
+          if (!hasError) continue;
+          const inputText = safeJsonPreview(part.state.input, 300);
+          if (!inputText || inputText.length < 80) continue;
+          const replacement = '[pretrim-purgeErrors: tool input removed after error aging]';
+          if (part.state.input !== replacement) {
+            part.state.input = replacement;
+            stats.purgedErrors += 1;
+          }
+        }
+      }
+    }
+
+    // Strategy 4: phase-aware trimming when over budget.
+    if (Boolean(policy?.phaseTrimEnabled)) {
+      for (let i = 0; i < messages.length; i += 1) {
+        if (i >= protectFrom) continue;
+        const msg = messages[i];
+        const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+        if (!Array.isArray(msg?.parts) || role === 'system' || role === 'user') continue;
+        for (const part of msg.parts) {
+          if (!part || part.type !== 'tool') continue;
+          const tool = partToolNameForPretrim(part);
+          if (!tool || isStrategyProtectedToolName(tool)) continue;
+          const phase = toolPhaseOf(tool);
+          if (phase === 'modify') continue; // keep modify outputs conservatively
+          part.state = part.state && typeof part.state === 'object' ? part.state : {};
+          const existing = normalizeText(String(part.state.output || ''));
+          if (!existing || existing.includes('pretrim-phase-trim')) continue;
+          const replacement = `[pretrim-phase-trim:${phase}] output compacted by adaptive policy`;
+          part.state.output = replacement;
+          if (part.state.error && phase !== 'verify') part.state.error = '';
+          stats.phaseTrim += 1;
+        }
+      }
+    }
+
+    return stats;
+  }
+
+  function isToolDefinitionLikeText(text) {
+    const t = normalizeText(String(text || ''));
+    if (!t || t.length < 120) return false;
+    const jsonSchemaLike = /"type"\s*:\s*"object"/i.test(t) && /"properties"\s*:/i.test(t) && /"required"\s*:/i.test(t);
+    const toolMetaLike = /tool\.definition|parameters|description/i.test(t) && /"properties"\s*:/i.test(t);
+    return jsonSchemaLike || toolMetaLike;
+  }
+
+  function isLowSignalPartForPretrim(part, text = '') {
+    const t = normalizeText(String(text || ''));
+    if (!t) return false;
+    if (isMemoryInjectionText(t) || isSummaryNoiseText(t)) return false;
+    if (isToolDefinitionLikeText(t)) return false;
+    if (isHighSignalToolSummary(t)) return false;
+    if (part && part.type === 'tool' && isDiscardableToolSummary(t)) return true;
+    if (/"status":"pending"|"status":"running"|\bpending\b|\brunning\b/i.test(t)) return true;
+    if (/^\[.*?\]\s*input=\{\}\s*output=\{\s*"?status"?\s*:\s*"?(pending|running)/i.test(t)) return true;
+    if (/tool call|tool result|debug trace|stack trace/i.test(t) && t.length > 240) return true;
+    return false;
+  }
+
+  function estimateOutgoingMessagesTokens(messages) {
+    if (!Array.isArray(messages)) return 0;
+    let total = 0;
+    for (const msg of messages) {
+      const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+      total += estimateTokensFromText(role);
+      const parts = Array.isArray(msg?.parts) ? msg.parts : [];
+      for (const part of parts) total += estimateTokensFromText(partTextForPretrim(part));
+    }
+    return total;
+  }
+
+  function getAdaptivePretrimPolicy(beforeTokens) {
+    const ratio = beforeTokens > 0 ? beforeTokens / Math.max(1, AUTO_SEND_PRETRIM_BUDGET) : 0;
+    let level = 0;
+    if (ratio >= 1.25) level = 2;
+    else if (ratio >= 1.05) level = 1;
+    return {
+      level,
+      ratio,
+      turnProtection: level === 2 ? 3 : AUTO_SEND_PRETRIM_TURN_PROTECTION,
+      maxRewriteMessages: level === 2 ? 48 : level === 1 ? 36 : AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES,
+      phaseTrimEnabled: ratio >= 1.0
+    };
+  }
+
+  function computeOutgoingTokenComposition(messages) {
+    const out = { system: 0, user: 0, assistant: 0, tool: 0, other: 0, total: 0 };
+    if (!Array.isArray(messages)) return out;
+    for (const msg of messages) {
+      const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+      const parts = Array.isArray(msg?.parts) ? msg.parts : [];
+      const roleToken = estimateTokensFromText(role);
+      out.total += roleToken;
+      if (role === 'system') out.system += roleToken;
+      else if (role === 'user') out.user += roleToken;
+      else if (role === 'assistant') out.assistant += roleToken;
+      else out.other += roleToken;
+      for (const part of parts) {
+        const textToken = estimateTokensFromText(partTextForPretrim(part));
+        out.total += textToken;
+        if (part?.type === 'tool') out.tool += textToken;
+        else if (role === 'system') out.system += textToken;
+        else if (role === 'user') out.user += textToken;
+        else if (role === 'assistant') out.assistant += textToken;
+        else out.other += textToken;
+      }
+    }
+    return out;
+  }
+
+  function toolPhaseOf(toolName = '') {
+    const t = normalizeText(String(toolName || '')).toLowerCase();
+    if (!t) return 'other';
+    if (/(read|list|ls|get|open|find|search|glob|ripgrep|grep)/i.test(t)) return 'discovery';
+    if (/(write|edit|update|patch|append|save|create)/i.test(t)) return 'modify';
+    if (/(test|pytest|lint|check|validate|build|compile|run)/i.test(t)) return 'verify';
+    if (/(fetch|http|request|browser|playwright|web|tavily)/i.test(t)) return 'network';
+    return 'other';
+  }
+
+  function applyAnchorBlockReplacement(messages, sessionID, protectFrom) {
+    const result = { applied: false, replacedMessages: 0, usedBlocks: 0 };
+    if (!sessionID || !Array.isArray(messages) || messages.length < 8) return result;
+    if (!hasSessionMemoryFile(sessionID)) return result;
+    const mem = loadSessionMemory(sessionID);
+    const blocks = ensureSummaryBlocks(mem);
+    if (!Array.isArray(blocks) || !blocks.length) return result;
+    const refs = blocks.slice(-3).map((b) => `b${Number(b?.blockId || 0)}`).filter(Boolean);
+    if (!refs.length) return result;
+    const anchorLines = [
+      '[pretrim-anchor-replace]',
+      `compressed blocks in effect: ${refs.join(' ')}`,
+      'use these blocks as canonical historical context; older raw traces are replaced to reduce tokens.'
+    ];
+    const anchor = truncateText(anchorLines.join('\n'), 420);
+    const placeholder = '[pretrim-anchor-replaced by compressed blocks]';
+    const candidateIdx = [];
+    for (let i = 0; i < messages.length; i += 1) {
+      if (i >= protectFrom) continue;
+      const msg = messages[i];
+      const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+      if (role === 'system' || role === 'user') continue;
+      if (!Array.isArray(msg?.parts) || !msg.parts.length) continue;
+      candidateIdx.push(i);
+    }
+    if (candidateIdx.length < 2) return result;
+    const first = candidateIdx[0];
+    messages[first].parts = [{ type: 'text', text: anchor }];
+    for (const idx of candidateIdx.slice(1)) {
+      messages[idx].parts = [{ type: 'text', text: placeholder }];
+      result.replacedMessages += 1;
+    }
+    result.applied = true;
+    result.usedBlocks = refs.length;
+    return result;
+  }
+
+  function inferSessionIDFromMessages(messages) {
+    if (!Array.isArray(messages) || !messages.length) return '';
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const sid = normalizeText(String(messages[i]?.info?.sessionID || messages[i]?.info?.sessionId || ''));
+      if (sid) return sid;
+    }
+    return '';
+  }
+
+  function extractMessageIDFromOutgoing(msg) {
+    if (!msg || typeof msg !== 'object') return '';
+    return normalizeText(
+      String(
+        msg?.info?.id ||
+        msg?.info?.messageID ||
+        msg?.id ||
+        ''
+      )
+    );
+  }
+
+  function inferSessionModelFromMessages(messages) {
+    if (!Array.isArray(messages) || !messages.length) return { providerID: '', modelID: '' };
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const info = messages[i]?.info || {};
+      const providerID = normalizeText(String(info?.model?.providerID || info?.providerID || ''));
+      const modelID = normalizeText(String(info?.model?.modelID || info?.modelID || ''));
+      if (providerID || modelID) return { providerID, modelID };
+    }
+    return { providerID: '', modelID: '' };
+  }
+
+  function collectDistillSnippetsFromMessage(msg) {
+    if (!msg || !Array.isArray(msg.parts)) return [];
+    const lines = [];
+    for (const part of msg.parts) {
+      const text = partTextForPretrim(part);
+      if (!text) continue;
+      if (isProtectedToolForPretrim(part, text) || isToolDefinitionLikeText(text)) return [];
+      if (isMemoryInjectionText(text) || isSummaryNoiseText(text)) continue;
+      lines.push(truncateText(text, 220));
+      if (lines.length >= 2) break;
+    }
+    return lines;
+  }
+
+  function selectDistillCandidateRange(messages, protectFrom) {
+    if (!Array.isArray(messages) || !messages.length) {
+      return { indices: [], items: [] };
+    }
+    const candidates = [];
+    for (let i = 0; i < messages.length; i += 1) {
+      if (i >= protectFrom) continue;
+      const msg = messages[i];
+      const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+      if (!msg || !Array.isArray(msg.parts) || !msg.parts.length) continue;
+      if (role === 'system' || role === 'user') continue;
+      const snippets = collectDistillSnippetsFromMessage(msg);
+      if (!snippets.length) continue;
+
+      let score = 0;
+      const joined = snippets.join('\n');
+      if (/pass|ok|saved|created|wrote|fixed|完成|已生成|已写入/i.test(joined)) score += 4;
+      if (/fail|error|exception|报错|失败|阻塞/i.test(joined)) score += 3;
+      if (extractPathsFromTextLoose(joined).length) score += 2;
+      if (/pending|running/i.test(joined)) score -= 3;
+      score += Math.max(0, Math.floor((protectFrom - i) / 12));
+
+      candidates.push({ idx: i, role, snippets, score });
+    }
+
+    if (candidates.length < AUTO_DISTILL_RANGE_MIN_MESSAGES) {
+      return { indices: [], items: [] };
+    }
+
+    let best = null;
+    for (let s = 0; s < candidates.length; s += 1) {
+      let scoreSum = 0;
+      let count = 0;
+      let prevIdx = -1000;
+      const idxs = [];
+      const items = [];
+      for (let e = s; e < candidates.length; e += 1) {
+        const cur = candidates[e];
+        if (count > 0 && cur.idx - prevIdx > 4) break;
+        prevIdx = cur.idx;
+        scoreSum += cur.score;
+        count += 1;
+        idxs.push(cur.idx);
+        items.push({ role: cur.role, snippets: cur.snippets });
+        if (count >= AUTO_DISTILL_RANGE_MAX_MESSAGES) break;
+      }
+      if (count < AUTO_DISTILL_RANGE_MIN_MESSAGES) continue;
+      const value = scoreSum + count * 2;
+      if (!best || value > best.value) {
+        best = { value, indices: idxs, items };
+      }
+    }
+
+    if (!best) return { indices: [], items: [] };
+    return { indices: best.indices, items: best.items };
+  }
+
+  function buildDistillPrompt(candidateItems, maxChars = AUTO_DISTILL_SUMMARY_MAX_CHARS) {
+    const cleanItems = Array.isArray(candidateItems) ? candidateItems : [];
+    const payload = cleanItems.map((it, idx) => {
+      const role = normalizeText(String(it?.role || 'assistant')).toLowerCase() || 'assistant';
+      const snippets = Array.isArray(it?.snippets) ? it.snippets : [];
+      return `${idx + 1}. role=${role}\n${snippets.map((s) => `- ${s}`).join('\n')}`;
+    }).join('\n\n');
+
+    return [
+      'You are compressing historical chat context for token saving.',
+      'Goal: preserve outcomes and actionable facts while removing noisy history.',
+      `Output constraints: plain text only, <= ${maxChars} characters, Chinese preferred when source is Chinese.`,
+      'Required sections:',
+      '1) Completed outcomes',
+      '2) Key files/paths',
+      '3) Decisions/constraints',
+      '4) Open risks/next steps',
+      'Do not include tool schema definitions, pending/running logs, or duplicated traces.',
+      '',
+      'Source snippets:',
+      payload
+    ].join('\n');
+  }
+
+  function extractPathsFromTextLoose(text) {
+    const t = String(text || '');
+    if (!t) return [];
+    const unix = t.match(/(?:^|[\s"'`])((?:\/[^\s"'`<>|]+)+)/g) || [];
+    const win = t.match(/[A-Za-z]:\\[^\s"'`<>|]+/g) || [];
+    const out = [];
+    for (const m of [...unix, ...win]) {
+      const cleaned = normalizeText(String(m).replace(/^[\s"'`]+/, '').replace(/[\s"'`]+$/, ''));
+      if (cleaned && !out.includes(cleaned)) out.push(cleaned);
+      if (out.length >= 8) break;
+    }
+    return out;
+  }
+
+  function evaluateDistillSummaryQuality(summary, sourceItems = []) {
+    const text = normalizeText(String(summary || ''));
+    if (!text) return { ok: false, reason: 'empty' };
+    if (text.length < 80) return { ok: false, reason: 'too_short' };
+    if (/pending|running|debug trace|stack trace/i.test(text) && text.length < 220) {
+      return { ok: false, reason: 'noisy_or_shallow' };
+    }
+    const sectionHits = [
+      /完成|结果|outcome|done|fixed/i.test(text),
+      /路径|文件|file|path/i.test(text),
+      /约束|决定|constraint|decision/i.test(text),
+      /风险|下一步|next|todo/i.test(text)
+    ].filter(Boolean).length;
+    if (sectionHits < 2) return { ok: false, reason: 'missing_structure' };
+
+    const sourcePaths = [];
+    for (const it of Array.isArray(sourceItems) ? sourceItems : []) {
+      for (const s of Array.isArray(it?.snippets) ? it.snippets : []) {
+        for (const p of extractPathsFromTextLoose(s)) {
+          if (!sourcePaths.includes(p)) sourcePaths.push(p);
+          if (sourcePaths.length >= 6) break;
+        }
+        if (sourcePaths.length >= 6) break;
+      }
+      if (sourcePaths.length >= 6) break;
+    }
+    if (sourcePaths.length) {
+      const summaryPaths = extractPathsFromTextLoose(text);
+      const hasPathOverlap = summaryPaths.some((p) => sourcePaths.some((sp) => p.includes(sp) || sp.includes(p)));
+      if (!hasPathOverlap) return { ok: false, reason: 'missing_key_path' };
+    }
+    return { ok: true, reason: 'ok' };
+  }
+
+  function extractDistillTextFromResponse(provider, json) {
+    if (!json || typeof json !== 'object') return '';
+    const p = normalizeText(String(provider || '')).toLowerCase();
+    if (p === 'openai_compatible') {
+      const c0 = json?.choices?.[0]?.message?.content;
+      if (typeof c0 === 'string') return normalizeText(c0);
+      if (Array.isArray(c0)) {
+        return normalizeText(c0.map((x) => (typeof x?.text === 'string' ? x.text : '')).join(' '));
+      }
+      return '';
+    }
+    if (p === 'anthropic') {
+      const arr = Array.isArray(json?.content) ? json.content : [];
+      return normalizeText(arr.map((x) => (typeof x?.text === 'string' ? x.text : '')).join(' '));
+    }
+    if (p === 'gemini') {
+      const arr = Array.isArray(json?.candidates) ? json.candidates : [];
+      const parts = arr.flatMap((c) => Array.isArray(c?.content?.parts) ? c.content.parts : []);
+      return normalizeText(parts.map((x) => (typeof x?.text === 'string' ? x.text : '')).join(' '));
+    }
+    return '';
+  }
+
+  async function runIndependentDistillLLM(messages, candidateItems) {
+    const cfg = getIndependentDistillConfig();
+    if (!canUseIndependentDistill(cfg)) return { ok: false, reason: 'disabled_or_incomplete_config', text: '' };
+    const sessionModel = inferSessionModelFromMessages(messages);
+    const model = normalizeText(
+      cfg.model || (cfg.useSessionModel ? String(sessionModel.modelID || '') : '')
+    );
+    if (!model) return { ok: false, reason: 'missing_model', text: '' };
+
+    const prompt = buildDistillPrompt(candidateItems, AUTO_DISTILL_SUMMARY_MAX_CHARS);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), cfg.timeoutMs);
+    try {
+      let url = cfg.baseURL.replace(/\/+$/, '');
+      let body = {};
+      let headers = {};
+      const temperature = Math.max(0, Math.min(1, Number(cfg.temperature || 0.2)));
+      if (cfg.provider === 'anthropic') {
+        url = `${url}/v1/messages`;
+        headers = {
+          'content-type': 'application/json',
+          'x-api-key': cfg.apiKey,
+          'anthropic-version': '2023-06-01'
+        };
+        body = {
+          model,
+          max_tokens: cfg.maxTokens,
+          temperature,
+          messages: [{ role: 'user', content: prompt }]
+        };
+      } else if (cfg.provider === 'gemini') {
+        url = `${url}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(cfg.apiKey)}`;
+        headers = { 'content-type': 'application/json' };
+        body = {
+          generationConfig: {
+            maxOutputTokens: cfg.maxTokens,
+            temperature
+          },
+          contents: [{ role: 'user', parts: [{ text: prompt }] }]
+        };
+      } else {
+        url = `${url}/chat/completions`;
+        headers = {
+          'content-type': 'application/json',
+          Authorization: `Bearer ${cfg.apiKey}`
+        };
+        body = {
+          model,
+          temperature,
+          max_tokens: cfg.maxTokens,
+          messages: [
+            { role: 'system', content: 'You are a high-fidelity context distiller.' },
+            { role: 'user', content: prompt }
+          ]
+        };
+      }
+
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+      const raw = await resp.text();
+      if (!resp.ok) {
+        return { ok: false, reason: `http_${resp.status}`, text: '', provider: cfg.provider, model };
+      }
+      let json = {};
+      try { json = JSON.parse(raw); } catch { return { ok: false, reason: 'non_json_response', text: '', provider: cfg.provider, model }; }
+      const text = truncateText(extractDistillTextFromResponse(cfg.provider, json), AUTO_DISTILL_SUMMARY_MAX_CHARS);
+      if (!text) return { ok: false, reason: 'empty_text', text: '', provider: cfg.provider, model };
+      return { ok: true, reason: 'ok', text, provider: cfg.provider, model };
+    } catch (err) {
+      const msg = String(err?.name === 'AbortError' ? 'timeout' : (err?.message || err || 'unknown_error'));
+      return { ok: false, reason: msg, text: '', provider: cfg.provider, model };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  function buildStrictSummaryAnchorFromMessages(items = []) {
+    const lines = [];
+    const state = { chars: 0, maxChars: AUTO_STRICT_ANCHOR_MAX_CHARS };
+    pushLineWithLimit(lines, '[pretrim-summary-anchor]', state);
+    pushLineWithLimit(lines, '- type: strict-summary', state);
+    pushLineWithLimit(lines, '- note: historical context before recent turns has been compacted', state);
+    pushLineWithLimit(lines, '- distilled:', state);
+    for (const text of items) {
+      if (lines.length >= AUTO_STRICT_ANCHOR_MAX_LINES) break;
+      const t = truncateText(normalizeText(String(text || '')), 160);
+      if (!t) continue;
+      pushLineWithLimit(lines, `  - ${t}`, state);
+    }
+    return lines.join('\n').trim();
+  }
+
+  function applyStrictAnchorCompaction(messages, currentAfterTokens = 0) {
+    const result = {
+      applied: false,
+      replacedMessages: 0,
+      beforeTokens: Number(currentAfterTokens || 0),
+      afterTokens: Number(currentAfterTokens || 0),
+      savedTokens: 0
+    };
+    if (!isStrictModeEnabled() || !Array.isArray(messages) || messages.length < 6) return result;
+    if (result.beforeTokens <= AUTO_SEND_PRETRIM_TARGET) return result;
+
+    const protectedWindow = Math.max(8, AUTO_SEND_PRETRIM_TURN_PROTECTION * 2 + 4);
+    const protectFrom = Math.max(0, messages.length - protectedWindow);
+    const candidateIndices = [];
+    const snippets = [];
+
+    for (let i = 0; i < messages.length; i += 1) {
+      if (i >= protectFrom) continue;
+      const msg = messages[i];
+      const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+      if (!msg || !Array.isArray(msg.parts) || !msg.parts.length) continue;
+      if (role === 'system' || role === 'user') continue;
+
+      let hasProtectedPart = false;
+      const msgSnippets = [];
+      for (const part of msg.parts) {
+        const text = partTextForPretrim(part);
+        if (!text) continue;
+        if (isProtectedToolForPretrim(part, text)) {
+          hasProtectedPart = true;
+          break;
+        }
+        if (isToolDefinitionLikeText(text)) {
+          hasProtectedPart = true;
+          break;
+        }
+        msgSnippets.push(text);
+      }
+      if (hasProtectedPart || !msgSnippets.length) continue;
+      candidateIndices.push(i);
+      snippets.push(...msgSnippets.slice(0, 2));
+    }
+
+    if (candidateIndices.length < 2 || !snippets.length) return result;
+
+    const anchor = buildStrictSummaryAnchorFromMessages(snippets.slice(0, AUTO_STRICT_ANCHOR_MAX_LINES));
+    if (!anchor) return result;
+
+    const first = candidateIndices[0];
+    const placeholder = '[strict-trimmed merged into summary-anchor]';
+    messages[first].parts = [{ type: 'text', text: anchor }];
+    for (const idx of candidateIndices.slice(1)) {
+      messages[idx].parts = [{ type: 'text', text: placeholder }];
+    }
+
+    const after = estimateOutgoingMessagesTokens(messages);
+    result.applied = true;
+    result.replacedMessages = candidateIndices.length;
+    result.afterTokens = after;
+    result.savedTokens = Math.max(0, result.beforeTokens - after);
+    return result;
+  }
+
+  async function applySendPretrim(messages, sessionID = '') {
+    const result = {
+      enabled: isSendPretrimEnabled(),
+      dryRun: AUTO_SEND_PRETRIM_DRY_RUN,
+      strictModeEnabled: isStrictModeEnabled(),
+      beforeTokens: estimateOutgoingMessagesTokens(messages),
+      afterTokens: 0,
+      adaptiveLevel: 0,
+      adaptiveRatio: 0,
+      rewrittenParts: 0,
+      rewrittenMessages: 0,
+      savedTokens: 0,
+      reason: '',
+      strictApplied: false,
+      strictReplacedMessages: 0,
+      distillUsed: false,
+      distillProvider: '',
+      distillModel: '',
+      distillStatus: '',
+      strategyDedup: 0,
+      strategySupersedeWrites: 0,
+      strategyPurgedErrors: 0,
+      strategyPhaseTrim: 0,
+      anchorReplaceApplied: false,
+      anchorReplaceMessages: 0,
+      anchorReplaceBlocks: 0,
+      predictedBlockId: 0,
+      compositionBefore: computeOutgoingTokenComposition(messages),
+      compositionAfter: { system: 0, user: 0, assistant: 0, tool: 0, other: 0, total: 0 },
+      compressedBlock: null
+    };
+
+    if (!isSendPretrimEnabled() || !Array.isArray(messages) || !messages.length) {
+      result.afterTokens = result.beforeTokens;
+      result.reason = isSendPretrimEnabled() ? 'no_messages' : 'disabled';
+      return result;
+    }
+
+    if (sessionID && hasSessionMemoryFile(sessionID)) {
+      try {
+        const sess = loadSessionMemory(sessionID);
+        result.predictedBlockId = Number(nextSummaryBlockId(sess) || 0);
+      } catch (_) {}
+    }
+
+    const policy = getAdaptivePretrimPolicy(result.beforeTokens);
+    result.adaptiveLevel = Number(policy.level || 0);
+    result.adaptiveRatio = Number(policy.ratio || 0);
+
+    if (!AUTO_SEND_PRETRIM_DRY_RUN) {
+      const st = applyAutomaticStrategies(messages, policy);
+      result.strategyDedup = Number(st?.dedup || 0);
+      result.strategySupersedeWrites = Number(st?.supersedeWrites || 0);
+      result.strategyPurgedErrors = Number(st?.purgedErrors || 0);
+      result.strategyPhaseTrim = Number(st?.phaseTrim || 0);
+    }
+
+    const tokensAfterStrategies = estimateOutgoingMessagesTokens(messages);
+    if (tokensAfterStrategies <= AUTO_SEND_PRETRIM_BUDGET) {
+      result.afterTokens = tokensAfterStrategies;
+      result.savedTokens = Math.max(0, result.beforeTokens - result.afterTokens);
+      result.reason = (result.strategyDedup || result.strategySupersedeWrites || result.strategyPurgedErrors || result.strategyPhaseTrim)
+        ? 'within_budget+strategies'
+        : 'within_budget';
+      result.compositionAfter = computeOutgoingTokenComposition(messages);
+      return result;
+    }
+
+    const protectedWindow = Math.max(8, Number(policy.turnProtection || AUTO_SEND_PRETRIM_TURN_PROTECTION) * 2 + 4);
+    const protectFrom = Math.max(0, messages.length - protectedWindow);
+    let rewrites = 0;
+
+    for (let i = 0; i < messages.length; i += 1) {
+      if (rewrites >= Number(policy.maxRewriteMessages || AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES)) break;
+      if (i >= protectFrom) continue;
+
+      const msg = messages[i];
+      const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+      if (!msg || !Array.isArray(msg.parts)) continue;
+      if (role === 'system' || role === 'user') continue;
+
+      let touchedInMessage = false;
+      for (const part of msg.parts) {
+        if (result.beforeTokens - result.savedTokens <= AUTO_SEND_PRETRIM_TARGET) break;
+
+        const oldText = partTextForPretrim(part);
+        if (!oldText) continue;
+        if (isProtectedToolForPretrim(part, oldText)) continue;
+        if (!isLowSignalPartForPretrim(part, oldText)) continue;
+
+        const oldTokens = estimateTokensFromText(oldText);
+        const replacement = '[pretrimmed low-signal tool/context output by memory-system]';
+        const newTokens = estimateTokensFromText(replacement);
+        const saved = Math.max(0, oldTokens - newTokens);
+        if (saved <= 0) continue;
+
+        if (!AUTO_SEND_PRETRIM_DRY_RUN) {
+          if (typeof part.text === 'string') part.text = replacement;
+          else if (typeof part.content === 'string') part.content = replacement;
+          else if (typeof part.output === 'string') part.output = replacement;
+          else if (part.type === 'tool') {
+            part.state = part.state && typeof part.state === 'object' ? part.state : {};
+            part.state.output = replacement;
+            if (part.state.error) part.state.error = '';
+          }
+        }
+
+        result.savedTokens += saved;
+        result.rewrittenParts += 1;
+        touchedInMessage = true;
+      }
+
+      if (touchedInMessage) {
+        result.rewrittenMessages += 1;
+        rewrites += 1;
+      }
+
+      if (result.beforeTokens - result.savedTokens <= AUTO_SEND_PRETRIM_TARGET) break;
+    }
+
+    result.afterTokens = AUTO_SEND_PRETRIM_DRY_RUN
+      ? Math.max(0, result.beforeTokens - result.savedTokens)
+      : estimateOutgoingMessagesTokens(messages);
+
+    // Stage-2: if still above hard threshold, perform DCP-like replacement:
+    // independent distill LLM (preferred) -> fallback mechanical extract.
+    const hardLimit = Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_HARD_RATIO);
+    const distillTrigger = Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_DISTILL_TRIGGER_RATIO);
+    const stage2Limit = Math.max(AUTO_SEND_PRETRIM_TARGET + 200, Math.min(hardLimit, distillTrigger));
+    let extractedMessages = 0;
+    if (!AUTO_SEND_PRETRIM_DRY_RUN && result.afterTokens > stage2Limit) {
+      const protectedWindow = Math.max(8, AUTO_SEND_PRETRIM_TURN_PROTECTION * 2 + 4);
+      const protectFrom = Math.max(0, messages.length - protectedWindow);
+      const selectedRange = selectDistillCandidateRange(messages, protectFrom);
+      const candidateIndices = Array.isArray(selectedRange.indices) ? selectedRange.indices : [];
+      const candidateItems = Array.isArray(selectedRange.items) ? selectedRange.items : [];
+
+      if (candidateIndices.length >= 2 && candidateItems.length) {
+        let summary = '';
+        const sourceItems = [];
+        for (const it of candidateItems) {
+          sourceItems.push(it);
+          if (JSON.stringify(sourceItems).length > AUTO_DISTILL_INPUT_MAX_CHARS) break;
+        }
+        const mode = getDistillMode();
+        const allowIndependent = mode === 'independent' || (mode === 'auto' && canUseIndependentDistill(getIndependentDistillConfig()));
+        if (allowIndependent) {
+          const distill = await runIndependentDistillLLM(messages, sourceItems);
+          result.distillProvider = String(distill?.provider || '');
+          result.distillModel = String(distill?.model || '');
+          result.distillStatus = String(distill?.reason || '');
+          if (distill?.ok && distill?.text) {
+            const quality = evaluateDistillSummaryQuality(distill.text, sourceItems);
+            result.distillStatus = quality.ok ? 'ok' : `low_quality:${quality.reason}`;
+            if (quality.ok) {
+              const bid = result.predictedBlockId > 0 ? ` b${result.predictedBlockId}` : '';
+              summary = `[pretrim-distill${bid}]\n${truncateText(distill.text, AUTO_DISTILL_SUMMARY_MAX_CHARS)}`;
+              result.distillUsed = true;
+            }
+          }
+        }
+
+        if (!summary) {
+          const inline = runSessionInlineDistill(sourceItems);
+          const quality = evaluateDistillSummaryQuality(inline, sourceItems);
+          result.distillProvider = result.distillProvider || 'session-inline';
+          result.distillModel = result.distillModel || 'current-session';
+          result.distillStatus = quality.ok ? 'ok_inline' : `low_quality_inline:${quality.reason}`;
+          if (quality.ok && inline) {
+            const bid = result.predictedBlockId > 0 ? ` b${result.predictedBlockId}` : '';
+            summary = `[pretrim-distill-inline${bid}]\n${truncateText(inline, AUTO_DISTILL_SUMMARY_MAX_CHARS)}`;
+            result.distillUsed = true;
+          } else {
+            const fallbackLines = sourceItems
+              .flatMap((it) => Array.isArray(it.snippets) ? it.snippets : [])
+              .slice(0, 12)
+              .map((x) => `- ${truncateText(x, 140)}`);
+            if (fallbackLines.length) {
+              summary = `[pretrim-extract]\n${fallbackLines.join('\n')}`;
+            }
+          }
+        }
+
+        if (summary) {
+          const refs = getRecentBlockPlaceholders(sessionID, getProjectName(), 3);
+          if (refs.length) {
+            const refLine = `\nReferenced compressed blocks: ${refs.map((r) => r.placeholder).join(' ')}`;
+            summary = truncateText(`${summary}${refLine}`, AUTO_DISTILL_SUMMARY_MAX_CHARS);
+          }
+          const first = candidateIndices[0];
+          const last = candidateIndices[candidateIndices.length - 1];
+          const startMessageID = extractMessageIDFromOutgoing(messages[first]) || `i${first}`;
+          const endMessageID = extractMessageIDFromOutgoing(messages[last]) || `i${last}`;
+          const anchorMessageID = startMessageID;
+          messages[first].parts = [{ type: 'text', text: summary }];
+          const placeholder = '[pretrim-distilled into anchor-summary]';
+          for (const idx of candidateIndices.slice(1)) {
+            messages[idx].parts = [{ type: 'text', text: placeholder }];
+            extractedMessages += 1;
+          }
+          extractedMessages += 1;
+          result.rewrittenMessages += candidateIndices.length;
+          result.rewrittenParts += candidateIndices.length;
+          result.afterTokens = estimateOutgoingMessagesTokens(messages);
+          result.compressedBlock = {
+            source: 'pretrim-distill',
+            startMessageID,
+            endMessageID,
+            anchorMessageID,
+            consumedMessages: Number(candidateIndices.length || 0),
+            summary: truncateText(normalizeText(summary.replace(/^\[[^\]]+\]\s*/,'').trim()), 2000)
+          };
+        }
+      }
+
+      if (!extractedMessages) {
+        // fallback to conservative per-message extract if batching couldn't run
+        for (let i = 0; i < messages.length; i += 1) {
+          if (result.afterTokens <= AUTO_SEND_PRETRIM_TARGET) break;
+          if (i >= protectFrom) continue;
+          const msg = messages[i];
+          const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+          if (!msg || !Array.isArray(msg.parts) || !msg.parts.length) continue;
+          if (role === 'system' || role === 'user') continue;
+          const snippets = collectDistillSnippetsFromMessage(msg);
+          if (!snippets.length) continue;
+          msg.parts = [{ type: 'text', text: `[pretrim-extract] ${snippets.join(' | ')}` }];
+          extractedMessages += 1;
+          result.rewrittenMessages += 1;
+          result.rewrittenParts += 1;
+          result.afterTokens = estimateOutgoingMessagesTokens(messages);
+        }
+      }
+    }
+
+    result.savedTokens = Math.max(0, result.beforeTokens - result.afterTokens);
+    if (extractedMessages > 0) result.reason = result.distillUsed
+      ? `trimmed+distill(${extractedMessages})`
+      : `trimmed+extract(${extractedMessages})`;
+    else result.reason = result.rewrittenParts > 0 ? (AUTO_SEND_PRETRIM_DRY_RUN ? 'dry_run' : 'trimmed') : 'no_rewrite_candidates';
+    result.extractedMessages = extractedMessages;
+
+    // Anchor replacement loop (DCP-like): when still over target and we already have compressed blocks,
+    // replace old assistant/tool raw traces with one anchor referring blocks.
+    if (!AUTO_SEND_PRETRIM_DRY_RUN && result.afterTokens > AUTO_SEND_PRETRIM_TARGET) {
+      const protectedWindow = Math.max(8, Number(policy.turnProtection || AUTO_SEND_PRETRIM_TURN_PROTECTION) * 2 + 4);
+      const protectFrom = Math.max(0, messages.length - protectedWindow);
+      const ar = applyAnchorBlockReplacement(messages, sessionID, protectFrom);
+      if (ar.applied) {
+        result.anchorReplaceApplied = true;
+        result.anchorReplaceMessages = Number(ar.replacedMessages || 0);
+        result.anchorReplaceBlocks = Number(ar.usedBlocks || 0);
+        result.afterTokens = estimateOutgoingMessagesTokens(messages);
+        result.savedTokens = Math.max(0, result.beforeTokens - result.afterTokens);
+        result.reason = `anchor-replace(${result.anchorReplaceMessages})`;
+      }
+    }
+
+    // Strict mode (optional): replace old assistant/tool history with one summary anchor.
+    if (!AUTO_SEND_PRETRIM_DRY_RUN && result.afterTokens > AUTO_SEND_PRETRIM_TARGET && isStrictModeEnabled()) {
+      const strict = applyStrictAnchorCompaction(messages, result.afterTokens);
+      if (strict.applied) {
+        result.strictApplied = true;
+        result.strictReplacedMessages = Number(strict.replacedMessages || 0);
+        result.afterTokens = Number(strict.afterTokens || result.afterTokens);
+        result.savedTokens = Math.max(0, result.beforeTokens - result.afterTokens);
+        result.reason = `strict-anchor(${result.strictReplacedMessages})`;
+      }
+    }
+    result.compositionAfter = computeOutgoingTokenComposition(messages);
+    return result;
+  }
+
+  function defaultSendPretrim() {
+    return {
+      autoRuns: 0,
+      manualRuns: 0,
+      savedTokensTotal: 0,
+      lastBeforeTokens: 0,
+      lastAfterTokens: 0,
+      lastSavedTokens: 0,
+      lastAt: null,
+      lastReason: '',
+      lastStatus: '',
+      traces: []
+    };
+  }
+
+  function ensureSendPretrim(sessionData) {
+    if (!sessionData || typeof sessionData !== 'object') return defaultSendPretrim();
+    const cur = sessionData.sendPretrim && typeof sessionData.sendPretrim === 'object'
+      ? sessionData.sendPretrim
+      : {};
+    sessionData.sendPretrim = {
+      autoRuns: Number(cur.autoRuns || 0),
+      manualRuns: Number(cur.manualRuns || 0),
+      savedTokensTotal: Number(cur.savedTokensTotal || 0),
+      lastBeforeTokens: Number(cur.lastBeforeTokens || 0),
+      lastAfterTokens: Number(cur.lastAfterTokens || 0),
+      lastSavedTokens: Number(cur.lastSavedTokens || 0),
+      lastAt: cur.lastAt || null,
+      lastReason: cur.lastReason || '',
+      lastStatus: cur.lastStatus || '',
+      traces: Array.isArray(cur.traces) ? cur.traces.slice(-AUTO_SEND_PRETRIM_TRACE_LIMIT) : []
+    };
+    return sessionData.sendPretrim;
+  }
+
+  function recordSendPretrimAudit(sessionID, stats, source = 'auto') {
+    if (!sessionID || !stats || typeof stats !== 'object') return;
+    if (!hasSessionMemoryFile(sessionID)) return;
+    const mem = loadSessionMemory(sessionID);
+    const audit = ensureSendPretrim(mem);
+    if (source === 'auto') audit.autoRuns += 1;
+    else audit.manualRuns += 1;
+    audit.savedTokensTotal += Number(stats.savedTokens || 0);
+    audit.lastBeforeTokens = Number(stats.beforeTokens || 0);
+    audit.lastAfterTokens = Number(stats.afterTokens || 0);
+    audit.lastSavedTokens = Number(stats.savedTokens || 0);
+    audit.lastAt = new Date().toISOString();
+    audit.lastReason = String(stats.reason || '');
+    audit.lastStatus = stats.savedTokens > 0 ? 'trimmed' : 'nochange';
+
+    const traceItem = {
+      ts: audit.lastAt,
+      source: String(source || 'auto'),
+      beforeTokens: Number(stats.beforeTokens || 0),
+      afterTokens: Number(stats.afterTokens || 0),
+      savedTokens: Number(stats.savedTokens || 0),
+      rewrittenParts: Number(stats.rewrittenParts || 0),
+      rewrittenMessages: Number(stats.rewrittenMessages || 0),
+      extractedMessages: Number(stats.extractedMessages || 0),
+      strictApplied: Boolean(stats.strictApplied),
+      strictReplacedMessages: Number(stats.strictReplacedMessages || 0),
+      distillUsed: Boolean(stats.distillUsed),
+      distillProvider: String(stats.distillProvider || ''),
+      distillModel: String(stats.distillModel || ''),
+      distillStatus: String(stats.distillStatus || ''),
+      strategyDedup: Number(stats.strategyDedup || 0),
+      strategySupersedeWrites: Number(stats.strategySupersedeWrites || 0),
+      strategyPurgedErrors: Number(stats.strategyPurgedErrors || 0),
+      strategyPhaseTrim: Number(stats.strategyPhaseTrim || 0),
+      adaptiveLevel: Number(stats.adaptiveLevel || 0),
+      adaptiveRatio: Number(stats.adaptiveRatio || 0),
+      anchorReplaceApplied: Boolean(stats.anchorReplaceApplied),
+      anchorReplaceMessages: Number(stats.anchorReplaceMessages || 0),
+      anchorReplaceBlocks: Number(stats.anchorReplaceBlocks || 0),
+      compositionBefore: stats.compositionBefore && typeof stats.compositionBefore === 'object' ? stats.compositionBefore : null,
+      compositionAfter: stats.compositionAfter && typeof stats.compositionAfter === 'object' ? stats.compositionAfter : null,
+      predictedBlockId: Number(stats.predictedBlockId || 0),
+      reason: String(stats.reason || '')
+    };
+    audit.traces = Array.isArray(audit.traces) ? audit.traces : [];
+    audit.traces.push(traceItem);
+    if (audit.traces.length > AUTO_SEND_PRETRIM_TRACE_LIMIT) {
+      audit.traces = audit.traces.slice(-AUTO_SEND_PRETRIM_TRACE_LIMIT);
+    }
+
+    mem.budget = mem.budget || {};
+    mem.budget.lastEstimatedBodyTokens = Number(stats.afterTokens || 0);
+    mem.budget.lastCompactedAt = audit.lastAt;
+    mem.budget.lastCompactionReason = `send_pretrim:${audit.lastReason || 'unknown'}`;
+
+    if (stats?.compressedBlock && typeof stats.compressedBlock === 'object') {
+      const blockId = Number(stats.predictedBlockId || nextSummaryBlockId(mem));
+      const appended = appendSummaryBlock(mem, {
+        blockId,
+        createdAt: audit.lastAt,
+        source: normalizeText(String(stats.compressedBlock.source || 'pretrim-distill')),
+        startMessageID: normalizeText(String(stats.compressedBlock.startMessageID || '')),
+        endMessageID: normalizeText(String(stats.compressedBlock.endMessageID || '')),
+        anchorMessageID: normalizeText(String(stats.compressedBlock.anchorMessageID || '')),
+        consumedMessages: Number(stats.compressedBlock.consumedMessages || 0),
+        summary: normalizeText(String(stats.compressedBlock.summary || ''))
+      });
+      if (appended) {
+        traceItem.blockId = appended.blockId;
+      }
+    }
+
+    // Conflict hint: high prompt size with little/no savings may indicate injection stacking.
+    mem.alerts = mem.alerts || {};
+    const bigBefore = Number(stats.beforeTokens || 0) > Math.floor(AUTO_SEND_PRETRIM_BUDGET * 1.25);
+    const weakSave = Number(stats.savedTokens || 0) < 120;
+    if (bigBefore && weakSave) {
+      mem.alerts.contextStackRisk = {
+        level: 'warn',
+        at: audit.lastAt,
+        reason: 'high_before_low_saved',
+        beforeTokens: Number(stats.beforeTokens || 0),
+        afterTokens: Number(stats.afterTokens || 0)
+      };
+    }
+
+    persistSessionMemory(mem);
   }
 
   function deriveSessionTitleFromEvents(sessionData) {
@@ -506,6 +1775,7 @@ export const MemorySystemPlugin = ({ client }) => {
         compressedEvents: Number(legacy.summary?.compressedEvents || 0),
         lastCompressedAt: legacy.summary?.lastCompressedAt || null
       },
+      summaryBlocks: [],
       lastFingerprint: legacy.lastFingerprint || ''
     };
   }
@@ -526,6 +1796,7 @@ export const MemorySystemPlugin = ({ client }) => {
         compressedEvents: 0,
         lastCompressedAt: null
       },
+      summaryBlocks: [],
       recall: {
         count: 0,
         lastAt: null,
@@ -538,7 +1809,10 @@ export const MemorySystemPlugin = ({ client }) => {
         memoryDocsCount: 0,
         lastAt: null,
         lastReason: '',
-        lastStatus: ''
+        lastStatus: '',
+        lastDigest: '',
+        lastSkippedAt: null,
+        lastSkipReason: ''
       },
       budget: {
         bodyTokenBudget: AUTO_BODY_TOKEN_BUDGET,
@@ -547,8 +1821,61 @@ export const MemorySystemPlugin = ({ client }) => {
         lastCompactionReason: ''
       },
       pruneAudit: defaultPruneAudit(),
+      sendPretrim: defaultSendPretrim(),
+      alerts: {},
       lastFingerprint: ''
     };
+  }
+
+  function ensureSummaryBlocks(sessionData) {
+    if (!sessionData || typeof sessionData !== 'object') return [];
+    const arr = Array.isArray(sessionData.summaryBlocks) ? sessionData.summaryBlocks : [];
+    sessionData.summaryBlocks = arr
+      .filter((b) => b && typeof b === 'object')
+      .map((b) => ({
+        blockId: Number(b.blockId || 0),
+        createdAt: b.createdAt || null,
+        source: normalizeText(String(b.source || 'pretrim')),
+        startMessageID: normalizeText(String(b.startMessageID || '')),
+        endMessageID: normalizeText(String(b.endMessageID || '')),
+        anchorMessageID: normalizeText(String(b.anchorMessageID || '')),
+        consumedMessages: Number(b.consumedMessages || 0),
+        summary: truncateText(normalizeText(String(b.summary || '')), 2400)
+      }))
+      .filter((b) => Number.isInteger(b.blockId) && b.blockId > 0 && b.summary);
+    if (sessionData.summaryBlocks.length > AUTO_SUMMARY_BLOCK_MAX) {
+      sessionData.summaryBlocks = sessionData.summaryBlocks.slice(-AUTO_SUMMARY_BLOCK_MAX);
+    }
+    return sessionData.summaryBlocks;
+  }
+
+  function nextSummaryBlockId(sessionData) {
+    const arr = ensureSummaryBlocks(sessionData);
+    let maxId = 0;
+    for (const b of arr) maxId = Math.max(maxId, Number(b.blockId || 0));
+    return maxId + 1;
+  }
+
+  function appendSummaryBlock(sessionData, block) {
+    if (!sessionData || !block || typeof block !== 'object') return null;
+    const arr = ensureSummaryBlocks(sessionData);
+    const id = Number(block.blockId || nextSummaryBlockId(sessionData));
+    const rec = {
+      blockId: id,
+      createdAt: block.createdAt || new Date().toISOString(),
+      source: normalizeText(String(block.source || 'pretrim')),
+      startMessageID: normalizeText(String(block.startMessageID || '')),
+      endMessageID: normalizeText(String(block.endMessageID || '')),
+      anchorMessageID: normalizeText(String(block.anchorMessageID || '')),
+      consumedMessages: Number(block.consumedMessages || 0),
+      summary: truncateText(normalizeText(String(block.summary || '')), 2400)
+    };
+    if (!rec.summary) return null;
+    arr.push(rec);
+    if (arr.length > AUTO_SUMMARY_BLOCK_MAX) {
+      sessionData.summaryBlocks = arr.slice(-AUTO_SUMMARY_BLOCK_MAX);
+    }
+    return rec;
   }
 
   function loadSessionMemory(sessionID, projectName = getProjectName()) {
@@ -578,7 +1905,12 @@ export const MemorySystemPlugin = ({ client }) => {
         data.inject.lastAt = data.inject.lastAt || null;
         data.inject.lastReason = data.inject.lastReason || '';
         data.inject.lastStatus = data.inject.lastStatus || '';
+        data.inject.lastDigest = data.inject.lastDigest || '';
+        data.inject.lastSkippedAt = data.inject.lastSkippedAt || null;
+        data.inject.lastSkipReason = data.inject.lastSkipReason || '';
         ensurePruneAudit(data);
+        ensureSendPretrim(data);
+        ensureSummaryBlocks(data);
         return data;
       }
     }
@@ -621,6 +1953,20 @@ export const MemorySystemPlugin = ({ client }) => {
     }
 
     return sortByUpdated(results);
+  }
+
+  function getRecentBlockPlaceholders(sessionID, projectName = getProjectName(), limit = 3) {
+    if (!sessionID || !hasSessionMemoryFile(sessionID, projectName)) return [];
+    const sess = loadSessionMemory(sessionID, projectName);
+    const blocks = ensureSummaryBlocks(sess);
+    return blocks
+      .slice(-Math.max(0, Number(limit || 0)))
+      .map((b) => ({
+        blockId: Number(b.blockId || 0),
+        placeholder: `(b${Number(b.blockId || 0)})`,
+        summary: truncateText(normalizeText(String(b.summary || '')), 120)
+      }))
+      .filter((x) => x.blockId > 0);
   }
 
   function pruneSessionFiles(projectName = getProjectName(), keepSessionID = '') {
@@ -676,6 +2022,20 @@ export const MemorySystemPlugin = ({ client }) => {
         compressedEvents: Number(sessionData?.summary?.compressedEvents || 0),
         lastCompressedAt: sessionData?.summary?.lastCompressedAt || null,
         compressedText: truncateText(normalizeText(String(sessionData?.summary?.compressedText || '')), 600)
+      },
+      summaryBlocks: {
+        count: Array.isArray(sessionData?.summaryBlocks) ? sessionData.summaryBlocks.length : 0,
+        latest: Array.isArray(sessionData?.summaryBlocks) && sessionData.summaryBlocks.length
+          ? (() => {
+              const b = sessionData.summaryBlocks[sessionData.summaryBlocks.length - 1] || {};
+              return {
+                blockId: Number(b.blockId || 0),
+                createdAt: b.createdAt || null,
+                source: b.source || '',
+                consumedMessages: Number(b.consumedMessages || 0)
+              };
+            })()
+          : null
       },
       lastFingerprint: sessionData.lastFingerprint || ''
     };
@@ -1118,6 +2478,7 @@ export const MemorySystemPlugin = ({ client }) => {
     let guard = 0;
     while (fs.existsSync(sessionPath) && fs.statSync(sessionPath).size > AUTO_SESSION_FILE_MAX_BYTES && guard < 8) {
       guard += 1;
+      ensureSummaryBlocks(sessionData);
 
       const events = Array.isArray(sessionData.recentEvents) ? sessionData.recentEvents : [];
       if (events.length > 6) {
@@ -1158,6 +2519,16 @@ export const MemorySystemPlugin = ({ client }) => {
       sessionData.budget.lastCompactedAt = new Date().toISOString();
       sessionData.budget.lastCompactionReason = `session_file_size_over_limit(${AUTO_SESSION_FILE_MAX_BYTES})`;
 
+      if (Array.isArray(sessionData.summaryBlocks) && sessionData.summaryBlocks.length > 0) {
+        if (sessionData.summaryBlocks.length > Math.max(12, Math.floor(AUTO_SUMMARY_BLOCK_MAX / 2))) {
+          sessionData.summaryBlocks = sessionData.summaryBlocks.slice(-Math.max(12, Math.floor(AUTO_SUMMARY_BLOCK_MAX / 2)));
+        }
+        sessionData.summaryBlocks = sessionData.summaryBlocks.map((b) => ({
+          ...b,
+          summary: truncateText(normalizeText(String(b?.summary || '')), 800)
+        }));
+      }
+
       writeJson(sessionPath, sessionData);
       if (fs.statSync(sessionPath).size <= AUTO_SESSION_FILE_TARGET_BYTES) break;
     }
@@ -1165,6 +2536,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
   function persistSessionMemory(sessionData, projectName = getProjectName()) {
     sessionData.updatedAt = new Date().toISOString();
+    ensureSummaryBlocks(sessionData);
     const sessionPath = getSessionMemoryPath(sessionData.sessionID, projectName);
     writeJson(sessionPath, sessionData);
     enforceSessionFileBudget(sessionData, sessionPath);
@@ -1268,9 +2640,26 @@ export const MemorySystemPlugin = ({ client }) => {
     return false;
   }
 
+  function shouldSuppressCurrentSummaryInjection(sessionID, projectName = getProjectName()) {
+    if (!sessionID || !isStrictModeEnabled()) return false;
+    const runtimeTs = Number(sessionStrictHitAt.get(sessionID) || 0);
+    if (runtimeTs > 0 && (Date.now() - runtimeTs) < AUTO_STRICT_SUPPRESS_CURRENT_SUMMARY_MS) return true;
+    if (!hasSessionMemoryFile(sessionID, projectName)) return false;
+    const sess = loadSessionMemory(sessionID, projectName);
+    const sp = ensureSendPretrim(sess);
+    const traces = Array.isArray(sp?.traces) ? sp.traces : [];
+    if (!traces.length) return false;
+    const last = traces[traces.length - 1] || {};
+    if (!last.strictApplied) return false;
+    const ts = Date.parse(last.ts || 0) || 0;
+    if (!ts) return false;
+    return (Date.now() - ts) < AUTO_STRICT_SUPPRESS_CURRENT_SUMMARY_MS;
+  }
+
   async function processUserMessageEvent(sessionID, text, rawEvent) {
     const clean = normalizeText(String(text || ''));
     if (!clean || isMemoryInjectionText(clean)) return;
+    if (shouldSkipDuplicateUserEvent(sessionID, clean, rawEvent)) return;
     const isFirstUserMessageForSession = !hasSessionMemoryFile(sessionID);
 
     if (isFirstUserMessageForSession) {
@@ -1306,7 +2695,8 @@ export const MemorySystemPlugin = ({ client }) => {
     if (
       AUTO_CURRENT_SESSION_SUMMARY_ENABLED &&
       currentCount >= AUTO_CURRENT_SESSION_REFRESH_EVERY &&
-      currentCount % AUTO_CURRENT_SESSION_REFRESH_EVERY === 0
+      currentCount % AUTO_CURRENT_SESSION_REFRESH_EVERY === 0 &&
+      !shouldSuppressCurrentSummaryInjection(sessionID)
     ) {
       const currentSummary = buildCurrentSessionSummaryText(sessionID);
       if (currentSummary) {
@@ -1464,7 +2854,7 @@ export const MemorySystemPlugin = ({ client }) => {
     if (!AUTO_VISIBLE_NOTICES || !sessionID) return false;
     const now = Date.now();
     const prev = sessionNoticeState.get(sessionID);
-    if (prev && prev.key === key && (now - prev.at) < AUTO_VISIBLE_NOTICE_COOLDOWN_MS) return false;
+    if (prev && (now - prev.at) < AUTO_VISIBLE_NOTICE_COOLDOWN_MS) return false;
     sessionNoticeState.set(sessionID, { key, at: now });
     return true;
   }
@@ -1513,6 +2903,42 @@ export const MemorySystemPlugin = ({ client }) => {
   async function injectMemoryText(sessionID, text, reason = 'memory-inject') {
     try {
       if (!sessionID || !text) return false;
+      const mem = loadSessionMemory(sessionID);
+      mem.inject = mem.inject || {};
+      const digest = stableTextHash(text);
+      const now = Date.now();
+      const dedupeWindow = reason === 'trigger-recall'
+        ? AUTO_INJECT_DEDUPE_WINDOW_RECALL_MS
+        : AUTO_INJECT_DEDUPE_WINDOW_MS;
+      const lastAtTs = Date.parse(mem.inject.lastAt || 0) || 0;
+      const sameDigest = String(mem.inject.lastDigest || '') === digest;
+      const sameReason = String(mem.inject.lastReason || '') === String(reason || '');
+      if (sameDigest && sameReason && lastAtTs > 0 && (now - lastAtTs) < dedupeWindow) {
+        mem.inject.lastSkippedAt = new Date().toISOString();
+        mem.inject.lastSkipReason = `dedupe_window_${dedupeWindow}ms`;
+        mem.inject.lastStatus = 'skipped';
+        persistSessionMemory(mem);
+        writeDashboardFiles();
+        return false;
+      }
+
+      const stackRisk = mem?.alerts?.contextStackRisk;
+      const stackRiskAt = Date.parse(stackRisk?.at || 0) || 0;
+      const riskActive = Boolean(
+        stackRisk &&
+        stackRisk.level === 'warn' &&
+        stackRiskAt > 0 &&
+        (now - stackRiskAt) < AUTO_INJECT_RISK_GUARD_WINDOW_MS
+      );
+      if (riskActive && reason === 'current-session-refresh') {
+        mem.inject.lastSkippedAt = new Date().toISOString();
+        mem.inject.lastSkipReason = 'context_stack_risk_guard';
+        mem.inject.lastStatus = 'skipped';
+        persistSessionMemory(mem);
+        writeDashboardFiles();
+        return false;
+      }
+
       const reasonLabel = (() => {
         const m = {
           'global-prefs': '已注入全局偏好记忆',
@@ -1524,8 +2950,6 @@ export const MemorySystemPlugin = ({ client }) => {
         return m[String(reason || 'memory-inject')] || '已注入记忆';
       })();
       const noteInject = () => {
-        const mem = loadSessionMemory(sessionID);
-        mem.inject = mem.inject || {};
         if (reason === 'global-prefs') mem.inject.globalPrefsCount = Number(mem.inject.globalPrefsCount || 0) + 1;
         if (reason === 'current-session-refresh') mem.inject.currentSummaryCount = Number(mem.inject.currentSummaryCount || 0) + 1;
         if (reason === 'trigger-recall') mem.inject.triggerRecallCount = Number(mem.inject.triggerRecallCount || 0) + 1;
@@ -1533,15 +2957,17 @@ export const MemorySystemPlugin = ({ client }) => {
         mem.inject.lastAt = new Date().toISOString();
         mem.inject.lastReason = String(reason || 'memory-inject');
         mem.inject.lastStatus = 'success';
+        mem.inject.lastDigest = digest;
+        mem.inject.lastSkippedAt = null;
+        mem.inject.lastSkipReason = '';
         persistSessionMemory(mem);
         writeDashboardFiles();
       };
       const noteInjectFailed = () => {
-        const mem = loadSessionMemory(sessionID);
-        mem.inject = mem.inject || {};
         mem.inject.lastAt = new Date().toISOString();
         mem.inject.lastReason = String(reason || 'memory-inject');
         mem.inject.lastStatus = 'failed';
+        mem.inject.lastDigest = digest;
         persistSessionMemory(mem);
         writeDashboardFiles();
       };
@@ -1592,6 +3018,7 @@ export const MemorySystemPlugin = ({ client }) => {
         mem.inject.lastAt = new Date().toISOString();
         mem.inject.lastReason = String(reason || 'memory-inject');
         mem.inject.lastStatus = 'failed';
+        mem.inject.lastDigest = stableTextHash(text);
         persistSessionMemory(mem);
         writeDashboardFiles();
       } catch {
@@ -1749,6 +3176,35 @@ export const MemorySystemPlugin = ({ client }) => {
           compressedText: sanitizeCompressedSummaryText(String(sess?.summary?.compressedText || '')),
           compressedPreview: truncateText(sanitizeCompressedSummaryText(String(sess?.summary?.compressedText || '')), 240)
         },
+        summaryBlocks: (() => {
+          const arr = Array.isArray(sess?.summaryBlocks) ? sess.summaryBlocks : [];
+          const traces = Array.isArray(sess?.sendPretrim?.traces) ? sess.sendPretrim.traces : [];
+          const traceByBlockId = new Map();
+          for (const tr of traces) {
+            const bid = Number(tr?.blockId || 0);
+            if (bid > 0 && !traceByBlockId.has(bid)) traceByBlockId.set(bid, tr);
+          }
+          const recent = arr.slice(-5).map((b) => ({
+            blockId: Number(b?.blockId || 0),
+            createdAt: b?.createdAt || null,
+            source: b?.source || '',
+            startMessageID: b?.startMessageID || '',
+            endMessageID: b?.endMessageID || '',
+            consumedMessages: Number(b?.consumedMessages || 0),
+            summaryPreview: (() => {
+              const blkId = Number(b?.blockId || 0);
+              const tr = traceByBlockId.get(blkId);
+              const range = (b?.startMessageID && b?.endMessageID)
+                ? `range:${b.startMessageID}->${b.endMessageID}`
+                : '';
+              const saved = tr ? ` save~${Number(tr?.savedTokens || 0)}` : '';
+              const prefix = `${range}${saved}`.trim();
+              const body = normalizeText(String(b?.summary || ''));
+              return truncateText(prefix ? `${prefix} | ${body}` : body, 160);
+            })()
+          }));
+          return { count: arr.length, recent };
+        })(),
         recall: {
           count: Number(sess?.recall?.count || 0),
           lastAt: sess?.recall?.lastAt || null
@@ -1760,7 +3216,10 @@ export const MemorySystemPlugin = ({ client }) => {
           memoryDocsCount: Number(sess?.inject?.memoryDocsCount || 0),
           lastAt: sess?.inject?.lastAt || null,
           lastReason: sess?.inject?.lastReason || '',
-          lastStatus: sess?.inject?.lastStatus || ''
+          lastStatus: sess?.inject?.lastStatus || '',
+          lastDigest: sess?.inject?.lastDigest || '',
+          lastSkippedAt: sess?.inject?.lastSkippedAt || null,
+          lastSkipReason: sess?.inject?.lastSkipReason || ''
         },
         budget: {
           bodyTokenBudget: Number(sess?.budget?.bodyTokenBudget || AUTO_BODY_TOKEN_BUDGET),
@@ -1778,7 +3237,20 @@ export const MemorySystemPlugin = ({ client }) => {
           lastDiscardRemoved: Number(sess?.pruneAudit?.lastDiscardRemoved || 0),
           lastExtractMoved: Number(sess?.pruneAudit?.lastExtractMoved || 0),
           lastEstimatedBodyTokens: Number(sess?.pruneAudit?.lastEstimatedBodyTokens || 0)
-        }
+        },
+        sendPretrim: {
+          autoRuns: Number(sess?.sendPretrim?.autoRuns || 0),
+          manualRuns: Number(sess?.sendPretrim?.manualRuns || 0),
+          savedTokensTotal: Number(sess?.sendPretrim?.savedTokensTotal || 0),
+          lastBeforeTokens: Number(sess?.sendPretrim?.lastBeforeTokens || 0),
+          lastAfterTokens: Number(sess?.sendPretrim?.lastAfterTokens || 0),
+          lastSavedTokens: Number(sess?.sendPretrim?.lastSavedTokens || 0),
+          lastAt: sess?.sendPretrim?.lastAt || null,
+          lastReason: sess?.sendPretrim?.lastReason || '',
+          lastStatus: sess?.sendPretrim?.lastStatus || '',
+          traces: Array.isArray(sess?.sendPretrim?.traces) ? sess.sendPretrim.traces.slice(-8) : []
+        },
+        alerts: sess?.alerts && typeof sess.alerts === 'object' ? sess.alerts : {}
       }));
 
       const totalEvents = sessionList.reduce(
@@ -1862,6 +3334,9 @@ export const MemorySystemPlugin = ({ client }) => {
       '    .ev .txt { white-space:pre-wrap; font-size:13px; line-height:1.4; }',
       '    .pref { font-size:13px; color:var(--ink); margin-bottom:4px; }',
       '    .empty { color:var(--muted); font-size:13px; }',
+      '    .trash-row { display:flex; align-items:flex-start; gap:10px; padding:8px; border:1px solid var(--line); border-radius:8px; margin-bottom:8px; background:#f8fafc; }',
+      '    .trash-row .meta { font-size:12px; color:var(--muted); }',
+      '    .trash-row .path { font-family:"IBM Plex Mono","JetBrains Mono",monospace; font-size:11px; color:#334155; word-break:break-all; }',
       '    @media (max-width:920px) { .layout { grid-template-columns:1fr; } .sidebar { border-right:none; border-bottom:1px solid var(--line); } }',
       '  </style>',
       '</head>',
@@ -1882,7 +3357,8 @@ export const MemorySystemPlugin = ({ client }) => {
       '      <div class="panel"><h1 id="projectTitle" style="font-size:18px;">No project selected</h1><div class="sub" id="projectMeta"></div></div>',
       '      <div class="panel"><h1 id="globalTitle" style="font-size:16px;">Global Preferences</h1><div class="sub" id="tokenHint">Token estimate is approximate (chars/4).</div><div id="globalPrefs" class="empty">No global preferences.</div></div>',
       '      <div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;"><h1 style="font-size:16px;">Sessions</h1><button id="batchDeleteBtn" style="height:30px;">批量删除</button></div><div id="sessionList" class="empty">No sessions.</div></div>',
-      '    </main>',
+      '      <div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;"><h1 style="font-size:16px;">回收站</h1><div style="display:flex;align-items:center;gap:8px;"><label for="trashRetentionSel" style="font-size:12px;color:var(--muted);">保留天数</label><select id="trashRetentionSel"><option value="1">1</option><option value="3">3</option><option value="7">7</option><option value="10">10</option><option value="30" selected>30</option></select><button id="trashCleanupBtn" style="height:30px;">立即清理过期</button><button id="trashDeleteBtn" style="height:30px;" disabled>永久删除(0)</button></div></div><div id="trashMeta" class="sub">-</div><div id="trashList" class="empty">暂无回收站条目</div></div>',
+    '    </main>',
       '  </div>',
       '  <div id="editModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9999;align-items:center;justify-content:center;">',
       '    <div style="width:min(900px,92vw);background:#fff;border-radius:12px;padding:14px;border:1px solid #d9e2ea;">',
@@ -1903,11 +3379,14 @@ export const MemorySystemPlugin = ({ client }) => {
       '    const projectMeta = $("projectMeta");',
       '    const globalPrefs = $("globalPrefs");',
       '    const langSel = $("langSel");',
-      '    const I18N = { zh:{title:"记忆看板",lang:"语言",global:"全局偏好",token:"Token 估算为近似值（chars/4）",edit:"编辑摘要",del:"删除会话",nos:"暂无会话",noproj:"暂无项目记忆",save:"保存",cancel:"取消"}, en:{title:"Memory Dashboard",lang:"Language",global:"Global Preferences",token:"Token estimate is approximate (chars/4).",edit:"Edit summary",del:"Delete session",nos:"No sessions.",noproj:"No project memory yet.",save:"Save",cancel:"Cancel"} };',
+      '    const I18N = { zh:{title:"记忆看板",lang:"语言",global:"全局偏好",token:"Token 估算为近似值（chars/4）",edit:"编辑摘要",del:"删除会话",nos:"暂无会话",noproj:"暂无项目记忆",save:"保存",cancel:"取消",trashTitle:"回收站",trashNone:"暂无回收站条目",trashDelete:"永久删除",trashCleanup:"立即清理过期"}, en:{title:"Memory Dashboard",lang:"Language",global:"Global Preferences",token:"Token estimate is approximate (chars/4).",edit:"Edit summary",del:"Delete session",nos:"No sessions.",noproj:"No project memory yet.",save:"Save",cancel:"Cancel",trashTitle:"Trash",trashNone:"No trash entries",trashDelete:"Delete Permanently",trashCleanup:"Cleanup Expired"} };',
       '    let LANG = localStorage.getItem("memory_dashboard_lang") || "zh";',
       '    const __selectedSessionIDs = new Set();',
+      '    const __trashSelectedPaths = new Set();',
+      '    let __trashData = { retentionDays:30, entries:[] };',
       '    let __activeProjectName = "";',
       '    function updateBatchDeleteBtn(){ const b=$("batchDeleteBtn"); if(!b) return; const n=__selectedSessionIDs.size; b.textContent=n>0?("批量删除("+n+")"):"批量删除"; b.disabled=n===0; }',
+      '    function updateTrashDeleteBtn(){ const b=$("trashDeleteBtn"); if(!b) return; const n=__trashSelectedPaths.size; b.textContent=t("trashDelete")+"(" + n + ")"; b.disabled=n===0; }',
       '    function t(k){ return (I18N[LANG]&&I18N[LANG][k]) || (I18N.en&&I18N.en[k]) || k; }',
       '    function updateMetrics(){',
       '      const gen = DATA && DATA.generatedAt ? new Date(DATA.generatedAt).toLocaleString() : "-";',
@@ -1926,20 +3405,25 @@ export const MemorySystemPlugin = ({ client }) => {
       '      updateMetrics();',
       '      renderGlobalPrefs();',
       '      renderProjects();',
+      '      await refreshTrashData();',
       '    }',
       '    async function apiPost(url,payload){ const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); if(!r.ok) throw new Error(await r.text()); return r.json(); }',
+      '    async function refreshTrashData(){ try{ const r=await fetch("/api/memory/trash",{cache:"no-store"}); if(r.ok){ __trashData=await r.json(); } }catch(_){ } renderTrash(); }',
+      '    function renderTrash(){ const list=$("trashList"); const meta=$("trashMeta"); const sel=$("trashRetentionSel"); if(!list||!meta||!sel) return; const entries=Array.isArray(__trashData.entries)?__trashData.entries:[]; const keep=Number(__trashData.retentionDays||30); sel.value=String(keep); meta.textContent=(LANG==="en"?("Retention "+keep+" days · entries="+entries.length):("保留 "+keep+" 天 · 条目="+entries.length)); if(!entries.length){ list.className="empty"; list.textContent=t("trashNone"); __trashSelectedPaths.clear(); updateTrashDeleteBtn(); return; } list.className=""; list.innerHTML=""; entries.forEach((e)=>{ const row=document.createElement("div"); row.className="trash-row"; const cb=document.createElement("input"); cb.type="checkbox"; cb.checked=__trashSelectedPaths.has(e.path||""); cb.addEventListener("change",(ev)=>{ if(ev.target.checked) __trashSelectedPaths.add(e.path||""); else __trashSelectedPaths.delete(e.path||""); updateTrashDeleteBtn(); }); const box=document.createElement("div"); box.style.display="flex"; box.style.flexDirection="column"; box.style.gap="4px"; const m1=document.createElement("div"); m1.className="meta"; m1.textContent=(e.projectName||"-")+" · "+(e.fileName||"-")+" · "+new Date(e.mtime||Date.now()).toLocaleString()+" · "+(e.size||0)+" bytes"; const m2=document.createElement("div"); m2.className="path"; m2.textContent=e.path||""; box.appendChild(m1); box.appendChild(m2); row.appendChild(cb); row.appendChild(box); list.appendChild(row); }); updateTrashDeleteBtn(); }',
+      '    async function cleanupTrashNow(){ const sel=$("trashRetentionSel"); const days=Number(sel&&sel.value||30); if(!window.confirm((LANG==="en"?"Cleanup expired trash with retention ":"按保留期清理过期回收站条目：")+days+(LANG==="en"?" days?":" 天？"))) return; try{ await apiPost("/api/memory/trash/cleanup",{days,confirm:true,source:"dashboard"}); __trashSelectedPaths.clear(); await refreshTrashData(); }catch(e){ alert("Trash cleanup failed: "+e.message);} }',
+      '    async function deleteTrashSelected(){ const entries=[...__trashSelectedPaths].filter(Boolean); if(!entries.length) return; if(!window.confirm((LANG==="en"?"Delete selected trash entries permanently? ":"永久删除所选回收站条目？ ")+entries.length)) return; try{ await apiPost("/api/memory/trash/delete",{confirm:true,entries,source:"dashboard"}); __trashSelectedPaths.clear(); await refreshTrashData(); }catch(e){ alert("Trash delete failed: "+e.message);} }',
       '    async function editSummary(projectName,sessionID,current){ const modal=$("editModal"); const ta=$("editTextarea"); const saveBtn=$("editSaveBtn"); const cancelBtn=$("editCancelBtn"); $("editTitle").textContent=t("edit")+" - "+sessionID; ta.value=current||""; $("editCancelBtn").textContent=t("cancel"); $("editSaveBtn").textContent=t("save"); modal.style.display="flex"; const close=()=>{ modal.style.display="none"; }; cancelBtn.onclick=close; saveBtn.onclick=async()=>{ if(!window.confirm("Apply summary update and write audit log?")) return; try{ await apiPost("/api/memory/session/summary",{projectName,sessionID,summaryText:ta.value,confirm:true,source:"dashboard"}); close(); window.location.reload(); }catch(e){ alert("Update failed: "+e.message);} }; }',
       '    async function deleteSession(projectName,sessionID){ if(!window.confirm("Delete this session memory file? This writes an audit log.")) return; try{ await apiPost("/api/memory/session/delete",{projectName,sessionID,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Delete failed: "+e.message);} }',
       '    async function batchDeleteSessions(projectName){ const ids=[...__selectedSessionIDs].filter(Boolean); if(!ids.length){ alert("请先勾选要删除的会话"); return; } if(!window.confirm("批量删除 "+ids.length+" 个会话记忆？将写入审计日志。")) return; try{ await apiPost("/api/memory/sessions/delete",{projectName,sessionIDs:ids,confirm:true,source:"dashboard"}); ids.forEach((id)=>__selectedSessionIDs.delete(id)); updateBatchDeleteBtn(); await refreshDashboardData(); }catch(e){ alert("Batch delete failed: "+e.message);} }',
-      '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); }',
+      '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); const c=$("trashCleanupBtn"); if(c) c.textContent=t("trashCleanup"); updateTrashDeleteBtn(); }',
       '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); if(!entries.length){globalPrefs.textContent=t("noproj")==="No project memory yet."?"No global preferences.":"暂无全局偏好"; return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
-      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; const _title=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:(s.sessionID||""); sid.textContent=_title+"  id:"+(s.sessionID||""); sid.style.whiteSpace="normal"; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · prune:auto\"+(pa.autoRuns||0)+\"/manual\"+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · 正文~\"+bt+\" tokens\"; const metaWrap=document.createElement("div"); metaWrap.style.display="flex"; metaWrap.style.flexDirection="column"; metaWrap.style.alignItems="flex-start"; metaWrap.style.gap="4px"; metaWrap.appendChild(sid); metaWrap.appendChild(st); head.appendChild(sel); head.appendChild(metaWrap); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
+      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; const _title=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:(s.sessionID||""); sid.textContent=_title+"  id:"+(s.sessionID||""); sid.style.whiteSpace="normal"; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const sp=s.sendPretrim||{}; const spLast=(sp.lastSavedTokens||0)>0?(" · 最近pretrim:"+(sp.lastBeforeTokens||0)+"→"+(sp.lastAfterTokens||0)+" (save~"+(sp.lastSavedTokens||0)+")"):""; const strictNow=(sp.traces&&sp.traces.length&&sp.traces[sp.traces.length-1].strictApplied)?(" · strict:ON("+((sp.traces[sp.traces.length-1].strictReplacedMessages)||0)+")"):""; const risk=(s.alerts&&s.alerts.contextStackRisk)?" · 风险:上下文叠加疑似":""; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · prune:auto\"+(pa.autoRuns||0)+\"/manual\"+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · pretrim:auto\"+(sp.autoRuns||0)+\" saved~\"+(sp.savedTokensTotal||0)+spLast+strictNow+risk+\" · blocks:\"+(((s.summaryBlocks&&s.summaryBlocks.count)||0))+\" · 正文~\"+bt+\" tokens\"; const metaWrap=document.createElement("div"); metaWrap.style.display="flex"; metaWrap.style.flexDirection="column"; metaWrap.style.alignItems="flex-start"; metaWrap.style.gap="4px"; metaWrap.appendChild(sid); metaWrap.appendChild(st); head.appendChild(sel); head.appendChild(metaWrap); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } if(s.summaryBlocks&&Array.isArray(s.summaryBlocks.recent)&&s.summaryBlocks.recent.length){ const blk=document.createElement("div"); blk.className="ev"; const bm=document.createElement("div"); bm.className="meta"; bm.textContent="compressed blocks (latest "+s.summaryBlocks.recent.length+")"; const bt=document.createElement("div"); bt.className="txt"; bt.textContent=s.summaryBlocks.recent.map((b)=>`b${b.blockId} | ${b.source||"pretrim"} | m:${b.consumedMessages||0} | ${b.summaryPreview||""}`).join("\n"); blk.appendChild(bm); blk.appendChild(bt); events.appendChild(blk); } if(s.sendPretrim&&Array.isArray(s.sendPretrim.traces)&&s.sendPretrim.traces.length){ const tr=document.createElement("div"); tr.className="ev"; const m=document.createElement("div"); m.className="meta"; m.textContent="pretrim traces (latest 8)"; const t=document.createElement("div"); t.className="txt"; const rows=s.sendPretrim.traces.slice(-8).map((x)=>{ const ts=x.ts?new Date(x.ts).toLocaleString():"-"; const strict=x.strictApplied?(` | strict:${x.strictReplacedMessages||0}`):\"\"; const distill=x.distillUsed?(` | distill:${x.distillProvider||\"\"}/${x.distillModel||\"\"}`):(x.distillStatus?(` | distill-fail:${x.distillStatus}`):\"\"); const strat=((x.strategyDedup||0)||(x.strategySupersedeWrites||0)||(x.strategyPurgedErrors||0)||(x.strategyPhaseTrim||0))?(` | strat:d${x.strategyDedup||0}/s${x.strategySupersedeWrites||0}/p${x.strategyPurgedErrors||0}/ph${x.strategyPhaseTrim||0}`):\"\"; const block=(x.blockId?(` | block:b${x.blockId}`):\"\"); const anchor=x.anchorReplaceApplied?(` | anchor:${x.anchorReplaceMessages||0}/b${x.anchorReplaceBlocks||0}`):\"\"; const comp=(()=>{ const b=x.compositionBefore||{}; const a=x.compositionAfter||{}; const bt=(b.total||0), at=(a.total||0); if(!bt||!at) return \"\"; const pct=(v,t)=>Math.round((100*v)/Math.max(1,t)); return ` | comp S:${pct(b.system||0,bt)}→${pct(a.system||0,at)} U:${pct(b.user||0,bt)}→${pct(a.user||0,at)} T:${pct(b.tool||0,bt)}→${pct(a.tool||0,at)}`; })(); return `${ts} | ${x.beforeTokens||0}→${x.afterTokens||0} | save~${x.savedTokens||0} | rw:${x.rewrittenMessages||0}/${x.rewrittenParts||0} | ex:${x.extractedMessages||0}${strict}${distill}${strat}${block}${anchor}${comp} | ${x.reason||""}`; }); t.textContent=rows.join("\n"); tr.appendChild(m); tr.appendChild(t); events.appendChild(tr); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
       '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); __activeProjectName=project.name||""; __selectedSessionIDs.clear(); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent="sessions="+project.sessionCount+" · events="+project.totalEvents+" · tech="+ts; const b=$("batchDeleteBtn"); if(b) b.onclick=()=>batchDeleteSessions(project.name); renderSessions(project); updateBatchDeleteBtn(); }',
       '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent="sessions="+p.sessionCount+" · events="+p.totalEvents; item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
       '    let __autoRefreshTimer = null;',
       '    function startAutoRefresh(){ if(__autoRefreshTimer) clearInterval(__autoRefreshTimer); __autoRefreshTimer = setInterval(()=>{ refreshDashboardData(); }, 60000); }',
       '    document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState!=="visible") return; const now=Date.now(); if(now-(__lastRefreshAt||0)>=60000) refreshDashboardData(); });',
-      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=langSel.value; localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); }; applyLang(); refreshDashboardData(); startAutoRefresh();',
+      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=langSel.value; localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); renderTrash(); }; const cleanupBtn=$("trashCleanupBtn"); if(cleanupBtn) cleanupBtn.onclick=cleanupTrashNow; const delBtn=$("trashDeleteBtn"); if(delBtn) delBtn.onclick=deleteTrashSelected; const retentionSel=$("trashRetentionSel"); if(retentionSel) retentionSel.onchange=()=>{ __trashData.retentionDays=Number(retentionSel.value||30); renderTrash(); }; applyLang(); updateTrashDeleteBtn(); refreshDashboardData(); startAutoRefresh();',
       '  </script>',
       '</body>',
       '</html>'
@@ -1988,7 +3472,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           properties: {
             command: {
               type: 'string',
-              enum: ['learn', 'project', 'global', 'set', 'prefer', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune'],
+              enum: ['learn', 'project', 'global', 'set', 'prefer', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'context', 'stats', 'doctor'],
               description: 'The memory command to execute'
             },
             args: {
@@ -2020,7 +3504,10 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
             '- dashboard [path|build|json]',
             '- discard [session <id>|current] [aggressive]',
             '- extract [session <id>|current] [maxEvents]',
-            '- prune [session <id>|current]'
+            '- prune [session <id>|current]',
+            '- context [session <id>|current]',
+            '- stats [project|session <id>]',
+            '- doctor [session <id>|current]'
           ].join('\n');
           const projectMemoryPath = getProjectMemoryPath();
           const projectName = getProjectName();
@@ -2369,6 +3856,243 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
               return `Session memory list (${projectName}):\n${JSON.stringify(sessions, null, 2)}`;
             }
 
+            case 'context': {
+              let sid = '';
+              if (args[0] === 'session') sid = args[1] || '';
+              if (!sid || args[0] === 'current') sid = sid || [...sessionUserMessageCounters.keys()].slice(-1)[0] || '';
+              if (!sid) return 'No active session id found. Use: /memory context session <id>';
+              if (!hasSessionMemoryFile(sid, projectName)) return `Session memory file not found: ${sid}`;
+              const sess = loadSessionMemory(sid, projectName);
+              const sp = ensureSendPretrim(sess);
+              const pa = ensurePruneAudit(sess);
+              const distillCfg = getIndependentDistillConfig();
+              return JSON.stringify({
+                sessionID: sid,
+                pretrimConfig: {
+                  enabled: isSendPretrimEnabled(),
+                  strictMode: isStrictModeEnabled(),
+                  dryRun: AUTO_SEND_PRETRIM_DRY_RUN,
+                  budget: AUTO_SEND_PRETRIM_BUDGET,
+                  target: AUTO_SEND_PRETRIM_TARGET,
+                  stage2Trigger: Math.max(
+                    AUTO_SEND_PRETRIM_TARGET + 200,
+                    Math.min(
+                      Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_HARD_RATIO),
+                      Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_DISTILL_TRIGGER_RATIO)
+                    )
+                  ),
+                  turnProtection: AUTO_SEND_PRETRIM_TURN_PROTECTION
+                },
+                strategyConfig: {
+                  deduplication: AUTO_STRATEGY_DEDUP_ENABLED,
+                  supersedeWrites: AUTO_STRATEGY_SUPERSEDE_WRITES_ENABLED,
+                  purgeErrors: AUTO_STRATEGY_PURGE_ERRORS_ENABLED,
+                  purgeErrorTurns: AUTO_STRATEGY_PURGE_ERROR_TURNS,
+                  phaseAwareTrim: true
+                },
+                distillConfig: {
+                  mode: getDistillMode(),
+                  enabled: Boolean(distillCfg.enabled),
+                  provider: distillCfg.provider || '',
+                  baseURL: distillCfg.baseURL ? '(configured)' : '',
+                  apiKey: distillCfg.apiKey ? '(configured)' : '',
+                  model: distillCfg.model || '',
+                  useSessionModel: Boolean(distillCfg.useSessionModel),
+                  timeoutMs: Number(distillCfg.timeoutMs || 0),
+                  maxTokens: Number(distillCfg.maxTokens || 0)
+                },
+                budget: sess?.budget || {},
+                inject: sess?.inject || {},
+                summaryBlocks: {
+                  count: ensureSummaryBlocks(sess).length,
+                  recent: ensureSummaryBlocks(sess).slice(-3)
+                },
+                sendPretrim: sp,
+                pruneAudit: pa,
+                stats: sess?.stats || emptyStats()
+              }, null, 2);
+            }
+
+            case 'stats': {
+              const target = (args[0] || 'project').toLowerCase();
+              if (target === 'session') {
+                const sid = args[1] || '';
+                if (!sid) return 'Usage: /memory stats session <id>';
+                if (!hasSessionMemoryFile(sid, projectName)) return `Session memory file not found: ${sid}`;
+                const sess = loadSessionMemory(sid, projectName);
+                return JSON.stringify({
+                  sessionID: sid,
+                  sendPretrim: ensureSendPretrim(sess),
+                  pruneAudit: ensurePruneAudit(sess),
+                  budget: sess?.budget || {},
+                  inject: sess?.inject || {},
+                  summaryBlocks: {
+                    count: ensureSummaryBlocks(sess).length,
+                    recent: ensureSummaryBlocks(sess).slice(-3)
+                  },
+                  recall: sess?.recall || {}
+                }, null, 2);
+              }
+              const sessions = listSessionMemories(projectName);
+              const distillCfg = getIndependentDistillConfig();
+              const agg = {
+                project: projectName,
+                pretrimConfig: {
+                  enabled: isSendPretrimEnabled(),
+                  strictMode: isStrictModeEnabled(),
+                  dryRun: AUTO_SEND_PRETRIM_DRY_RUN,
+                  budget: AUTO_SEND_PRETRIM_BUDGET,
+                  target: AUTO_SEND_PRETRIM_TARGET,
+                  stage2Trigger: Math.max(
+                    AUTO_SEND_PRETRIM_TARGET + 200,
+                    Math.min(
+                      Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_HARD_RATIO),
+                      Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_DISTILL_TRIGGER_RATIO)
+                    )
+                  ),
+                  turnProtection: AUTO_SEND_PRETRIM_TURN_PROTECTION
+                },
+                strategyConfig: {
+                  deduplication: AUTO_STRATEGY_DEDUP_ENABLED,
+                  supersedeWrites: AUTO_STRATEGY_SUPERSEDE_WRITES_ENABLED,
+                  purgeErrors: AUTO_STRATEGY_PURGE_ERRORS_ENABLED,
+                  purgeErrorTurns: AUTO_STRATEGY_PURGE_ERROR_TURNS,
+                  phaseAwareTrim: true
+                },
+                distillConfig: {
+                  mode: getDistillMode(),
+                  enabled: Boolean(distillCfg.enabled),
+                  provider: distillCfg.provider || '',
+                  baseURL: distillCfg.baseURL ? '(configured)' : '',
+                  apiKey: distillCfg.apiKey ? '(configured)' : '',
+                  model: distillCfg.model || '',
+                  useSessionModel: Boolean(distillCfg.useSessionModel),
+                  timeoutMs: Number(distillCfg.timeoutMs || 0),
+                  maxTokens: Number(distillCfg.maxTokens || 0)
+                },
+                sessions: sessions.length,
+                sendPretrim: {
+                  autoRuns: 0,
+                  manualRuns: 0,
+                  savedTokensTotal: 0,
+                  lastAt: null
+                },
+                pruneAudit: {
+                  autoRuns: 0,
+                  manualRuns: 0,
+                  discardRemovedTotal: 0,
+                  extractMovedTotal: 0,
+                  lastAt: null
+                }
+              };
+              let latestTs = 0;
+              let latestP = 0;
+              for (const sess of sessions) {
+                const sp = ensureSendPretrim(sess);
+                const pa = ensurePruneAudit(sess);
+                agg.sendPretrim.autoRuns += Number(sp.autoRuns || 0);
+                agg.sendPretrim.manualRuns += Number(sp.manualRuns || 0);
+                agg.sendPretrim.savedTokensTotal += Number(sp.savedTokensTotal || 0);
+                agg.pruneAudit.autoRuns += Number(pa.autoRuns || 0);
+                agg.pruneAudit.manualRuns += Number(pa.manualRuns || 0);
+                agg.pruneAudit.discardRemovedTotal += Number(pa.discardRemovedTotal || 0);
+                agg.pruneAudit.extractMovedTotal += Number(pa.extractMovedTotal || 0);
+                const t1 = Date.parse(sp.lastAt || 0) || 0;
+                if (t1 > latestTs) { latestTs = t1; agg.sendPretrim.lastAt = sp.lastAt || null; }
+                const t2 = Date.parse(pa.lastAt || 0) || 0;
+                if (t2 > latestP) { latestP = t2; agg.pruneAudit.lastAt = pa.lastAt || null; }
+              }
+              return JSON.stringify(agg, null, 2);
+            }
+
+            case 'doctor': {
+              let sid = '';
+              if (args[0] === 'session') sid = args[1] || '';
+              if (!sid || args[0] === 'current') sid = sid || [...sessionUserMessageCounters.keys()].slice(-1)[0] || '';
+              if (!sid) return 'No active session id found. Use: /memory doctor session <id>';
+              if (!hasSessionMemoryFile(sid, projectName)) return `Session memory file not found: ${sid}`;
+
+              const sess = loadSessionMemory(sid, projectName);
+              const inject = sess?.inject || {};
+              const sp = ensureSendPretrim(sess);
+              const alerts = sess?.alerts && typeof sess.alerts === 'object' ? sess.alerts : {};
+              const blocks = ensureSummaryBlocks(sess);
+              const latestBlock = blocks.length ? blocks[blocks.length - 1] : null;
+
+              const injectedCount = Number(inject.globalPrefsCount || 0)
+                + Number(inject.currentSummaryCount || 0)
+                + Number(inject.triggerRecallCount || 0)
+                + Number(inject.memoryDocsCount || 0);
+              const lastTrace = Array.isArray(sp.traces) && sp.traces.length ? sp.traces[sp.traces.length - 1] : null;
+              const payload = {
+                sessionID: sid,
+                injected: {
+                  happened: injectedCount > 0,
+                  total: injectedCount,
+                  breakdown: {
+                    globalPrefs: Number(inject.globalPrefsCount || 0),
+                    currentSummary: Number(inject.currentSummaryCount || 0),
+                    triggerRecall: Number(inject.triggerRecallCount || 0),
+                    memoryDocs: Number(inject.memoryDocsCount || 0)
+                  },
+                  lastAt: inject.lastAt || null,
+                  lastReason: inject.lastReason || '',
+                  lastStatus: inject.lastStatus || '',
+                  lastSkippedAt: inject.lastSkippedAt || null,
+                  lastSkipReason: inject.lastSkipReason || ''
+                },
+                pretrim: {
+                  happened: Number(sp.autoRuns || 0) + Number(sp.manualRuns || 0) > 0,
+                  strictModeEnabled: isStrictModeEnabled(),
+                  suppressCurrentSummaryNow: shouldSuppressCurrentSummaryInjection(sid, projectName),
+                  autoRuns: Number(sp.autoRuns || 0),
+                  manualRuns: Number(sp.manualRuns || 0),
+                  savedTokensTotal: Number(sp.savedTokensTotal || 0),
+                  last: lastTrace ? {
+                    at: lastTrace.ts || null,
+                    beforeTokens: Number(lastTrace.beforeTokens || 0),
+                    afterTokens: Number(lastTrace.afterTokens || 0),
+                    savedTokens: Number(lastTrace.savedTokens || 0),
+                    strictApplied: Boolean(lastTrace.strictApplied),
+                    strictReplacedMessages: Number(lastTrace.strictReplacedMessages || 0),
+                    distillUsed: Boolean(lastTrace.distillUsed),
+                    distillProvider: String(lastTrace.distillProvider || ''),
+                    distillModel: String(lastTrace.distillModel || ''),
+                    distillStatus: String(lastTrace.distillStatus || ''),
+                    strategyDedup: Number(lastTrace.strategyDedup || 0),
+                    strategySupersedeWrites: Number(lastTrace.strategySupersedeWrites || 0),
+                    strategyPurgedErrors: Number(lastTrace.strategyPurgedErrors || 0),
+                    strategyPhaseTrim: Number(lastTrace.strategyPhaseTrim || 0),
+                    adaptiveLevel: Number(lastTrace.adaptiveLevel || 0),
+                    adaptiveRatio: Number(lastTrace.adaptiveRatio || 0),
+                    anchorReplaceApplied: Boolean(lastTrace.anchorReplaceApplied),
+                    anchorReplaceMessages: Number(lastTrace.anchorReplaceMessages || 0),
+                    anchorReplaceBlocks: Number(lastTrace.anchorReplaceBlocks || 0),
+                    compositionBefore: lastTrace.compositionBefore || null,
+                    compositionAfter: lastTrace.compositionAfter || null,
+                    blockId: Number(lastTrace.blockId || 0),
+                    reason: lastTrace.reason || ''
+                  } : null
+                },
+                risk: {
+                  contextStackRisk: alerts.contextStackRisk || null,
+                  hit: Boolean(alerts.contextStackRisk)
+                },
+                blocks: {
+                  count: blocks.length,
+                  latest: latestBlock ? {
+                    blockId: Number(latestBlock.blockId || 0),
+                    createdAt: latestBlock.createdAt || null,
+                    source: latestBlock.source || '',
+                    startMessageID: latestBlock.startMessageID || '',
+                    endMessageID: latestBlock.endMessageID || '',
+                    consumedMessages: Number(latestBlock.consumedMessages || 0)
+                  } : null
+                }
+              };
+              return JSON.stringify(payload, null, 2);
+            }
+
             case 'discard': {
               let targetSessionID = '';
               let aggressive = false;
@@ -2633,6 +4357,42 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
         }
       }
     },
+    "experimental.chat.messages.transform": async (_input, output) => {
+      try {
+        const messages = Array.isArray(output?.messages) ? output.messages : [];
+        if (!messages.length) return;
+
+        const sid = inferSessionIDFromMessages(messages);
+        let lastUser = null;
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          if (normalizeText(String(messages[i]?.info?.role || '')).toLowerCase() === 'user') {
+            lastUser = messages[i];
+            break;
+          }
+        }
+        const agent = normalizeText(String(lastUser?.info?.agent || '')).toLowerCase();
+        if (agent && agent !== 'orchestrator') {
+          if (sid) {
+            recordSendPretrimAudit(sid, {
+              beforeTokens: estimateOutgoingMessagesTokens(messages),
+              afterTokens: estimateOutgoingMessagesTokens(messages),
+              savedTokens: 0,
+              reason: `subagent_bypass:${agent}`
+            }, 'auto');
+          }
+          return;
+        }
+
+        const stats = await applySendPretrim(messages, sid);
+        if (sid) {
+          if (stats.strictApplied) sessionStrictHitAt.set(sid, Date.now());
+          recordSendPretrimAudit(sid, stats, 'auto');
+          if (stats.savedTokens > 0) writeDashboardFiles();
+        }
+      } catch (err) {
+        console.error('memory-system send pretrim hook failed:', err);
+      }
+    },
     event: async ({ event }) => {
       const sessionID = extractSessionID(event);
       maybeSetRuntimeSessionTitle(event);
@@ -2683,10 +4443,9 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
         if (part.type === 'text') {
           const text = extractContentText(part.text || event?.properties?.delta || '');
           if (!text) return;
-          if (role === 'user') {
-            await processUserMessageEvent(sessionID, text, event);
-            return;
-          }
+          // Avoid double-counting user messages:
+          // user text is already handled by `message.updated` / `user.message`.
+          if (role === 'user') return;
           appendAutoEvent({
             sessionID,
             kind: role === 'user' ? 'user-message' : 'assistant-message',
@@ -2722,51 +4481,13 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
       }
 
       if (event.type === 'user.message') {
+        const uid = normalizeText(String(event?.data?.id || event?.data?.messageID || ''));
+        if (uid && messageRoleByID.get(`${sessionID}:${uid}`) === 'user') {
+          // Already handled through message.updated path for the same message id.
+          return;
+        }
         const text = extractContentText(event?.data?.content || event?.content || event?.data?.text || '');
-        const isFirstUserMessageForSession = !hasSessionMemoryFile(sessionID);
-
-        if (isFirstUserMessageForSession) {
-          appendAutoEvent({
-            sessionID,
-            kind: 'session-start',
-            summary: 'Session created',
-            rawEvent: event
-          });
-
-          if (AUTO_INJECT_MEMORY_DOCS) {
-            await injectMemoryText(sessionID, memoryDocs, 'memory-docs');
-          }
-
-          if (AUTO_INJECT_GLOBAL_PREFS_ON_SESSION_START) {
-            const globalText = buildGlobalPrefsContextText();
-            if (globalText) await injectMemoryText(sessionID, globalText, 'global-prefs');
-          }
-        }
-
-        appendAutoEvent({
-          sessionID,
-          kind: 'user-message',
-          summary: text || 'User message event',
-          rawEvent: event
-        });
-
-        const currentCount = (sessionUserMessageCounters.get(sessionID) || 0) + 1;
-        sessionUserMessageCounters.set(sessionID, currentCount);
-
-        if (
-          AUTO_CURRENT_SESSION_SUMMARY_ENABLED &&
-          currentCount >= AUTO_CURRENT_SESSION_REFRESH_EVERY &&
-          currentCount % AUTO_CURRENT_SESSION_REFRESH_EVERY === 0
-        ) {
-          const currentSummary = buildCurrentSessionSummaryText(sessionID);
-          if (currentSummary) {
-            await injectMemoryText(sessionID, currentSummary, 'current-session-refresh');
-          }
-        }
-
-        if (AUTO_RECALL_ENABLED && (shouldTriggerRecall(text) || referencesAnotherSessionTitle(text, sessionID))) {
-          await maybeInjectTriggerRecall(sessionID, text);
-        }
+        await processUserMessageEvent(sessionID, text, event);
         return;
       }
 
@@ -2813,12 +4534,16 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
         sessionUserMessageCounters.delete(sessionID);
         sessionRecallState.delete(sessionID);
         sessionTitleByID.delete(sessionID);
+        sessionUserDedupeState.delete(sessionID);
+        sessionStrictHitAt.delete(sessionID);
       }
 
       if (event.type === 'session.deleted') {
         sessionUserMessageCounters.delete(sessionID);
         sessionRecallState.delete(sessionID);
         sessionTitleByID.delete(sessionID);
+        sessionUserDedupeState.delete(sessionID);
+        sessionStrictHitAt.delete(sessionID);
       }
     }
   };

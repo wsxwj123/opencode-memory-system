@@ -100,6 +100,7 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 - `/memory recall <关键词>`：手动跨会话召回
 - `/memory prefer <key> <value>`：写入全局偏好（推荐，最稳）
 - `/memory sessions`：查看会话记忆列表
+- `/memory doctor [session <id>|current]`：诊断本会话是否注入/是否 pretrim/最近节省 token/是否命中叠加风险
 - `/memory clear session <id>`：删除某个 session 记忆
 - `/memory clear sessions <id1,id2,...>`：批量删除多个 session 记忆
 - `/memory discard [session <id>|current] [aggressive]`：清理低信号工具噪音
@@ -110,7 +111,60 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 #### 5.3 跨会话召回触发
 
 - 默认是“收紧触发”，只有明显跨会话意图才自动召回（例如“另一个对话/上次那个session”）
+- 当前已关闭 recall 冷却（可连续跨会话召回）
 - 同会话的“刚刚说的”不会误触发跨会话 recall
+
+#### 5.4 发送前裁剪（DCP-like）与 Distill 模式
+
+- 发送前会自动做 `pretrim`，目标是把本次要发给模型的正文 token 压回预算区间
+- 策略是两阶段：
+  - 阶段 1：低信号内容替换（pending/running/噪音工具输出）
+  - 阶段 2：替换式摘要锚点（把旧历史折叠成一段摘要，而不是简单追加）
+    - 会先做“候选区间评分”（结果/失败/路径加权，pending/running 降权），再选连续区间做蒸馏，避免把不相关片段混在一起
+    - 新增 block 占位追踪：每次范围压缩会生成 `bN` 记录（含起止消息、消耗条目数、摘要）
+    - 摘要头会携带本次预测 block 编号（如 `pretrim-distill b7`），便于和 `summaryBlocks` 审计对齐
+- 默认是 DCP 风格（无需额外配置）：
+  - `auto` 模式（默认）：优先用独立 distill（若已配置），否则自动回退到 `session` 内联蒸馏
+  - `session` 模式：在发送前用当前会话上下文做结构化蒸馏替换（无需额外 key/base_url）
+- 新增“替换闭环”：
+  - 当仍超预算且已有 `bN` 压缩块时，会启用 `anchor-replace`，把旧 assistant/tool 原始轨迹替换为“compressed blocks anchor”，避免 A+B+C 叠加
+- 新增“自适应策略”：
+  - 根据本次发送前 token/budget 比例自动调节裁剪强度（rewrite 上限、保护窗口、phase-aware trim）
+  - phase-aware trim 会优先压缩 discovery/verify/network 类工具输出，保守保留 modify 类输出
+- 可选“独立 Distill LLM”增强：
+  - 仅当你显式设置 `OPENCODE_MEMORY_DISTILL_MODE=independent` 时启用
+  - 启用后优先用独立模型生成高保真摘要
+  - 若失败，自动回退到 `session` 模式或机械提炼（不阻塞主会话）
+- 质量门槛：
+  - 若 Distill 结果过短/结构不足/缺关键路径，会判为低质量并回退，不直接替换
+
+可选环境变量（按需设置）：
+
+```bash
+OPENCODE_MEMORY_DISTILL_MODE=auto                     # 默认；可改为 session / independent
+
+# 仅 independent 模式需要以下配置
+OPENCODE_MEMORY_DISTILL_ENABLED=1
+OPENCODE_MEMORY_DISTILL_PROVIDER=openai_compatible   # 或 anthropic / gemini
+OPENCODE_MEMORY_DISTILL_BASE_URL=https://api.xxx.com/v1
+OPENCODE_MEMORY_DISTILL_API_KEY=sk-xxxx
+OPENCODE_MEMORY_DISTILL_MODEL=your-model-id          # 可留空并启用 use_session_model
+OPENCODE_MEMORY_DISTILL_USE_SESSION_MODEL=1
+OPENCODE_MEMORY_DISTILL_TIMEOUT_MS=12000
+OPENCODE_MEMORY_DISTILL_MAX_TOKENS=420
+OPENCODE_MEMORY_DISTILL_TEMPERATURE=0.2
+```
+
+查看是否生效：
+
+- `/memory doctor current` 看 `pretrim.last.distillUsed/distillStatus`
+- `/memory doctor current` 看 `pretrim.last.anchorReplaceApplied/anchorReplaceMessages`
+- `/memory doctor current` 看 `pretrim.last.adaptiveLevel/adaptiveRatio`
+- `/memory doctor current` 看 `pretrim.last.compositionBefore/compositionAfter`（system/user/tool 占比）
+- `/memory context current` 看 `distillConfig.mode`
+- `/memory doctor current` 的 `blocks.latest` 可看到最近一次 `bN`
+- `37777` 页面会显示 `blocks` 计数与最近 block 摘要，并在 block 预览里展示 `range:start->end` 与 `save~tokens`
+- `37777` 的 `pretrim traces` 行会显示 `comp S/U/T` 百分比（发送前后 system/user/tool 占比变化）
 
 ---
 
@@ -133,6 +187,8 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 
 - `~/.opencode/memory/audit/memory-audit.jsonl`
   - 看板编辑/删除审计记录
+- `~/.opencode/memory/trash/`
+  - 会话删除回收站（从看板删除会话时，先移动到这里）
 
 #### 6.1 删除与归档说明
 
@@ -263,12 +319,51 @@ Typical paths:
 - `/memory recall <query>`
 - `/memory prefer <key> <value>`
 - `/memory sessions`
+- `/memory doctor [session <id>|current]`
 - `/memory clear session <id>`
 - `/memory clear sessions <id1,id2,...>`
 - `/memory discard [session <id>|current] [aggressive]`
 - `/memory extract [session <id>|current] [maxEvents]`
 - `/memory prune [session <id>|current]`
 - `/memory dashboard`
+
+### 4.1 Send-time pretrim + distill modes (new)
+
+- Pretrim runs before sending messages to reduce prompt size.
+- Stage 1 rewrites low-signal content.
+- Stage 2 performs replacement-style anchor compaction (replace old history with one distilled anchor, not append-only).
+- Default is `auto` (DCP-style):
+  - `auto`: prefer independent distill when configured, otherwise fallback to `session` inline distill.
+  - `session`: inline structured distillation in transform path.
+- Replacement loop:
+  - If still over budget and there are existing `bN` blocks, plugin applies `anchor-replace` to substitute older assistant/tool traces with a compact block anchor.
+- Optional independent distill:
+  - Set `OPENCODE_MEMORY_DISTILL_MODE=independent` and provide provider config.
+  - On failure/misconfiguration, plugin falls back to session mode or deterministic extraction.
+- Quality gate is enforced before replacement (too-short/no-structure/missing key path => fallback).
+
+Environment variables:
+
+```bash
+OPENCODE_MEMORY_DISTILL_MODE=auto
+
+# independent mode (optional)
+OPENCODE_MEMORY_DISTILL_ENABLED=1
+OPENCODE_MEMORY_DISTILL_MODE=independent
+OPENCODE_MEMORY_DISTILL_PROVIDER=openai_compatible   # anthropic | gemini
+OPENCODE_MEMORY_DISTILL_BASE_URL=https://api.xxx.com/v1
+OPENCODE_MEMORY_DISTILL_API_KEY=sk-xxxx
+OPENCODE_MEMORY_DISTILL_MODEL=your-model-id
+OPENCODE_MEMORY_DISTILL_USE_SESSION_MODEL=1
+OPENCODE_MEMORY_DISTILL_TIMEOUT_MS=12000
+OPENCODE_MEMORY_DISTILL_MAX_TOKENS=420
+OPENCODE_MEMORY_DISTILL_TEMPERATURE=0.2
+```
+
+Verification:
+
+- `/memory doctor current` -> `pretrim.last.distillUsed/distillStatus`
+- `/memory context current` -> `distillConfig`
 
 ### 5. Runtime data paths
 
@@ -277,3 +372,4 @@ Typical paths:
 - `~/.opencode/memory/dashboard/data.json`
 - `~/.opencode/memory/dashboard/index.html`
 - `~/.opencode/memory/audit/memory-audit.jsonl`
+- `~/.opencode/memory/trash/`
