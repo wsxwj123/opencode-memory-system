@@ -75,6 +75,22 @@ git clone https://github.com/wsxwj123/opencode-memory-system.git
 
 完整重启 OpenCode（不是只刷新页面）。
 
+#### 3.4 重要：禁用插件的正确方式
+
+OpenCode 运行时会扫描全局 `plugins/` 目录中的 `.js` 文件。  
+因此“仅从 `opencode.json` 的 `plugin` 列表删除”并不总能彻底禁用。
+
+推荐做法：
+
+- 把要禁用的插件改成非 `.js` 后缀（例如 `xxx.disabled`）
+- 或移出 `plugins/` 目录
+
+示例（禁用 `chinese-settings`）：
+
+```bash
+mv ~/.config/opencode/plugins/chinese-settings.js ~/.config/opencode/plugins/chinese-settings.disabled
+```
+
 ---
 
 ### 4. 如何验证安装成功
@@ -255,6 +271,19 @@ OPENCODE_MEMORY_DISTILL_TEMPERATURE=0.2
 - 每条 session 头部现在是左对齐布局
 - 第一行显示：`标题 + id`
 - 第二行显示：统计信息（`u/a/t/r/注入/最近注入/prune/正文token`）
+
+#### 8.8 自检命令（推荐）
+
+仓库内置仿真自检脚本（覆盖 system/MCP/tool 噪声裁剪与 doctor 诊断）：
+
+```bash
+node scripts/selfcheck.mjs
+```
+
+通过标准：
+- 输出包含 `SELFTEST PASS`
+- 包含 `pretrim reduced tokens (before -> after)`
+- 包含 `system message preserved`
 
 ---
 
