@@ -142,6 +142,7 @@ mv ~/.config/opencode/plugins/chinese-settings.js ~/.config/opencode/plugins/chi
     - 摘要头会携带本次预测 block 编号（如 `pretrim-distill b7`），便于和 `summaryBlocks` 审计对齐
 - 默认是 DCP 兼容风格（无需额外配置）：
   - 永远先机械裁剪（阶段1），只有“仍超阈值”才进入LLM总结（阶段2）
+  - 默认保护窗口是最近 `10` 条用户轮次（可在 37777 参数页调）
   - `auto` 模式（默认）：若已手动开启并配置独立LLM则走独立LLM，否则走 `session` 内联LLM总结
   - `session` 模式：在发送前用当前会话上下文做结构化LLM总结替换（无需额外 key/base_url）
 - 新增“替换闭环”：
@@ -260,7 +261,7 @@ OPENCODE_MEMORY_DISTILL_TEMPERATURE=0.2
 
 - 这是“可见模式”提示，表示注入/裁剪动作已执行
 - 新版本会做合并去抖：同一波操作仅显示最新一条，避免刷屏
-- 当前默认：`AUTO_VISIBLE_NOTICES=false`（默认不向会话插入可见提示）
+- 当前默认：`AUTO_VISIBLE_NOTICES=true`（默认会显示可见提示，但有冷却去抖）
 
 #### 8.6 37777 页面数据是静态还是动态
 
@@ -281,6 +282,8 @@ OPENCODE_MEMORY_DISTILL_TEMPERATURE=0.2
 ```bash
 node scripts/minimal_regression_suite.mjs
 ```
+
+当前推荐仅使用这个最小回归脚本；旧的 `full_regression` / `selfcheck` 已移除，避免因本地依赖差异导致误报。
 
 通过标准：
 - 依次输出 6 个场景：

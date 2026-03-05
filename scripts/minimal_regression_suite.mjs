@@ -260,21 +260,21 @@ async function main() {
     },
     {
       name: 'S2_mechanical_trim',
-      settings: { sendPretrimEnabled: true, sendPretrimBudget: 3000, sendPretrimTarget: 2400, llmSummaryMode: 'auto', independentLlmEnabled: false },
+      settings: { sendPretrimEnabled: true, sendPretrimBudget: 3000, sendPretrimTarget: 2400, sendPretrimTurnProtection: 2, llmSummaryMode: 'auto', independentLlmEnabled: false },
       messages: buildMessages({ sessionID: 's2', noisy: true, long: true }),
       fetchImpl: okFetch,
       expect: (trace) => (trace.savedTokens || 0) > 0 && !trace.distillUsed
     },
     {
       name: 'S3_inline_llm_success',
-      settings: { sendPretrimEnabled: true, sendPretrimBudget: 2400, sendPretrimTarget: 1600, llmSummaryMode: 'session', independentLlmEnabled: false },
+      settings: { sendPretrimEnabled: true, sendPretrimBudget: 2400, sendPretrimTarget: 1600, sendPretrimTurnProtection: 2, llmSummaryMode: 'session', independentLlmEnabled: false },
       messages: buildMessages({ sessionID: 's3', noisy: false, long: true }),
       fetchImpl: okFetch,
       expect: (trace) => Boolean(trace.distillUsed) && String(trace.distillProvider || '').includes('session-inline') && !String(trace.distillProvider || '').includes('fallback')
     },
     {
       name: 'S4_inline_llm_fail_fallback',
-      settings: { sendPretrimEnabled: true, sendPretrimBudget: 2400, sendPretrimTarget: 1600, llmSummaryMode: 'session', independentLlmEnabled: false },
+      settings: { sendPretrimEnabled: true, sendPretrimBudget: 2400, sendPretrimTarget: 1600, sendPretrimTurnProtection: 2, llmSummaryMode: 'session', independentLlmEnabled: false },
       messages: buildMessages({ sessionID: 's4', noisy: false, long: true }),
       fetchImpl: failFetch,
       expect: (trace) => String(trace.distillStatus || '').includes('http_') && String(trace.distillStatus || '').includes('fallback:')
@@ -282,7 +282,7 @@ async function main() {
     {
       name: 'S5_independent_llm_success',
       settings: {
-        sendPretrimEnabled: true, sendPretrimBudget: 2400, sendPretrimTarget: 1600,
+        sendPretrimEnabled: true, sendPretrimBudget: 2400, sendPretrimTarget: 1600, sendPretrimTurnProtection: 2,
         llmSummaryMode: 'auto',
         independentLlmEnabled: true,
         independentLlmProvider: 'openai_compatible',
@@ -297,7 +297,7 @@ async function main() {
     {
       name: 'S6_independent_llm_fail_fallback',
       settings: {
-        sendPretrimEnabled: true, sendPretrimBudget: 2400, sendPretrimTarget: 1600,
+        sendPretrimEnabled: true, sendPretrimBudget: 2400, sendPretrimTarget: 1600, sendPretrimTurnProtection: 2,
         llmSummaryMode: 'independent',
         independentLlmEnabled: true,
         independentLlmProvider: 'openai_compatible',
