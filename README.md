@@ -147,9 +147,22 @@ flowchart TD
 - Q: 页面没更新？
   - A: 强刷浏览器，或重启 OpenCode（会自动重建页面并动态拉取）。
 - Q: 独立LLM超时？
-  - A: 提高 `independentLlmTimeoutMs`（建议 30000ms）。
+  - A: 默认已是 `30000ms`，可在 37777 的 `LLM设置`页继续调高。
+- Q: 4097 在跑但 37777 没起来？
+  - A: 可手动执行：
+    - `node ~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs restart 37777`
+    - 然后访问 `http://127.0.0.1:37777`。
 - Q: 为什么 token 还高？
   - A: 系统层/MCP 定义通常不在本插件裁剪范围。
+
+### 10. 联调检查（4097 + 37777）
+1. 启动 OpenCode：
+   - `opencode web --port 4097`
+2. 检查两端口：
+   - `curl -I http://127.0.0.1:4097`
+   - `curl -I http://127.0.0.1:37777`
+3. 检查面板API：
+   - `curl http://127.0.0.1:37777/api/dashboard`
 
 ---
 

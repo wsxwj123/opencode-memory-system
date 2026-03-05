@@ -299,12 +299,12 @@ function normalizeBaseURL(value, provider = 'openai_compatible') {
   return base;
 }
 
-async function fetchIndependentModels({ provider, baseURL, apiKey, timeoutMs = 12000 }) {
+async function fetchIndependentModels({ provider, baseURL, apiKey, timeoutMs = 30000 }) {
   const p = normalizeProvider(provider);
   const base = normalizeBaseURL(baseURL, p);
   const key = normalizeText(String(apiKey || ''));
   if (!base || !key) return { ok: false, error: 'baseURL/apiKey required', models: [] };
-  const timeout = Math.max(3000, Number(timeoutMs || 12000));
+  const timeout = Math.max(3000, Number(timeoutMs || 30000));
 
   async function fetchJson(url, headers = {}) {
     const controller = new AbortController();
@@ -427,14 +427,14 @@ async function fetchIndependentModels({ provider, baseURL, apiKey, timeoutMs = 1
   }
 }
 
-async function validateIndependentLlm({ provider, baseURL, apiKey, model, timeoutMs = 12000 }) {
+async function validateIndependentLlm({ provider, baseURL, apiKey, model, timeoutMs = 30000 }) {
   const p = normalizeProvider(provider);
   const base = normalizeBaseURL(baseURL, p);
   const key = normalizeText(String(apiKey || ''));
   const m = normalizeText(String(model || ''));
   if (!base || !key || !m) return { ok: false, error: 'provider/baseURL/apiKey/model required' };
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(3000, Number(timeoutMs || 12000)));
+  const timer = setTimeout(() => controller.abort(), Math.max(3000, Number(timeoutMs || 30000)));
   try {
     let url = '';
     let headers = { 'content-type': 'application/json' };
@@ -831,7 +831,8 @@ function isOpencodeRunning() {
     const out = spawnSync('tasklist', ['/FI', 'IMAGENAME eq opencode.exe'], { encoding: 'utf8' });
     return out.status === 0 && /opencode\.exe/i.test(out.stdout || '');
   }
-  const out = spawnSync('pgrep', ['-f', '(^|/| )opencode( |$)|opencode web'], { encoding: 'utf8' });
+  // macOS/Unix: accept both CLI and desktop app process names, case-insensitive.
+  const out = spawnSync('pgrep', ['-if', '(^|/| )opencode( |$)|opencode web|OpenCode'], { encoding: 'utf8' });
   if (out.status !== 0) return false;
   return String(out.stdout || '').trim().length > 0;
 }
