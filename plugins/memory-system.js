@@ -3,6 +3,7 @@ import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
+import { tool as defineTool } from '@opencode-ai/plugin';
 
 export const MemorySystemPlugin = ({ client }) => {
   const AUTO_MEMORY_VERSION = '2.0.0';
@@ -51,25 +52,65 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_DISTILL_INPUT_MAX_CHARS = 9000;
   const AUTO_DISTILL_RANGE_MAX_MESSAGES = 18;
   const AUTO_DISTILL_RANGE_MIN_MESSAGES = 2;
+  const AUTO_PRETRIM_PROFILE_DEFAULT = 'balanced'; // conservative | balanced | aggressive
+  const AUTO_DCP_COMPAT_MODE = true;
 
   function isSendPretrimEnabled() {
-    return AUTO_SEND_PRETRIM_ENABLED && String(process.env.OPENCODE_MEMORY_SEND_PRETRIM || '1') !== '0';
+    const settingEnabled = getBoolSetting(['sendPretrimEnabled', 'send_pretrim_enabled'], AUTO_SEND_PRETRIM_ENABLED);
+    return settingEnabled && String(process.env.OPENCODE_MEMORY_SEND_PRETRIM || '1') !== '0';
   }
 
   function isStrictModeEnabled() {
     return AUTO_STRICT_MODE_ENABLED || String(process.env.OPENCODE_MEMORY_STRICT_MODE || '0') === '1';
   }
 
+  function isDcpCompatModeEnabled() {
+    return getBoolSetting(['dcpCompatMode', 'dcp_compat_mode'], AUTO_DCP_COMPAT_MODE);
+  }
+
   function getIndependentDistillConfig() {
-    const enabled = String(process.env.OPENCODE_MEMORY_DISTILL_ENABLED || '0') === '1';
-    const provider = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_PROVIDER || 'openai_compatible')).toLowerCase();
-    const baseURL = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_BASE_URL || ''));
-    const apiKey = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_API_KEY || ''));
-    const model = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_MODEL || ''));
-    const timeoutMs = Math.max(3000, Number(process.env.OPENCODE_MEMORY_DISTILL_TIMEOUT_MS || 12000));
-    const maxTokens = Math.max(128, Number(process.env.OPENCODE_MEMORY_DISTILL_MAX_TOKENS || 420));
-    const temperature = Number(process.env.OPENCODE_MEMORY_DISTILL_TEMPERATURE || 0.2);
-    const useSessionModel = String(process.env.OPENCODE_MEMORY_DISTILL_USE_SESSION_MODEL || '1') !== '0';
+    const enabled = getBoolSetting(
+      ['independentLlmEnabled', 'independent_llm_enabled'],
+      String(process.env.OPENCODE_MEMORY_DISTILL_ENABLED || '0') === '1'
+    );
+    const provider = getStringSetting(
+      ['independentLlmProvider', 'independent_llm_provider'],
+      normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_PROVIDER || 'openai_compatible')).toLowerCase()
+    ).toLowerCase();
+    const baseURL = getStringSetting(
+      ['independentLlmBaseURL', 'independent_llm_base_url'],
+      normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_BASE_URL || ''))
+    );
+    const apiKey = getStringSetting(
+      ['independentLlmApiKey', 'independent_llm_api_key'],
+      normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_API_KEY || ''))
+    );
+    const model = getStringSetting(
+      ['independentLlmModel', 'independent_llm_model'],
+      normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_MODEL || ''))
+    );
+    const timeoutMs = getIntPreference(
+      ['independentLlmTimeoutMs', 'independent_llm_timeout_ms'],
+      Math.max(3000, Number(process.env.OPENCODE_MEMORY_DISTILL_TIMEOUT_MS || 12000)),
+      3000,
+      120000
+    );
+    const maxTokens = getIntPreference(
+      ['independentLlmMaxTokens', 'independent_llm_max_tokens'],
+      Math.max(128, Number(process.env.OPENCODE_MEMORY_DISTILL_MAX_TOKENS || 420)),
+      64,
+      4096
+    );
+    const temperature = getFloatSetting(
+      ['independentLlmTemperature', 'independent_llm_temperature'],
+      Number(process.env.OPENCODE_MEMORY_DISTILL_TEMPERATURE || 0.2),
+      0,
+      1
+    );
+    const useSessionModel = getBoolSetting(
+      ['independentLlmUseSessionModel', 'independent_llm_use_session_model'],
+      String(process.env.OPENCODE_MEMORY_DISTILL_USE_SESSION_MODEL || '1') !== '0'
+    );
     return {
       enabled,
       provider,
@@ -88,7 +129,10 @@ export const MemorySystemPlugin = ({ client }) => {
     // "auto" => prefer independent distill when configured, else session-inline.
     // "session" => inline structured distill in transform path.
     // "independent" => external provider call (optional override).
-    const m = normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_MODE || 'auto')).toLowerCase();
+    const m = getStringSetting(
+      ['llmSummaryMode', 'llm_summary_mode'],
+      normalizeText(String(process.env.OPENCODE_MEMORY_DISTILL_MODE || 'auto'))
+    ).toLowerCase();
     if (m === 'auto') return 'auto';
     if (m === 'independent') return 'independent';
     return 'session';
@@ -100,9 +144,240 @@ export const MemorySystemPlugin = ({ client }) => {
     return ['openai_compatible', 'anthropic', 'gemini'].includes(config.provider);
   }
 
-  function runSessionInlineDistill(candidateItems = []) {
+  function normalizePretrimProfile(value = '') {
+    const s = normalizeText(String(value || '')).toLowerCase();
+    if (s === 'conservative' || s === 'balanced' || s === 'aggressive') return s;
+    if (s === 'safe' || s === '稳妥' || s === '保守') return 'conservative';
+    if (s === 'normal' || s === '平衡') return 'balanced';
+    if (s === 'hard' || s === 'strict' || s === '激进') return 'aggressive';
+    return '';
+  }
+
+  function getPretrimProfile() {
+    const envMode = normalizePretrimProfile(process.env.OPENCODE_MEMORY_PRETRIM_PROFILE || '');
+    if (envMode) return envMode;
+    try {
+      const gm = readJson(globalMemoryPath) || {};
+      const pref = gm?.preferences && typeof gm.preferences === 'object'
+        ? gm.preferences.pretrimProfile || gm.preferences.pretrim_profile || ''
+        : '';
+      const mode = normalizePretrimProfile(pref);
+      if (mode) return mode;
+    } catch (_) {}
+    return AUTO_PRETRIM_PROFILE_DEFAULT;
+  }
+
+  function getGlobalPreferenceByKeys(keys = []) {
+    try {
+      const gm = readJson(globalMemoryPath) || {};
+      const prefs = gm?.preferences && typeof gm.preferences === 'object' ? gm.preferences : {};
+      for (const k of keys) {
+        if (prefs[k] !== undefined && prefs[k] !== null && String(prefs[k]).trim() !== '') return prefs[k];
+      }
+    } catch (_) {}
+    return undefined;
+  }
+
+  function getIntPreference(keys = [], fallback = 0, min = 0, max = Number.MAX_SAFE_INTEGER) {
+    const rawFromSettings = getSettingRaw(keys);
+    const raw = rawFromSettings !== undefined ? rawFromSettings : getGlobalPreferenceByKeys(keys);
+    if (raw === undefined) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, Math.floor(n)));
+  }
+
+  function getFloatSetting(keys = [], fallback = 0, min = 0, max = Number.MAX_SAFE_INTEGER) {
+    const raw = getSettingRaw(keys);
+    if (raw === undefined) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function getCurrentSessionRefreshEvery() {
+    return getIntPreference(
+      ['currentSummaryEvery', 'current_summary_every'],
+      AUTO_CURRENT_SESSION_REFRESH_EVERY,
+      1,
+      50
+    );
+  }
+
+  function getCurrentSessionSummaryTokenBudget() {
+    return getIntPreference(
+      ['currentSummaryTokenBudget', 'current_summary_token_budget'],
+      AUTO_CURRENT_SESSION_SUMMARY_TOKEN_BUDGET,
+      120,
+      2000
+    );
+  }
+
+  function getVisibleNoticesEnabled() {
+    return getBoolSetting(['visibleNoticesEnabled', 'visible_notices_enabled'], AUTO_VISIBLE_NOTICES);
+  }
+
+  function getVisibleNoticeCooldownMs() {
+    return getIntPreference(['visibleNoticeCooldownMs', 'visible_notice_cooldown_ms'], AUTO_VISIBLE_NOTICE_COOLDOWN_MS, 0, 600000);
+  }
+
+  function getVisibleNoticeForDiscard() {
+    return getBoolSetting(['visibleNoticeForDiscard', 'visible_notice_for_discard'], AUTO_VISIBLE_NOTICE_FOR_DISCARD);
+  }
+
+  function getStringSetting(keys = [], fallback = '') {
+    const raw = getSettingRaw(keys);
+    if (raw === undefined || raw === null) return fallback;
+    const s = normalizeText(String(raw));
+    return s || fallback;
+  }
+
+  function getNotificationMode() {
+    const mode = getStringSetting(['notificationMode', 'notification_mode'], AUTO_NOTIFICATION_MODE).toLowerCase();
+    if (mode === 'off' || mode === 'minimal' || mode === 'detailed') return mode;
+    return AUTO_NOTIFICATION_MODE;
+  }
+
+  function getDcpPrunableToolsEnabled() {
+    return getBoolSetting(['dcpPrunableToolsEnabled', 'dcp_prunable_tools_enabled'], AUTO_DCP_PRUNABLE_TOOLS_ENABLED);
+  }
+
+  function getDcpMessageIdTagsEnabled() {
+    return getBoolSetting(['dcpMessageIdTagsEnabled', 'dcp_message_id_tags_enabled'], AUTO_DCP_MESSAGE_ID_TAGS_ENABLED);
+  }
+
+  function getRecallEnabled() {
+    return getBoolSetting(['recallEnabled', 'recall_enabled'], AUTO_RECALL_ENABLED);
+  }
+
+  function getRecallTopSessions() {
+    return getIntPreference(['recallTopSessions', 'recall_top_sessions'], AUTO_RECALL_TOP_SESSIONS, 1, 10);
+  }
+
+  function getRecallMaxEventsPerSession() {
+    return getIntPreference(['recallMaxEventsPerSession', 'recall_max_events_per_session'], AUTO_RECALL_MAX_EVENTS_PER_SESSION, 1, 12);
+  }
+
+  function getRecallTokenBudget() {
+    return getIntPreference(['recallTokenBudget', 'recall_token_budget'], AUTO_RECALL_TOKEN_BUDGET, 120, 2000);
+  }
+
+  function getRecallCooldownMs() {
+    return getIntPreference(['recallCooldownMs', 'recall_cooldown_ms'], AUTO_RECALL_COOLDOWN_MS, 0, 600000);
+  }
+
+  function getInjectGlobalPrefsOnSessionStart() {
+    return getBoolSetting(['injectGlobalPrefsOnSessionStart', 'inject_global_prefs_on_session_start'], AUTO_INJECT_GLOBAL_PREFS_ON_SESSION_START);
+  }
+
+  function getInjectMemoryDocsEnabled() {
+    return getBoolSetting(['injectMemoryDocsEnabled', 'inject_memory_docs_enabled'], AUTO_INJECT_MEMORY_DOCS);
+  }
+
+  function getSendPretrimBudget() {
+    return getIntPreference(['sendPretrimBudget', 'send_pretrim_budget'], AUTO_SEND_PRETRIM_BUDGET, 2000, 200000);
+  }
+
+  function getSendPretrimTarget() {
+    const budget = getSendPretrimBudget();
+    return getIntPreference(['sendPretrimTarget', 'send_pretrim_target'], Math.min(AUTO_SEND_PRETRIM_TARGET, budget), 1000, budget);
+  }
+
+  function getSendPretrimHardRatio() {
+    return getFloatSetting(['sendPretrimHardRatio', 'send_pretrim_hard_ratio'], AUTO_SEND_PRETRIM_HARD_RATIO, 0.5, 0.99);
+  }
+
+  function getSendPretrimDistillTriggerRatio() {
+    return getFloatSetting(
+      ['sendPretrimDistillTriggerRatio', 'send_pretrim_distill_trigger_ratio'],
+      AUTO_SEND_PRETRIM_DISTILL_TRIGGER_RATIO,
+      0.4,
+      0.99
+    );
+  }
+
+  function getSendPretrimTurnProtection() {
+    return getIntPreference(['sendPretrimTurnProtection', 'send_pretrim_turn_protection'], AUTO_SEND_PRETRIM_TURN_PROTECTION, 1, 20);
+  }
+
+  function getSendPretrimMaxRewriteMessages() {
+    return getIntPreference(['sendPretrimMaxRewriteMessages', 'send_pretrim_max_rewrite_messages'], AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES, 4, 120);
+  }
+
+  function getDistillSummaryMaxChars() {
+    return getIntPreference(['distillSummaryMaxChars', 'distill_summary_max_chars'], AUTO_DISTILL_SUMMARY_MAX_CHARS, 400, 8000);
+  }
+
+  function getDistillInputMaxChars() {
+    return getIntPreference(['distillInputMaxChars', 'distill_input_max_chars'], AUTO_DISTILL_INPUT_MAX_CHARS, 1000, 200000);
+  }
+
+  function getDistillRangeMaxMessages() {
+    return getIntPreference(['distillRangeMaxMessages', 'distill_range_max_messages'], AUTO_DISTILL_RANGE_MAX_MESSAGES, 2, 100);
+  }
+
+  function getDistillRangeMinMessages() {
+    const maxMsgs = getDistillRangeMaxMessages();
+    return getIntPreference(['distillRangeMinMessages', 'distill_range_min_messages'], AUTO_DISTILL_RANGE_MIN_MESSAGES, 1, maxMsgs);
+  }
+
+  function getStrategyPurgeErrorTurns() {
+    return getIntPreference(['strategyPurgeErrorTurns', 'strategy_purge_error_turns'], AUTO_STRATEGY_PURGE_ERROR_TURNS, 1, 20);
+  }
+
+  function getRecallMaxChars() {
+    return getIntPreference(['recallMaxChars', 'recall_max_chars'], AUTO_RECALL_MAX_CHARS, 300, 12000);
+  }
+
+  function getCurrentSessionSummaryMaxChars() {
+    return getIntPreference(
+      ['currentSummaryMaxChars', 'current_summary_max_chars'],
+      AUTO_CURRENT_SESSION_SUMMARY_MAX_CHARS,
+      400,
+      12000
+    );
+  }
+
+  function getCurrentSessionSummaryMaxEvents() {
+    return getIntPreference(
+      ['currentSummaryMaxEvents', 'current_summary_max_events'],
+      AUTO_CURRENT_SESSION_SUMMARY_MAX_EVENTS,
+      2,
+      20
+    );
+  }
+
+  function getSummaryTriggerEvents() {
+    return getIntPreference(['summaryTriggerEvents', 'summary_trigger_events'], AUTO_SUMMARY_TRIGGER_EVENTS, 10, 500);
+  }
+
+  function getSummaryKeepRecentEvents() {
+    return getIntPreference(['summaryKeepRecentEvents', 'summary_keep_recent_events'], AUTO_SUMMARY_KEEP_RECENT_EVENTS, 6, 200);
+  }
+
+  function getSummaryMaxChars() {
+    return getIntPreference(['summaryMaxChars', 'summary_max_chars'], AUTO_SUMMARY_MAX_CHARS, 500, 12000);
+  }
+
+  function getSummaryMaxCharsBudgetMode() {
+    return getIntPreference(['summaryMaxCharsBudgetMode', 'summary_max_chars_budget_mode'], AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE, 600, 16000);
+  }
+
+  function getMaxEventsPerSession() {
+    return getIntPreference(['maxEventsPerSession', 'max_events_per_session'], AUTO_MAX_EVENTS_PER_SESSION, 40, 1000);
+  }
+
+  function getDiscardMaxRemovalsPerPass() {
+    return getIntPreference(['discardMaxRemovalsPerPass', 'discard_max_removals_per_pass'], AUTO_DISCARD_MAX_REMOVALS_PER_PASS, 5, 400);
+  }
+
+  function getExtractEventsPerPass() {
+    return getIntPreference(['extractEventsPerPass', 'extract_events_per_pass'], AUTO_EXTRACT_EVENTS_PER_PASS, 6, 200);
+  }
+
+  function runSessionInlineSummaryFallback(candidateItems = []) {
     const lines = [];
-    const state = { chars: 0, maxChars: AUTO_DISTILL_SUMMARY_MAX_CHARS };
+    const state = { chars: 0, maxChars: getDistillSummaryMaxChars() };
     const items = Array.isArray(candidateItems) ? candidateItems : [];
     const snippets = items.flatMap((it) => Array.isArray(it?.snippets) ? it.snippets : []).slice(0, 18);
     const allText = snippets.join('\n');
@@ -128,6 +403,48 @@ export const MemorySystemPlugin = ({ client }) => {
     else pushLineWithLimit(lines, '- continue from latest completed step and verify outputs', state);
 
     return normalizeText(lines.join('\n'));
+  }
+
+  function resolveApiKey(raw = '') {
+    const s = normalizeText(String(raw || ''));
+    if (!s) return '';
+    const m = s.match(/^\$\{([A-Z0-9_]+)\}$/i);
+    if (m && m[1]) return normalizeText(String(process.env[m[1]] || ''));
+    return s;
+  }
+
+  function parseProviderProtocol(provider = {}, modelID = '') {
+    const npm = normalizeText(String(provider?.npm || '')).toLowerCase();
+    if (npm.includes('anthropic')) return 'anthropic';
+    if (npm.includes('google') || normalizeText(modelID).toLowerCase().includes('gemini')) return 'gemini';
+    return 'openai_compatible';
+  }
+
+  function resolveSessionInlineProviderConfig(messages = []) {
+    const sessionModel = inferSessionModelFromMessages(messages);
+    const providerID = normalizeText(String(sessionModel?.providerID || ''));
+    const modelID = normalizeText(String(sessionModel?.modelID || ''));
+    if (!providerID || !modelID) return null;
+    const cfgPath = path.join(os.homedir(), '.config', 'opencode', 'opencode.json');
+    const cfg = readJson(cfgPath) || {};
+    const providers = cfg?.provider && typeof cfg.provider === 'object' ? cfg.provider : {};
+    const p = providers[providerID];
+    if (!p || typeof p !== 'object') return null;
+    const options = p?.options && typeof p.options === 'object' ? p.options : {};
+    const baseURL = normalizeText(String(options.baseURL || ''));
+    const apiKey = resolveApiKey(options.apiKey || '');
+    if (!baseURL || !apiKey) return null;
+    return {
+      enabled: true,
+      provider: parseProviderProtocol(p, modelID),
+      baseURL,
+      apiKey,
+      model: modelID,
+      timeoutMs: Math.max(3000, getIntPreference(['independentLlmTimeoutMs', 'independent_llm_timeout_ms'], 12000, 3000, 120000)),
+      maxTokens: Math.max(64, getIntPreference(['independentLlmMaxTokens', 'independent_llm_max_tokens'], 420, 64, 4096)),
+      temperature: getFloatSetting(['independentLlmTemperature', 'independent_llm_temperature'], 0.2, 0, 1),
+      useSessionModel: true
+    };
   }
 
   // Injection strategy (token-saving defaults)
@@ -167,11 +484,15 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_VISIBLE_NOTICES = true;
   const AUTO_VISIBLE_NOTICE_COOLDOWN_MS = 120000;
   const AUTO_VISIBLE_NOTICE_FOR_DISCARD = false;
+  const AUTO_NOTIFICATION_MODE = 'minimal'; // off | minimal | detailed
+  const AUTO_DCP_PRUNABLE_TOOLS_ENABLED = true;
+  const AUTO_DCP_MESSAGE_ID_TAGS_ENABLED = false;
 
   // --- Storage paths ---
   const memoryDir = path.join(os.homedir(), '.opencode', 'memory');
   const projectsDir = path.join(memoryDir, 'projects');
   const globalMemoryPath = path.join(memoryDir, 'global.json');
+  const memoryConfigPath = path.join(memoryDir, 'config.json');
   const dashboardDir = path.join(memoryDir, 'dashboard');
   const dashboardHtmlPath = path.join(dashboardDir, 'index.html');
   const dashboardDataPath = path.join(dashboardDir, 'data.json');
@@ -272,6 +593,49 @@ export const MemorySystemPlugin = ({ client }) => {
     return fs.existsSync(getSessionMemoryPath(sessionID, projectName));
   }
 
+  function resolveSessionProjectName(sessionID, preferredProjectName = getProjectName()) {
+    const sid = normalizeText(String(sessionID || ''));
+    if (!sid) return preferredProjectName;
+    if (hasSessionMemoryFile(sid, preferredProjectName)) return preferredProjectName;
+    if (!fs.existsSync(projectsDir)) return preferredProjectName;
+
+    const filename = sessionFileName(sid);
+    let best = null;
+    let bestMtime = 0;
+    let dirs = [];
+    try {
+      dirs = fs.readdirSync(projectsDir, { withFileTypes: true });
+    } catch {
+      dirs = [];
+    }
+    for (const ent of dirs) {
+      if (!ent?.isDirectory?.()) continue;
+      const pName = ent.name;
+      const p = path.join(projectsDir, pName, 'sessions', filename);
+      if (!fs.existsSync(p)) continue;
+      let mtime = 0;
+      try {
+        mtime = Number(fs.statSync(p).mtimeMs || 0);
+      } catch {
+        mtime = 0;
+      }
+      if (!best || mtime > bestMtime) {
+        best = pName;
+        bestMtime = mtime;
+      }
+    }
+    return best || preferredProjectName;
+  }
+
+  function resolveSessionLocation(sessionID = '', preferredProjectName = getProjectName()) {
+    const sid = normalizeText(String(sessionID || ''))
+      || [...sessionUserMessageCounters.keys()].slice(-1)[0]
+      || '';
+    if (!sid) return { sessionID: '', projectName: preferredProjectName };
+    const projectName = resolveSessionProjectName(sid, preferredProjectName);
+    return { sessionID: sid, projectName };
+  }
+
   function readJson(filePath) {
     if (!fs.existsSync(filePath)) return {};
     try {
@@ -279,6 +643,36 @@ export const MemorySystemPlugin = ({ client }) => {
     } catch {
       return {};
     }
+  }
+
+  function readMemoryConfig() {
+    const cfg = readJson(memoryConfigPath);
+    return cfg && typeof cfg === 'object' ? cfg : {};
+  }
+
+  function readMemorySystemSettings() {
+    const cfg = readMemoryConfig();
+    const ms = cfg?.memorySystem;
+    return ms && typeof ms === 'object' ? ms : {};
+  }
+
+  function getSettingRaw(keys = []) {
+    const s = readMemorySystemSettings();
+    for (const k of keys) {
+      if (s[k] !== undefined && s[k] !== null) return s[k];
+    }
+    return undefined;
+  }
+
+  function getBoolSetting(keys = [], fallback = false) {
+    const raw = getSettingRaw(keys);
+    if (raw === undefined) return fallback;
+    if (typeof raw === 'boolean') return raw;
+    const t = normalizeText(String(raw)).toLowerCase();
+    if (!t) return fallback;
+    if (['1', 'true', 'yes', 'on'].includes(t)) return true;
+    if (['0', 'false', 'no', 'off'].includes(t)) return false;
+    return fallback;
   }
 
   function writeJson(filePath, data) {
@@ -516,9 +910,8 @@ export const MemorySystemPlugin = ({ client }) => {
   function applyAutomaticStrategies(messages, policy = null) {
     const stats = { dedup: 0, supersedeWrites: 0, purgedErrors: 0, phaseTrim: 0 };
     if (!Array.isArray(messages) || !messages.length) return stats;
-    const turnProtection = Math.max(1, Number(policy?.turnProtection || AUTO_SEND_PRETRIM_TURN_PROTECTION));
-    const protectedWindow = Math.max(8, turnProtection * 2 + 4);
-    const protectFrom = Math.max(0, messages.length - protectedWindow);
+    const turnProtection = Math.max(1, Number(policy?.turnProtection || getSendPretrimTurnProtection()));
+    const protectFrom = getProtectFromByUserTurns(messages, turnProtection, 8);
 
     // Strategy 1: deduplicate identical tool calls, keep latest output.
     if (AUTO_STRATEGY_DEDUP_ENABLED) {
@@ -607,7 +1000,7 @@ export const MemorySystemPlugin = ({ client }) => {
         const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
         if (!Array.isArray(msg?.parts) || role === 'system' || role === 'user') continue;
         const turnsAfter = userSuffix[i + 1] || 0;
-        if (turnsAfter < AUTO_STRATEGY_PURGE_ERROR_TURNS) continue;
+        if (turnsAfter < getStrategyPurgeErrorTurns()) continue;
         for (const part of msg.parts) {
           if (!part || part.type !== 'tool') continue;
           const tool = partToolNameForPretrim(part);
@@ -687,16 +1080,44 @@ export const MemorySystemPlugin = ({ client }) => {
   }
 
   function getAdaptivePretrimPolicy(beforeTokens) {
-    const ratio = beforeTokens > 0 ? beforeTokens / Math.max(1, AUTO_SEND_PRETRIM_BUDGET) : 0;
+    const profile = getPretrimProfile();
+    const ratio = beforeTokens > 0 ? beforeTokens / Math.max(1, getSendPretrimBudget()) : 0;
+    let turnProtectionBase = getSendPretrimTurnProtection();
+    let t1 = 1.05;
+    let t2 = 1.25;
+    let phaseTrimAt = 1.0;
+    let maxRewriteL0 = getSendPretrimMaxRewriteMessages();
+    let maxRewriteL1 = 36;
+    let maxRewriteL2 = 48;
+    if (profile === 'conservative') {
+      turnProtectionBase = 6;
+      t1 = 1.15;
+      t2 = 1.45;
+      phaseTrimAt = 1.15;
+      maxRewriteL0 = 20;
+      maxRewriteL1 = 28;
+      maxRewriteL2 = 36;
+    } else if (profile === 'aggressive') {
+      turnProtectionBase = 3;
+      t1 = 0.95;
+      t2 = 1.15;
+      phaseTrimAt = 0.95;
+      maxRewriteL0 = 36;
+      maxRewriteL1 = 48;
+      maxRewriteL2 = 64;
+    }
     let level = 0;
-    if (ratio >= 1.25) level = 2;
-    else if (ratio >= 1.05) level = 1;
+    if (ratio >= t2) level = 2;
+    else if (ratio >= t1) level = 1;
+    const turnProtection = Math.max(2, turnProtectionBase - (profile === 'aggressive' ? level : 0));
+    const maxRewriteMessages = level === 2 ? maxRewriteL2 : level === 1 ? maxRewriteL1 : maxRewriteL0;
     return {
+      profile,
       level,
       ratio,
-      turnProtection: level === 2 ? 3 : AUTO_SEND_PRETRIM_TURN_PROTECTION,
-      maxRewriteMessages: level === 2 ? 48 : level === 1 ? 36 : AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES,
-      phaseTrimEnabled: ratio >= 1.0
+      turnProtection,
+      maxRewriteMessages,
+      phaseTrimEnabled: ratio >= phaseTrimAt
     };
   }
 
@@ -781,6 +1202,21 @@ export const MemorySystemPlugin = ({ client }) => {
     return '';
   }
 
+  function getProtectFromByUserTurns(messages, userTurns = 4, minRecentMessages = 8) {
+    if (!Array.isArray(messages) || !messages.length) return 0;
+    const turns = Math.max(1, Number(userTurns || 4));
+    let userSeen = 0;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const role = normalizeText(String(messages[i]?.info?.role || '')).toLowerCase();
+      if (role !== 'user') continue;
+      userSeen += 1;
+      if (userSeen >= turns) {
+        return Math.max(0, Math.min(i, messages.length - Math.max(1, Number(minRecentMessages || 1))));
+      }
+    }
+    return 0;
+  }
+
   function extractMessageIDFromOutgoing(msg) {
     if (!msg || typeof msg !== 'object') return '';
     return normalizeText(
@@ -843,7 +1279,7 @@ export const MemorySystemPlugin = ({ client }) => {
       candidates.push({ idx: i, role, snippets, score });
     }
 
-    if (candidates.length < AUTO_DISTILL_RANGE_MIN_MESSAGES) {
+    if (candidates.length < getDistillRangeMinMessages()) {
       return { indices: [], items: [] };
     }
 
@@ -862,9 +1298,9 @@ export const MemorySystemPlugin = ({ client }) => {
         count += 1;
         idxs.push(cur.idx);
         items.push({ role: cur.role, snippets: cur.snippets });
-        if (count >= AUTO_DISTILL_RANGE_MAX_MESSAGES) break;
+        if (count >= getDistillRangeMaxMessages()) break;
       }
-      if (count < AUTO_DISTILL_RANGE_MIN_MESSAGES) continue;
+      if (count < getDistillRangeMinMessages()) continue;
       const value = scoreSum + count * 2;
       if (!best || value > best.value) {
         best = { value, indices: idxs, items };
@@ -875,7 +1311,7 @@ export const MemorySystemPlugin = ({ client }) => {
     return { indices: best.indices, items: best.items };
   }
 
-  function buildDistillPrompt(candidateItems, maxChars = AUTO_DISTILL_SUMMARY_MAX_CHARS) {
+  function buildDistillPrompt(candidateItems, maxChars = getDistillSummaryMaxChars()) {
     const cleanItems = Array.isArray(candidateItems) ? candidateItems : [];
     const payload = cleanItems.map((it, idx) => {
       const role = normalizeText(String(it?.role || 'assistant')).toLowerCase() || 'assistant';
@@ -970,8 +1406,10 @@ export const MemorySystemPlugin = ({ client }) => {
     return '';
   }
 
-  async function runIndependentDistillLLM(messages, candidateItems) {
-    const cfg = getIndependentDistillConfig();
+  async function runIndependentDistillLLM(messages, candidateItems, overrideConfig = null) {
+    const cfg = overrideConfig && typeof overrideConfig === 'object'
+      ? { ...getIndependentDistillConfig(), ...overrideConfig }
+      : getIndependentDistillConfig();
     if (!canUseIndependentDistill(cfg)) return { ok: false, reason: 'disabled_or_incomplete_config', text: '' };
     const sessionModel = inferSessionModelFromMessages(messages);
     const model = normalizeText(
@@ -979,7 +1417,7 @@ export const MemorySystemPlugin = ({ client }) => {
     );
     if (!model) return { ok: false, reason: 'missing_model', text: '' };
 
-    const prompt = buildDistillPrompt(candidateItems, AUTO_DISTILL_SUMMARY_MAX_CHARS);
+    const prompt = buildDistillPrompt(candidateItems, getDistillSummaryMaxChars());
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), cfg.timeoutMs);
     try {
@@ -1039,7 +1477,7 @@ export const MemorySystemPlugin = ({ client }) => {
       }
       let json = {};
       try { json = JSON.parse(raw); } catch { return { ok: false, reason: 'non_json_response', text: '', provider: cfg.provider, model }; }
-      const text = truncateText(extractDistillTextFromResponse(cfg.provider, json), AUTO_DISTILL_SUMMARY_MAX_CHARS);
+      const text = truncateText(extractDistillTextFromResponse(cfg.provider, json), getDistillSummaryMaxChars());
       if (!text) return { ok: false, reason: 'empty_text', text: '', provider: cfg.provider, model };
       return { ok: true, reason: 'ok', text, provider: cfg.provider, model };
     } catch (err) {
@@ -1075,10 +1513,9 @@ export const MemorySystemPlugin = ({ client }) => {
       savedTokens: 0
     };
     if (!isStrictModeEnabled() || !Array.isArray(messages) || messages.length < 6) return result;
-    if (result.beforeTokens <= AUTO_SEND_PRETRIM_TARGET) return result;
+    if (result.beforeTokens <= pretrimTarget) return result;
 
-    const protectedWindow = Math.max(8, AUTO_SEND_PRETRIM_TURN_PROTECTION * 2 + 4);
-    const protectFrom = Math.max(0, messages.length - protectedWindow);
+    const protectFrom = getProtectFromByUserTurns(messages, getSendPretrimTurnProtection(), 8);
     const candidateIndices = [];
     const snippets = [];
 
@@ -1130,6 +1567,8 @@ export const MemorySystemPlugin = ({ client }) => {
   }
 
   async function applySendPretrim(messages, sessionID = '') {
+    const pretrimBudget = getSendPretrimBudget();
+    const pretrimTarget = getSendPretrimTarget();
     const result = {
       enabled: isSendPretrimEnabled(),
       dryRun: AUTO_SEND_PRETRIM_DRY_RUN,
@@ -1138,6 +1577,7 @@ export const MemorySystemPlugin = ({ client }) => {
       afterTokens: 0,
       adaptiveLevel: 0,
       adaptiveRatio: 0,
+      pretrimProfile: getPretrimProfile(),
       rewrittenParts: 0,
       rewrittenMessages: 0,
       savedTokens: 0,
@@ -1148,6 +1588,8 @@ export const MemorySystemPlugin = ({ client }) => {
       distillProvider: '',
       distillModel: '',
       distillStatus: '',
+      distillSource: '',
+      distillFallbackUsed: false,
       strategyDedup: 0,
       strategySupersedeWrites: 0,
       strategyPurgedErrors: 0,
@@ -1175,6 +1617,7 @@ export const MemorySystemPlugin = ({ client }) => {
     }
 
     const policy = getAdaptivePretrimPolicy(result.beforeTokens);
+    result.pretrimProfile = String(policy.profile || result.pretrimProfile || AUTO_PRETRIM_PROFILE_DEFAULT);
     result.adaptiveLevel = Number(policy.level || 0);
     result.adaptiveRatio = Number(policy.ratio || 0);
 
@@ -1187,7 +1630,7 @@ export const MemorySystemPlugin = ({ client }) => {
     }
 
     const tokensAfterStrategies = estimateOutgoingMessagesTokens(messages);
-    if (tokensAfterStrategies <= AUTO_SEND_PRETRIM_BUDGET) {
+    if (tokensAfterStrategies <= pretrimBudget) {
       result.afterTokens = tokensAfterStrategies;
       result.savedTokens = Math.max(0, result.beforeTokens - result.afterTokens);
       result.reason = (result.strategyDedup || result.strategySupersedeWrites || result.strategyPurgedErrors || result.strategyPhaseTrim)
@@ -1197,12 +1640,11 @@ export const MemorySystemPlugin = ({ client }) => {
       return result;
     }
 
-    const protectedWindow = Math.max(8, Number(policy.turnProtection || AUTO_SEND_PRETRIM_TURN_PROTECTION) * 2 + 4);
-    const protectFrom = Math.max(0, messages.length - protectedWindow);
+    const protectFrom = getProtectFromByUserTurns(messages, Number(policy.turnProtection || getSendPretrimTurnProtection()), 8);
     let rewrites = 0;
 
     for (let i = 0; i < messages.length; i += 1) {
-      if (rewrites >= Number(policy.maxRewriteMessages || AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES)) break;
+      if (rewrites >= Number(policy.maxRewriteMessages || getSendPretrimMaxRewriteMessages())) break;
       if (i >= protectFrom) continue;
 
       const msg = messages[i];
@@ -1212,7 +1654,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
       let touchedInMessage = false;
       for (const part of msg.parts) {
-        if (result.beforeTokens - result.savedTokens <= AUTO_SEND_PRETRIM_TARGET) break;
+        if (result.beforeTokens - result.savedTokens <= pretrimTarget) break;
 
         const oldText = partTextForPretrim(part);
         if (!oldText) continue;
@@ -1246,22 +1688,21 @@ export const MemorySystemPlugin = ({ client }) => {
         rewrites += 1;
       }
 
-      if (result.beforeTokens - result.savedTokens <= AUTO_SEND_PRETRIM_TARGET) break;
+      if (result.beforeTokens - result.savedTokens <= pretrimTarget) break;
     }
 
     result.afterTokens = AUTO_SEND_PRETRIM_DRY_RUN
       ? Math.max(0, result.beforeTokens - result.savedTokens)
       : estimateOutgoingMessagesTokens(messages);
 
-    // Stage-2: if still above hard threshold, perform DCP-like replacement:
-    // independent distill LLM (preferred) -> fallback mechanical extract.
-    const hardLimit = Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_HARD_RATIO);
-    const distillTrigger = Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_DISTILL_TRIGGER_RATIO);
-    const stage2Limit = Math.max(AUTO_SEND_PRETRIM_TARGET + 200, Math.min(hardLimit, distillTrigger));
+    // Stage-2 (DCP-compatible): after mechanical pretrim, if still above threshold,
+    // run LLM summary replacement (inline by default; independent only when enabled).
+    const hardLimit = Math.floor(pretrimBudget * getSendPretrimHardRatio());
+    const distillTrigger = Math.floor(pretrimBudget * getSendPretrimDistillTriggerRatio());
+    const stage2Limit = Math.max(pretrimTarget + 200, Math.min(hardLimit, distillTrigger));
     let extractedMessages = 0;
     if (!AUTO_SEND_PRETRIM_DRY_RUN && result.afterTokens > stage2Limit) {
-      const protectedWindow = Math.max(8, AUTO_SEND_PRETRIM_TURN_PROTECTION * 2 + 4);
-      const protectFrom = Math.max(0, messages.length - protectedWindow);
+      const protectFrom = getProtectFromByUserTurns(messages, getSendPretrimTurnProtection(), 8);
       const selectedRange = selectDistillCandidateRange(messages, protectFrom);
       const candidateIndices = Array.isArray(selectedRange.indices) ? selectedRange.indices : [];
       const candidateItems = Array.isArray(selectedRange.items) ? selectedRange.items : [];
@@ -1271,35 +1712,63 @@ export const MemorySystemPlugin = ({ client }) => {
         const sourceItems = [];
         for (const it of candidateItems) {
           sourceItems.push(it);
-          if (JSON.stringify(sourceItems).length > AUTO_DISTILL_INPUT_MAX_CHARS) break;
+          if (JSON.stringify(sourceItems).length > getDistillInputMaxChars()) break;
         }
         const mode = getDistillMode();
-        const allowIndependent = mode === 'independent' || (mode === 'auto' && canUseIndependentDistill(getIndependentDistillConfig()));
-        if (allowIndependent) {
-          const distill = await runIndependentDistillLLM(messages, sourceItems);
-          result.distillProvider = String(distill?.provider || '');
+        const dcpCompat = isDcpCompatModeEnabled();
+        const independentCfg = getIndependentDistillConfig();
+        const sessionInlineCfg = resolveSessionInlineProviderConfig(messages);
+        let llmCfg = null;
+        if (mode === 'session') llmCfg = sessionInlineCfg;
+        else if (mode === 'independent') llmCfg = canUseIndependentDistill(independentCfg) ? independentCfg : null;
+        else {
+          // auto:
+          // compat=true  -> mechanical first + inline unless independent was explicitly enabled/configured
+          // compat=false -> keep previous behavior (still prefers independent when configured)
+          llmCfg = canUseIndependentDistill(independentCfg) ? independentCfg : sessionInlineCfg;
+        }
+        if (!dcpCompat && mode === 'auto' && !llmCfg) {
+          // explicit marker for diagnostics when auto mode found no runnable LLM path.
+          result.distillStatus = result.distillStatus || 'auto_no_runnable_llm';
+        }
+
+        if (llmCfg) {
+          const sourceTag = (llmCfg === sessionInlineCfg) ? 'session-model' : 'independent';
+          const distill = await runIndependentDistillLLM(messages, sourceItems, llmCfg);
+          const providerRaw = String(distill?.provider || '');
+          result.distillProvider = sourceTag === 'session-model'
+            ? `session-inline/${providerRaw || 'current-provider'}`
+            : providerRaw;
           result.distillModel = String(distill?.model || '');
           result.distillStatus = String(distill?.reason || '');
+          result.distillSource = sourceTag;
           if (distill?.ok && distill?.text) {
             const quality = evaluateDistillSummaryQuality(distill.text, sourceItems);
             result.distillStatus = quality.ok ? 'ok' : `low_quality:${quality.reason}`;
             if (quality.ok) {
               const bid = result.predictedBlockId > 0 ? ` b${result.predictedBlockId}` : '';
-              summary = `[pretrim-distill${bid}]\n${truncateText(distill.text, AUTO_DISTILL_SUMMARY_MAX_CHARS)}`;
+              summary = `[pretrim-distill${bid}]\n${truncateText(distill.text, getDistillSummaryMaxChars())}`;
               result.distillUsed = true;
             }
           }
+        } else {
+          result.distillStatus = result.distillStatus || 'llm_unavailable_fallback';
         }
 
         if (!summary) {
-          const inline = runSessionInlineDistill(sourceItems);
+          const inline = runSessionInlineSummaryFallback(sourceItems);
           const quality = evaluateDistillSummaryQuality(inline, sourceItems);
-          result.distillProvider = result.distillProvider || 'session-inline';
+          result.distillProvider = 'session-inline-fallback';
           result.distillModel = result.distillModel || 'current-session';
-          result.distillStatus = quality.ok ? 'ok_inline' : `low_quality_inline:${quality.reason}`;
+          const fallbackStatus = quality.ok ? 'ok_inline' : `low_quality_inline:${quality.reason}`;
+          result.distillStatus = result.distillStatus
+            ? `${result.distillStatus}|fallback:${fallbackStatus}`
+            : fallbackStatus;
+          result.distillSource = result.distillSource || 'fallback-rules';
+          result.distillFallbackUsed = true;
           if (quality.ok && inline) {
             const bid = result.predictedBlockId > 0 ? ` b${result.predictedBlockId}` : '';
-            summary = `[pretrim-distill-inline${bid}]\n${truncateText(inline, AUTO_DISTILL_SUMMARY_MAX_CHARS)}`;
+            summary = `[pretrim-distill-inline${bid}]\n${truncateText(inline, getDistillSummaryMaxChars())}`;
             result.distillUsed = true;
           } else {
             const fallbackLines = sourceItems
@@ -1316,7 +1785,7 @@ export const MemorySystemPlugin = ({ client }) => {
           const refs = getRecentBlockPlaceholders(sessionID, getProjectName(), 3);
           if (refs.length) {
             const refLine = `\nReferenced compressed blocks: ${refs.map((r) => r.placeholder).join(' ')}`;
-            summary = truncateText(`${summary}${refLine}`, AUTO_DISTILL_SUMMARY_MAX_CHARS);
+            summary = truncateText(`${summary}${refLine}`, getDistillSummaryMaxChars());
           }
           const first = candidateIndices[0];
           const last = candidateIndices[candidateIndices.length - 1];
@@ -1347,7 +1816,7 @@ export const MemorySystemPlugin = ({ client }) => {
       if (!extractedMessages) {
         // fallback to conservative per-message extract if batching couldn't run
         for (let i = 0; i < messages.length; i += 1) {
-          if (result.afterTokens <= AUTO_SEND_PRETRIM_TARGET) break;
+          if (result.afterTokens <= pretrimTarget) break;
           if (i >= protectFrom) continue;
           const msg = messages[i];
           const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
@@ -1373,9 +1842,8 @@ export const MemorySystemPlugin = ({ client }) => {
 
     // Anchor replacement loop (DCP-like): when still over target and we already have compressed blocks,
     // replace old assistant/tool raw traces with one anchor referring blocks.
-    if (!AUTO_SEND_PRETRIM_DRY_RUN && result.afterTokens > AUTO_SEND_PRETRIM_TARGET) {
-      const protectedWindow = Math.max(8, Number(policy.turnProtection || AUTO_SEND_PRETRIM_TURN_PROTECTION) * 2 + 4);
-      const protectFrom = Math.max(0, messages.length - protectedWindow);
+    if (!AUTO_SEND_PRETRIM_DRY_RUN && result.afterTokens > pretrimTarget) {
+      const protectFrom = getProtectFromByUserTurns(messages, Number(policy.turnProtection || getSendPretrimTurnProtection()), 8);
       const ar = applyAnchorBlockReplacement(messages, sessionID, protectFrom);
       if (ar.applied) {
         result.anchorReplaceApplied = true;
@@ -1388,7 +1856,7 @@ export const MemorySystemPlugin = ({ client }) => {
     }
 
     // Strict mode (optional): replace old assistant/tool history with one summary anchor.
-    if (!AUTO_SEND_PRETRIM_DRY_RUN && result.afterTokens > AUTO_SEND_PRETRIM_TARGET && isStrictModeEnabled()) {
+    if (!AUTO_SEND_PRETRIM_DRY_RUN && result.afterTokens > pretrimTarget && isStrictModeEnabled()) {
       const strict = applyStrictAnchorCompaction(messages, result.afterTokens);
       if (strict.applied) {
         result.strictApplied = true;
@@ -1467,10 +1935,13 @@ export const MemorySystemPlugin = ({ client }) => {
       distillProvider: String(stats.distillProvider || ''),
       distillModel: String(stats.distillModel || ''),
       distillStatus: String(stats.distillStatus || ''),
+      distillSource: String(stats.distillSource || ''),
+      distillFallbackUsed: Boolean(stats.distillFallbackUsed),
       strategyDedup: Number(stats.strategyDedup || 0),
       strategySupersedeWrites: Number(stats.strategySupersedeWrites || 0),
       strategyPurgedErrors: Number(stats.strategyPurgedErrors || 0),
       strategyPhaseTrim: Number(stats.strategyPhaseTrim || 0),
+      pretrimProfile: String(stats.pretrimProfile || getPretrimProfile()),
       adaptiveLevel: Number(stats.adaptiveLevel || 0),
       adaptiveRatio: Number(stats.adaptiveRatio || 0),
       anchorReplaceApplied: Boolean(stats.anchorReplaceApplied),
@@ -1511,7 +1982,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
     // Conflict hint: high prompt size with little/no savings may indicate injection stacking.
     mem.alerts = mem.alerts || {};
-    const bigBefore = Number(stats.beforeTokens || 0) > Math.floor(AUTO_SEND_PRETRIM_BUDGET * 1.25);
+    const bigBefore = Number(stats.beforeTokens || 0) > Math.floor(getSendPretrimBudget() * 1.25);
     const weakSave = Number(stats.savedTokens || 0) < 120;
     if (bigBefore && weakSave) {
       mem.alerts.contextStackRisk = {
@@ -1876,6 +2347,37 @@ export const MemorySystemPlugin = ({ client }) => {
       sessionData.summaryBlocks = arr.slice(-AUTO_SUMMARY_BLOCK_MAX);
     }
     return rec;
+  }
+
+  function ensureSummaryBlockPresent(sessionData, block) {
+    if (!sessionData || !block || typeof block !== 'object') return false;
+    const id = Number(block.blockId || 0);
+    if (!(id > 0)) return false;
+    const arr = ensureSummaryBlocks(sessionData);
+    const idx = arr.findIndex((x) => Number(x?.blockId || 0) === id);
+    if (idx >= 0) {
+      arr[idx] = {
+        ...arr[idx],
+        ...block,
+        blockId: id,
+        summary: truncateText(normalizeText(String(block.summary || arr[idx]?.summary || '')), 2400)
+      };
+      return true;
+    }
+    arr.push({
+      blockId: id,
+      createdAt: block.createdAt || new Date().toISOString(),
+      source: normalizeText(String(block.source || 'pretrim')),
+      startMessageID: normalizeText(String(block.startMessageID || '')),
+      endMessageID: normalizeText(String(block.endMessageID || '')),
+      anchorMessageID: normalizeText(String(block.anchorMessageID || '')),
+      consumedMessages: Number(block.consumedMessages || 0),
+      summary: truncateText(normalizeText(String(block.summary || '')), 2400)
+    });
+    if (arr.length > AUTO_SUMMARY_BLOCK_MAX) {
+      sessionData.summaryBlocks = arr.slice(-AUTO_SUMMARY_BLOCK_MAX);
+    }
+    return true;
   }
 
   function loadSessionMemory(sessionID, projectName = getProjectName()) {
@@ -2291,11 +2793,11 @@ export const MemorySystemPlugin = ({ client }) => {
   function compressSessionMemory(sessionData) {
     if (!Array.isArray(sessionData.recentEvents)) sessionData.recentEvents = [];
 
-    if (sessionData.recentEvents.length <= AUTO_SUMMARY_TRIGGER_EVENTS) return;
+    if (sessionData.recentEvents.length <= getSummaryTriggerEvents()) return;
 
     const toCompress = sessionData.recentEvents.slice(
       0,
-      Math.max(0, sessionData.recentEvents.length - AUTO_SUMMARY_KEEP_RECENT_EVENTS)
+      Math.max(0, sessionData.recentEvents.length - getSummaryKeepRecentEvents())
     );
     if (!toCompress.length) return;
 
@@ -2304,12 +2806,12 @@ export const MemorySystemPlugin = ({ client }) => {
     const merged = [current, chunk].filter(Boolean).join('\n\n');
 
     sessionData.summary = {
-      compressedText: truncateFromEnd(merged, AUTO_SUMMARY_MAX_CHARS),
+      compressedText: truncateFromEnd(merged, getSummaryMaxChars()),
       compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + toCompress.length,
       lastCompressedAt: new Date().toISOString()
     };
 
-    sessionData.recentEvents = sessionData.recentEvents.slice(-AUTO_SUMMARY_KEEP_RECENT_EVENTS);
+    sessionData.recentEvents = sessionData.recentEvents.slice(-getSummaryKeepRecentEvents());
   }
 
   function estimateBodyTokens(sessionData) {
@@ -2328,7 +2830,7 @@ export const MemorySystemPlugin = ({ client }) => {
     const current = sanitizeCompressedSummaryText(String(sessionData?.summary?.compressedText || ''));
     const merged = [current, chunk].filter(Boolean).join('\n\n');
     sessionData.summary = {
-      compressedText: truncateFromEnd(merged, AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE),
+      compressedText: truncateFromEnd(merged, getSummaryMaxCharsBudgetMode()),
       compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + eventsToCompress.length,
       lastCompressedAt: new Date().toISOString()
     };
@@ -2408,7 +2910,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
   function discardLowValueToolEvents(sessionData, options = {}) {
     const keepRecent = Number(options.keepRecent || AUTO_DISCARD_KEEP_RECENT_TOOL_EVENTS);
-    const maxRemovals = Number(options.maxRemovals || AUTO_DISCARD_MAX_REMOVALS_PER_PASS);
+    const maxRemovals = Number(options.maxRemovals || getDiscardMaxRemovalsPerPass());
     const events = Array.isArray(sessionData?.recentEvents) ? sessionData.recentEvents : [];
     if (!events.length) return { removed: 0 };
 
@@ -2453,7 +2955,7 @@ export const MemorySystemPlugin = ({ client }) => {
   function extractSessionContext(sessionData, options = {}) {
     const events = Array.isArray(sessionData?.recentEvents) ? sessionData.recentEvents : [];
     if (!events.length) return { extracted: 0 };
-    const maxExtract = Math.max(6, Number(options.maxExtract || AUTO_EXTRACT_EVENTS_PER_PASS));
+    const maxExtract = Math.max(6, Number(options.maxExtract || getExtractEventsPerPass()));
     const keepRecentConvo = Math.max(8, Number(options.keepRecentConvo || AUTO_BODY_KEEP_RECENT_CONVO_EVENTS));
 
     const convoIdx = [];
@@ -2489,7 +2991,7 @@ export const MemorySystemPlugin = ({ client }) => {
           chunk
         ].filter(Boolean).join('\n\n');
         sessionData.summary = {
-          compressedText: truncateFromEnd(merged, AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE),
+          compressedText: truncateFromEnd(merged, getSummaryMaxCharsBudgetMode()),
           compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + cut,
           lastCompressedAt: new Date().toISOString()
         };
@@ -2498,7 +3000,7 @@ export const MemorySystemPlugin = ({ client }) => {
         sessionData.summary = {
           compressedText: truncateFromEnd(
             sanitizeCompressedSummaryText(String(sessionData?.summary?.compressedText || '')),
-            Math.min(AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE, 1000)
+            Math.min(getSummaryMaxCharsBudgetMode(), 1000)
           ),
           compressedEvents: Number(sessionData?.summary?.compressedEvents || 0),
           lastCompressedAt: new Date().toISOString()
@@ -2538,6 +3040,46 @@ export const MemorySystemPlugin = ({ client }) => {
     sessionData.updatedAt = new Date().toISOString();
     ensureSummaryBlocks(sessionData);
     const sessionPath = getSessionMemoryPath(sessionData.sessionID, projectName);
+    if (fs.existsSync(sessionPath)) {
+      const existing = readJson(sessionPath) || {};
+      const existingBlocks = Array.isArray(existing.summaryBlocks) ? existing.summaryBlocks : [];
+      const nextBlocks = Array.isArray(sessionData.summaryBlocks) ? sessionData.summaryBlocks : [];
+      if (existingBlocks.length) {
+        const byId = new Map();
+        for (const b of existingBlocks) {
+          const id = Number(b?.blockId || 0);
+          if (id > 0 && !byId.has(id)) byId.set(id, b);
+        }
+        for (const b of nextBlocks) {
+          const id = Number(b?.blockId || 0);
+          if (id > 0) byId.set(id, b);
+        }
+        sessionData.summaryBlocks = [...byId.values()]
+          .sort((a, b) => Number(a?.blockId || 0) - Number(b?.blockId || 0))
+          .slice(-AUTO_SUMMARY_BLOCK_MAX);
+      }
+
+      // Preserve max counters across concurrent writes.
+      const oldPrune = existing?.pruneAudit && typeof existing.pruneAudit === 'object' ? existing.pruneAudit : null;
+      if (oldPrune && sessionData?.pruneAudit && typeof sessionData.pruneAudit === 'object') {
+        sessionData.pruneAudit.autoRuns = Math.max(
+          Number(sessionData.pruneAudit.autoRuns || 0),
+          Number(oldPrune.autoRuns || 0)
+        );
+        sessionData.pruneAudit.manualRuns = Math.max(
+          Number(sessionData.pruneAudit.manualRuns || 0),
+          Number(oldPrune.manualRuns || 0)
+        );
+        sessionData.pruneAudit.discardRemovedTotal = Math.max(
+          Number(sessionData.pruneAudit.discardRemovedTotal || 0),
+          Number(oldPrune.discardRemovedTotal || 0)
+        );
+        sessionData.pruneAudit.extractMovedTotal = Math.max(
+          Number(sessionData.pruneAudit.extractMovedTotal || 0),
+          Number(oldPrune.extractMovedTotal || 0)
+        );
+      }
+    }
     writeJson(sessionPath, sessionData);
     enforceSessionFileBudget(sessionData, sessionPath);
     updateProjectMetaFromSession(sessionData, projectName);
@@ -2581,8 +3123,8 @@ export const MemorySystemPlugin = ({ client }) => {
         const derivedTitle = deriveSessionTitleFromEvents(sessionData);
         if (derivedTitle) sessionData.sessionTitle = derivedTitle;
       }
-      if (sessionData.recentEvents.length > AUTO_MAX_EVENTS_PER_SESSION) {
-        sessionData.recentEvents = sessionData.recentEvents.slice(-AUTO_MAX_EVENTS_PER_SESSION);
+      if (sessionData.recentEvents.length > getMaxEventsPerSession()) {
+        sessionData.recentEvents = sessionData.recentEvents.slice(-getMaxEventsPerSession());
       }
 
       sessionData.stats = sessionData.stats || emptyStats();
@@ -2606,7 +3148,7 @@ export const MemorySystemPlugin = ({ client }) => {
         sessionData.budget = sessionData.budget || {};
         sessionData.budget.lastCompactedAt = new Date().toISOString();
         sessionData.budget.lastCompactionReason = `discard_low_signal_tools(${discardResult.removed})`;
-        if (AUTO_VISIBLE_NOTICE_FOR_DISCARD) {
+        if (getVisibleNoticeForDiscard()) {
           void emitVisibleNotice(
             sessionID,
             `已裁剪 ${discardResult.removed} 条低信号工具输出，正文估算 ~${estimatedTokens} tokens`,
@@ -2670,11 +3212,11 @@ export const MemorySystemPlugin = ({ client }) => {
         rawEvent
       });
 
-      if (AUTO_INJECT_MEMORY_DOCS) {
+      if (getInjectMemoryDocsEnabled()) {
         await injectMemoryText(sessionID, memoryDocs, 'memory-docs');
       }
 
-      if (AUTO_INJECT_GLOBAL_PREFS_ON_SESSION_START) {
+      if (getInjectGlobalPrefsOnSessionStart()) {
         const globalText = buildGlobalPrefsContextText();
         if (globalText) await injectMemoryText(sessionID, globalText, 'global-prefs');
       }
@@ -2692,10 +3234,11 @@ export const MemorySystemPlugin = ({ client }) => {
     const currentCount = (sessionUserMessageCounters.get(sessionID) || 0) + 1;
     sessionUserMessageCounters.set(sessionID, currentCount);
 
+    const refreshEvery = getCurrentSessionRefreshEvery();
     if (
       AUTO_CURRENT_SESSION_SUMMARY_ENABLED &&
-      currentCount >= AUTO_CURRENT_SESSION_REFRESH_EVERY &&
-      currentCount % AUTO_CURRENT_SESSION_REFRESH_EVERY === 0 &&
+      currentCount >= refreshEvery &&
+      currentCount % refreshEvery === 0 &&
       !shouldSuppressCurrentSummaryInjection(sessionID)
     ) {
       const currentSummary = buildCurrentSessionSummaryText(sessionID);
@@ -2704,7 +3247,7 @@ export const MemorySystemPlugin = ({ client }) => {
       }
     }
 
-    if (AUTO_RECALL_ENABLED && clean && (shouldTriggerRecall(clean) || referencesAnotherSessionTitle(clean, sessionID))) {
+    if (getRecallEnabled() && clean && (shouldTriggerRecall(clean) || referencesAnotherSessionTitle(clean, sessionID))) {
       await maybeInjectTriggerRecall(sessionID, clean);
     }
   }
@@ -2736,9 +3279,9 @@ export const MemorySystemPlugin = ({ client }) => {
   }
 
   function buildRecallContextText(query, sessions, options = {}) {
-    const budgetChars = charsFromTokenBudget(options.tokenBudget || AUTO_RECALL_TOKEN_BUDGET);
-    const maxChars = Math.min(Number(options.maxChars || AUTO_RECALL_MAX_CHARS), budgetChars);
-    const maxEventsPerSession = Number(options.maxEventsPerSession || AUTO_RECALL_MAX_EVENTS_PER_SESSION);
+    const budgetChars = charsFromTokenBudget(options.tokenBudget || getRecallTokenBudget());
+    const maxChars = Math.min(Number(options.maxChars || getRecallMaxChars()), budgetChars);
+    const maxEventsPerSession = Number(options.maxEventsPerSession || getRecallMaxEventsPerSession());
 
     const lines = [];
     const state = { chars: 0, maxChars };
@@ -2814,7 +3357,7 @@ export const MemorySystemPlugin = ({ client }) => {
     const projectName = options.projectName || getProjectName();
     const currentSessionID = options.currentSessionID || null;
     const includeCurrent = Boolean(options.includeCurrent || false);
-    const maxSessions = Number(options.maxSessions || AUTO_RECALL_TOP_SESSIONS);
+    const maxSessions = Number(options.maxSessions || getRecallTopSessions());
 
     const queryText = normalizeText(String(query || ''));
     const tokens = tokenize(queryText);
@@ -2851,18 +3394,269 @@ export const MemorySystemPlugin = ({ client }) => {
   }
 
   function canEmitVisibleNotice(sessionID, key = 'notice') {
-    if (!AUTO_VISIBLE_NOTICES || !sessionID) return false;
+    if (!getVisibleNoticesEnabled() || !sessionID) return false;
     const now = Date.now();
     const prev = sessionNoticeState.get(sessionID);
-    if (prev && (now - prev.at) < AUTO_VISIBLE_NOTICE_COOLDOWN_MS) return false;
+    if (prev && (now - prev.at) < getVisibleNoticeCooldownMs()) return false;
     sessionNoticeState.set(sessionID, { key, at: now });
+    return true;
+  }
+
+  function makeSyntheticTextPart(text = '') {
+    return { type: 'text', text, synthetic: true, ignored: true };
+  }
+
+  function sanitizeHintPartText(text = '') {
+    return normalizeText(String(text || '')).slice(0, 3000);
+  }
+
+  function clearInjectedHintParts(messages = []) {
+    if (!Array.isArray(messages)) return;
+    const marks = ['<prunable-tools>', '<message-id>', '<message-id-map>'];
+    for (const msg of messages) {
+      if (!Array.isArray(msg?.parts)) continue;
+      msg.parts = msg.parts.filter((p) => {
+        if (!p || p.type !== 'text' || !p.synthetic) return true;
+        const t = String(p.text || '');
+        return !marks.some((m) => t.includes(m));
+      });
+    }
+  }
+
+  function findLastMessageForHint(messages = []) {
+    if (!Array.isArray(messages) || !messages.length) return null;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const msg = messages[i];
+      const role = normalizeText(String(msg?.info?.role || '')).toLowerCase();
+      if (role === 'assistant' || role === 'user') return msg;
+    }
+    return messages[messages.length - 1] || null;
+  }
+
+  function injectMessageIdTags(messages = []) {
+    if (!getDcpMessageIdTagsEnabled()) return { injected: 0 };
+    let injected = 0;
+    for (let i = 0; i < messages.length; i += 1) {
+      const msg = messages[i];
+      if (!msg || !Array.isArray(msg.parts)) continue;
+      const rid = normalizeText(String(msg?.info?.id || ''));
+      const mid = `m${String(i + 1).padStart(4, '0')}`;
+      const marker = `<message-id>${mid}</message-id>`;
+      const dcpMarker = `<dcp-message-id>${mid}</dcp-message-id>`;
+      const mapTag = rid ? ` raw="${rid}"` : '';
+      msg.parts.push(makeSyntheticTextPart(`<message-id-map id="${mid}"${mapTag} />`));
+      msg.parts.push(makeSyntheticTextPart(marker));
+      msg.parts.push(makeSyntheticTextPart(dcpMarker));
+      injected += 1;
+    }
+    return { injected };
+  }
+
+  function resolveActiveSessionID(sessionID = '', projectName = getProjectName()) {
+    const loc = resolveSessionLocation(sessionID, projectName);
+    if (!loc.sessionID) return { sessionID: '', projectName };
+    return loc;
+  }
+
+  function executePruneForSession(sessionID = '', projectName = getProjectName(), source = 'tool-prune') {
+    const loc = resolveActiveSessionID(sessionID, projectName);
+    const sid = loc.sessionID;
+    const resolvedProjectName = loc.projectName;
+    if (!sid) return { ok: false, message: 'No active session id found.' };
+    const sess = loadSessionMemory(sid, resolvedProjectName);
+    const d = discardLowValueToolEvents(sess);
+    const e = extractSessionContext(sess);
+    const c = compactConversationByBudget(sess) || { extracted: 0 };
+    const est = estimateBodyTokens(sess);
+    recordPruneAudit(sess, {
+      source,
+      discardRemoved: Number(d.removed || 0),
+      extractMoved: Number(e.extracted || 0) + Number(c.extracted || 0),
+      estimatedTokens: est
+    });
+    persistSessionMemory(sess, resolvedProjectName);
+    writeDashboardFiles();
+    return {
+      ok: true,
+      sessionID: sid,
+      projectName: resolvedProjectName,
+      discardRemoved: Number(d.removed || 0),
+      extractMoved: Number(e.extracted || 0),
+      compactExtracted: Number(c.extracted || 0),
+      estimatedTokens: Number(est || 0)
+    };
+  }
+
+  function executeDistillForSession({
+    sessionID = '',
+    targets = [],
+    projectName = getProjectName()
+  } = {}) {
+    const loc = resolveActiveSessionID(sessionID, projectName);
+    const sid = loc.sessionID;
+    const resolvedProjectName = loc.projectName;
+    if (!sid) return { ok: false, message: 'No active session id found.' };
+    if (!Array.isArray(targets) || !targets.length) {
+      return { ok: false, message: 'Missing targets. Provide at least one {id, distillation}.' };
+    }
+
+    const cleaned = [];
+    for (const t of targets) {
+      const id = normalizeText(String(t?.id || ''));
+      const distillation = normalizeText(String(t?.distillation || ''));
+      if (!id || !distillation) {
+        return { ok: false, message: 'Each target must include non-empty id and distillation.' };
+      }
+      cleaned.push({ id, distillation: truncateText(distillation, getDistillSummaryMaxChars()) });
+    }
+
+    const sess = loadSessionMemory(sid, resolvedProjectName);
+    const blockSummary = cleaned
+      .map((x) => `- [${x.id}] ${x.distillation}`)
+      .join('\n');
+    const appended = appendSummaryBlock(sess, {
+      source: 'tool-distill-manual',
+      startMessageID: cleaned[0]?.id || '',
+      endMessageID: cleaned[cleaned.length - 1]?.id || '',
+      anchorMessageID: cleaned[0]?.id || '',
+      consumedMessages: cleaned.length,
+      summary: truncateText(`[distill]\n${blockSummary}`, getSummaryMaxChars())
+    });
+    if (appended) ensureSummaryBlockPresent(sess, appended);
+    appendCompressedSummaryChunk(sess, [{
+      ts: new Date().toISOString(),
+      kind: 'assistant-message',
+      summary: truncateText(`[manual distill] ${cleaned.map((x) => x.id).join(', ')}`, 320)
+    }]);
+    const c = compactConversationByBudget(sess) || { extracted: 0 };
+    const est = estimateBodyTokens(sess);
+    const debugBlocksBeforePersist = Array.isArray(sess.summaryBlocks) ? sess.summaryBlocks.length : 0;
+    recordPruneAudit(sess, {
+      source: 'tool-distill-manual',
+      discardRemoved: 0,
+      extractMoved: Number(c.extracted || 0),
+      estimatedTokens: est
+    });
+    persistSessionMemory(sess, resolvedProjectName);
+    const debugPath = getSessionMemoryPath(sid, resolvedProjectName);
+    const debugAfter = readJson(debugPath) || {};
+    const debugBlocksAfterPersist = Array.isArray(debugAfter.summaryBlocks) ? debugAfter.summaryBlocks.length : 0;
+    writeDashboardFiles();
+    return {
+      ok: true,
+      sessionID: sid,
+      projectName: resolvedProjectName,
+      targets: cleaned.length,
+      blockAdded: Boolean(appended),
+      blockId: Number(appended?.blockId || 0),
+      debugBlocksBeforePersist,
+      debugBlocksAfterPersist,
+      compactExtracted: Number(c.extracted || 0),
+      estimatedTokens: Number(est || 0)
+    };
+  }
+
+  function executeCompressForSession({
+    sessionID = '',
+    topic = '',
+    content = {},
+    projectName = getProjectName()
+  } = {}) {
+    const loc = resolveActiveSessionID(sessionID, projectName);
+    const sid = loc.sessionID;
+    const resolvedProjectName = loc.projectName;
+    if (!sid) return { ok: false, message: 'No active session id found.' };
+    const summary = normalizeText(String(content?.summary || ''));
+    if (!summary) {
+      return { ok: false, message: 'content.summary is required and must be non-empty.' };
+    }
+    const startId = normalizeText(String(content?.startId || ''));
+    const endId = normalizeText(String(content?.endId || ''));
+    const sess = loadSessionMemory(sid, resolvedProjectName);
+    const appended = appendSummaryBlock(sess, {
+      source: 'tool-compress-manual',
+      startMessageID: startId,
+      endMessageID: endId,
+      anchorMessageID: startId || endId || '',
+      consumedMessages: Math.max(1, Number(getDistillRangeMinMessages() || 1)),
+      summary: truncateText(`[compress:${truncateText(topic || 'phase-summary', 64)}]\n${summary}`, getSummaryMaxChars())
+    });
+    if (appended) ensureSummaryBlockPresent(sess, appended);
+    appendCompressedSummaryChunk(sess, [{
+      ts: new Date().toISOString(),
+      kind: 'assistant-message',
+      summary: truncateText(`[manual compress] ${summary}`, 600)
+    }]);
+    // Persist newly appended block first; prune path reloads session from disk.
+    persistSessionMemory(sess, resolvedProjectName);
+    const p = executePruneForSession(sid, resolvedProjectName, 'tool-compress-manual');
+    if (!p.ok) return p;
+    const debugPath = getSessionMemoryPath(sid, resolvedProjectName);
+    const debugAfter = readJson(debugPath) || {};
+    const debugBlocksAfterPersist = Array.isArray(debugAfter.summaryBlocks) ? debugAfter.summaryBlocks.length : 0;
+    return {
+      ok: true,
+      sessionID: sid,
+      projectName: resolvedProjectName,
+      topic: truncateText(topic || 'phase-summary', 64),
+      blockAdded: Boolean(appended),
+      blockId: Number(appended?.blockId || 0),
+      debugBlocksAfterPersist,
+      estimatedTokens: Number(p.estimatedTokens || 0),
+      discardRemoved: Number(p.discardRemoved || 0),
+      extractMoved: Number(p.extractMoved || 0),
+      compactExtracted: Number(p.compactExtracted || 0)
+    };
+  }
+
+  function buildPrunableToolsXml(messages = [], maxItems = 18) {
+    const items = [];
+    const seen = new Set();
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const msg = messages[i];
+      const parts = Array.isArray(msg?.parts) ? msg.parts : [];
+      for (const part of parts) {
+        if (!part || part.type !== 'tool') continue;
+        const callID = normalizeText(String(part?.callID || ''));
+        const tool = normalizeText(String(part?.tool || 'unknown'));
+        const status = normalizeText(String(part?.state?.status || ''));
+        if (!callID || seen.has(callID)) continue;
+        seen.add(callID);
+        if (!['completed', 'error'].includes(status)) continue;
+        const outputText = normalizeText(String(part?.state?.output || part?.state?.error || ''));
+        const tokenEst = Math.max(1, estimateTokensFromText(outputText || safeJsonPreview(part?.state?.output, 280)));
+        items.push({ callID, tool, status, tokenEst });
+        if (items.length >= maxItems) break;
+      }
+      if (items.length >= maxItems) break;
+    }
+    if (!items.length) return '';
+    const lines = items
+      .map((x, idx) => `${idx + 1}: ${x.tool}#${x.callID} (${x.status}, ~${x.tokenEst} tokens)`)
+      .join('\n');
+    return `<prunable-tools>\n${lines}\n</prunable-tools>`;
+  }
+
+  function injectPrunableToolsHint(messages = []) {
+    if (!getDcpPrunableToolsEnabled()) return false;
+    const xml = buildPrunableToolsXml(messages);
+    if (!xml) return false;
+    const target = findLastMessageForHint(messages);
+    if (!target) return false;
+    target.parts = Array.isArray(target.parts) ? target.parts : [];
+    target.parts.push(makeSyntheticTextPart(sanitizeHintPartText(xml)));
     return true;
   }
 
   async function emitVisibleNotice(sessionID, message, key = 'notice') {
     try {
       if (!canEmitVisibleNotice(sessionID, key)) return false;
-      const text = `[memory-system] ${truncateText(normalizeText(String(message || '')), 220)}`;
+      const mode = getNotificationMode();
+      if (mode === 'off') return false;
+      const detail = truncateText(normalizeText(String(message || '')), mode === 'detailed' ? 520 : 220);
+      const text = mode === 'minimal'
+        ? `[memory-system] ${detail}`
+        : `[memory-system][detailed] ${detail}`;
       if (!text.trim()) return false;
 
       if (client?.session && typeof client.session.prompt === 'function') {
@@ -2870,7 +3664,7 @@ export const MemorySystemPlugin = ({ client }) => {
           path: { id: sessionID },
           body: {
             noReply: true,
-            parts: [{ type: 'text', text, synthetic: true }]
+            parts: [makeSyntheticTextPart(text)]
           }
         });
         return true;
@@ -2880,7 +3674,7 @@ export const MemorySystemPlugin = ({ client }) => {
         try {
           await client.session.update(sessionID, {
             noReply: true,
-            parts: [{ type: 'text', text, synthetic: true }]
+            parts: [makeSyntheticTextPart(text)]
           });
           return true;
         } catch {
@@ -2888,7 +3682,7 @@ export const MemorySystemPlugin = ({ client }) => {
             path: { id: sessionID },
             body: {
               noReply: true,
-              parts: [{ type: 'text', text, synthetic: true }]
+              parts: [makeSyntheticTextPart(text)]
             }
           });
           return true;
@@ -3032,11 +3826,13 @@ export const MemorySystemPlugin = ({ client }) => {
     const globalMemory = readJson(globalMemoryPath) || {};
     const prefs = getNormalizedGlobalPreferences(globalMemory);
 
-    const entries = Object.entries(prefs).slice(0, AUTO_INJECT_GLOBAL_PREFS_MAX_ITEMS);
+    const maxItems = getIntPreference(['injectGlobalPrefsMaxItems', 'inject_global_prefs_max_items'], AUTO_INJECT_GLOBAL_PREFS_MAX_ITEMS, 1, 30);
+    const maxCharsSetting = getIntPreference(['injectGlobalPrefsMaxChars', 'inject_global_prefs_max_chars'], AUTO_INJECT_GLOBAL_PREFS_MAX_CHARS, 120, 3000);
+    const entries = Object.entries(prefs).slice(0, maxItems);
     if (!entries.length) return '';
 
     const lines = [];
-    const state = { chars: 0, maxChars: AUTO_INJECT_GLOBAL_PREFS_MAX_CHARS };
+    const state = { chars: 0, maxChars: maxCharsSetting };
     pushLineWithLimit(lines, '<OPENCODE_GLOBAL_PREFERENCES>', state);
     for (const [k, v] of entries) {
       pushLineWithLimit(lines, `- ${k}: ${truncateText(normalizeText(String(v)), 120)}`, state);
@@ -3071,8 +3867,8 @@ export const MemorySystemPlugin = ({ client }) => {
     if (!s || !Array.isArray(s.recentEvents)) return '';
 
     const maxChars = Math.min(
-      charsFromTokenBudget(AUTO_CURRENT_SESSION_SUMMARY_TOKEN_BUDGET),
-      AUTO_CURRENT_SESSION_SUMMARY_MAX_CHARS
+      charsFromTokenBudget(getCurrentSessionSummaryTokenBudget()),
+      getCurrentSessionSummaryMaxChars()
     );
     const state = { chars: 0, maxChars };
     const lines = [];
@@ -3089,7 +3885,7 @@ export const MemorySystemPlugin = ({ client }) => {
     const summary = truncateText(sanitizeCompressedSummaryText(String(s?.summary?.compressedText || '')), 260);
     if (summary) pushLineWithLimit(lines, `compressed: ${summary}`, state);
 
-    const recent = s.recentEvents.slice(-AUTO_CURRENT_SESSION_SUMMARY_MAX_EVENTS);
+    const recent = s.recentEvents.slice(-getCurrentSessionSummaryMaxEvents());
     const structured = buildCompressedChunk(recent);
     for (const row of structured.split('\n')) {
       pushLineWithLimit(lines, row, state);
@@ -3101,23 +3897,23 @@ export const MemorySystemPlugin = ({ client }) => {
   }
 
   async function maybeInjectTriggerRecall(sessionID, query) {
-    if (!AUTO_RECALL_ENABLED || !sessionID) return;
+    if (!getRecallEnabled() || !sessionID) return;
 
     const now = Date.now();
     const normQuery = normalizeText(query).toLowerCase();
     const state = sessionRecallState.get(sessionID) || { lastAt: 0, lastQuery: '' };
 
-    if (now - state.lastAt < AUTO_RECALL_COOLDOWN_MS && state.lastQuery === normQuery) {
+    if (now - state.lastAt < getRecallCooldownMs() && state.lastQuery === normQuery) {
       return;
     }
 
     const { text, hits } = recallProjectMemories(query, {
       currentSessionID: sessionID,
       includeCurrent: false,
-      maxSessions: AUTO_RECALL_TOP_SESSIONS,
-      maxEventsPerSession: AUTO_RECALL_MAX_EVENTS_PER_SESSION,
-      maxChars: AUTO_RECALL_MAX_CHARS,
-      tokenBudget: AUTO_RECALL_TOKEN_BUDGET
+      maxSessions: getRecallTopSessions(),
+      maxEventsPerSession: getRecallMaxEventsPerSession(),
+      maxChars: getRecallMaxChars(),
+      tokenBudget: getRecallTokenBudget()
     });
 
     if (!text || !hits.length) return;
@@ -3146,6 +3942,10 @@ export const MemorySystemPlugin = ({ client }) => {
 
   function buildDashboardData() {
     const globalMemory = readJson(globalMemoryPath) || {};
+    const memoryCfg = readMemoryConfig();
+    const memorySystemSettings = memoryCfg?.memorySystem && typeof memoryCfg.memorySystem === 'object'
+      ? memoryCfg.memorySystem
+      : {};
     const projects = [];
 
     let projectDirs = [];
@@ -3277,6 +4077,9 @@ export const MemorySystemPlugin = ({ client }) => {
 
     return {
       generatedAt: new Date().toISOString(),
+      settings: {
+        memorySystem: memorySystemSettings
+      },
       global: {
         preferences: getNormalizedGlobalPreferences(globalMemory),
         snippets: globalMemory?.snippets && typeof globalMemory.snippets === 'object' ? globalMemory.snippets : {},
@@ -3301,43 +4104,63 @@ export const MemorySystemPlugin = ({ client }) => {
       '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />',
       '  <title>Memory Dashboard</title>',
       '  <style>',
-      '    :root { --bg:#f4f6f8; --panel:#fff; --ink:#17212b; --muted:#5f6b76; --accent:#0f766e; --line:#d9e2ea; }',
+      '    :root { --bg:#f5f7fa; --panel:#ffffff; --ink:#111827; --muted:#6b7280; --accent:#0f766e; --line:#e5e7eb; --shadow:0 2px 10px rgba(15,23,42,.04); --radius:12px; }',
       '    * { box-sizing: border-box; }',
-      '    body { margin:0; font-family:"IBM Plex Sans","Noto Sans SC","PingFang SC","Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at 15% 10%, #e0f2fe 0%, var(--bg) 45%), var(--bg); }',
-      '    .layout { display:grid; grid-template-columns:320px 1fr; min-height:100vh; }',
-      '    .sidebar { border-right:1px solid var(--line); background:#fbfdff; padding:16px; overflow:auto; }',
-      '    .main { padding:20px; overflow:auto; }',
-      '    h1 { margin:0 0 12px; font-size:20px; letter-spacing:.2px; }',
-      '    .sub { color:var(--muted); font-size:13px; margin-bottom:12px; }',
-      '    .metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-bottom:14px; }',
-      '    .metric { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px; box-shadow:0 3px 10px rgba(15,23,42,.04); }',
-      '    .metric .k { font-size:11px; color:var(--muted); text-transform:uppercase; }',
-      '    .metric .v { font-size:18px; font-weight:650; margin-top:2px; }',
-      '    .project-item { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px; margin-bottom:8px; cursor:pointer; transition:120ms ease; }',
-      '    .project-item:hover { border-color:#b6c8d6; transform:translateY(-1px); }',
-      '    .project-item.active { border-color:var(--accent); background:#f0fdfa; box-shadow:0 0 0 2px rgba(15,118,110,.08) inset; }',
-      '    .project-item .name { font-weight:650; }',
+      '    body { margin:0; font-family:"IBM Plex Sans","Noto Sans SC","PingFang SC","Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }',
+      '    .layout { display:grid; grid-template-columns:320px 1fr; min-height:100vh; gap:12px; padding:12px; }',
+      '    .sidebar { border:1px solid var(--line); border-radius:var(--radius); background:#fff; padding:16px; overflow:auto; box-shadow:var(--shadow); position:sticky; top:12px; max-height:calc(100vh - 24px); }',
+      '    .main { overflow:auto; }',
+      '    h1 { margin:0 0 8px; font-size:18px; letter-spacing:0; font-weight:700; }',
+      '    .sub { color:var(--muted); font-size:12px; margin-bottom:8px; line-height:1.45; }',
+      '    .metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin:4px 0 14px; }',
+      '    .metric { background:#fff; border:1px solid var(--line); border-radius:10px; padding:10px; box-shadow:none; }',
+      '    .metric .k { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; }',
+      '    .metric .v { font-size:18px; font-weight:700; margin-top:2px; color:var(--ink); }',
+      '    .project-item { background:#fff; border:1px solid var(--line); border-radius:10px; padding:10px; margin-bottom:8px; cursor:pointer; transition:border-color .12s ease, background .12s ease; }',
+      '    .project-item:hover { border-color:#cbd5e1; }',
+      '    .project-item.active { border-color:var(--accent); background:#f0fdfa; box-shadow:0 0 0 1px rgba(15,118,110,.12) inset; }',
+      '    .project-item .name { font-weight:700; font-size:13px; }',
       '    .project-item .meta { color:var(--muted); font-size:12px; margin-top:4px; }',
-      '    .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; box-shadow:0 4px 14px rgba(15,23,42,.05); }',
-      '    .session { border:1px solid var(--line); border-radius:10px; margin-bottom:10px; overflow:hidden; background:#fff; }',
-      '    .session-h { padding:10px 12px; display:flex; justify-content:flex-start; align-items:flex-start; gap:12px; background:linear-gradient(180deg,#f8fafc,#f1f5f9); border-bottom:1px solid var(--line); cursor:pointer; }',
-      '    .session-id { font-family:"IBM Plex Mono","JetBrains Mono",monospace; font-size:12px; text-align:left; }',
-      '    .stats { font-size:12px; color:var(--muted); text-align:left; }',
-      '    .events { padding:10px 12px; display:none; }',
-      '    .events.open { display:block; }',
-      '    .ev { border-left:3px solid #cbd5e1; padding:6px 8px; margin-bottom:8px; background:#f8fafc; border-radius:6px; }',
+      '    .panel { background:#fff; border:1px solid var(--line); border-radius:var(--radius); padding:14px; margin-bottom:10px; box-shadow:var(--shadow); }',
+      '    .session { border:1px solid var(--line); border-radius:10px; margin-bottom:8px; overflow:hidden; background:#fff; transition:border-color .12s ease; }',
+      '    .session:hover { border-color:#cbd5e1; }',
+      '    .session-h { padding:10px 12px; display:flex; justify-content:flex-start; align-items:flex-start; gap:12px; background:#fafafa; border-bottom:1px solid var(--line); cursor:pointer; }',
+      '    .session-id { font-family:"IBM Plex Mono","JetBrains Mono",monospace; font-size:12px; text-align:left; font-weight:620; }',
+      '    .stats { font-size:12px; color:var(--muted); text-align:left; line-height:1.55; }',
+      '    .events { display:block; max-height:0; opacity:0; overflow:hidden; padding:0 12px; transition:max-height .2s ease, opacity .18s ease, padding .18s ease; }',
+      '    .events.open { max-height:1600px; opacity:1; padding:10px 12px; }',
+      '    .ev { border-left:3px solid #d1d5db; padding:8px 9px; margin-bottom:8px; background:#f8fafc; border-radius:8px; }',
       '    .ev.user-message { border-left-color:#2563eb; }',
-      '    .ev.assistant-message { border-left-color:#7c3aed; }',
+      '    .ev.assistant-message { border-left-color:#0ea5a0; }',
       '    .ev.tool-result { border-left-color:#0f766e; }',
       '    .ev.session-start, .ev.session-end { border-left-color:#64748b; }',
       '    .ev .meta { color:var(--muted); font-size:11px; margin-bottom:4px; }',
-      '    .ev .txt { white-space:pre-wrap; font-size:13px; line-height:1.4; }',
-      '    .pref { font-size:13px; color:var(--ink); margin-bottom:4px; }',
-      '    .empty { color:var(--muted); font-size:13px; }',
-      '    .trash-row { display:flex; align-items:flex-start; gap:10px; padding:8px; border:1px solid var(--line); border-radius:8px; margin-bottom:8px; background:#f8fafc; }',
+      '    .ev .txt { white-space:pre-wrap; font-size:13px; line-height:1.45; }',
+      '    .pref { font-size:13px; color:var(--ink); margin-bottom:6px; background:#fff; border:1px solid var(--line); border-radius:8px; padding:8px 10px; }',
+      '    .empty { color:var(--muted); font-size:13px; padding:6px 0; }',
+      '    .trash-row { display:flex; align-items:flex-start; gap:10px; padding:10px; border:1px solid var(--line); border-radius:10px; margin-bottom:8px; background:#f8fafc; }',
       '    .trash-row .meta { font-size:12px; color:var(--muted); }',
       '    .trash-row .path { font-family:"IBM Plex Mono","JetBrains Mono",monospace; font-size:11px; color:#334155; word-break:break-all; }',
-      '    @media (max-width:920px) { .layout { grid-template-columns:1fr; } .sidebar { border-right:none; border-bottom:1px solid var(--line); } }',
+      '    .tabbar { display:flex; gap:8px; flex-wrap:wrap; }',
+      '    .tab-btn { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:10px; padding:8px 12px; cursor:pointer; font-size:13px; font-weight:600; transition:.12s ease; }',
+      '    .tab-btn:hover { border-color:#b4c4d4; }',
+      '    .tab-btn.active { background:var(--accent); color:#fff; border-color:var(--accent); box-shadow:none; }',
+      '    .tab-pane { display:none; animation:fadeIn .18s ease; }',
+      '    .tab-pane.active { display:block; }',
+      '    @keyframes fadeIn { from { opacity:0; transform:translateY(2px); } to { opacity:1; transform:none; } }',
+      '    button { border:1px solid var(--line); background:#fff; color:#111827; border-radius:10px; padding:7px 10px; cursor:pointer; font-weight:600; }',
+      '    button:hover { border-color:#9fb3c8; }',
+      '    button:disabled { opacity:.45; cursor:not-allowed; }',
+      '    select, input[type="number"], textarea { border:1px solid var(--line); border-radius:10px; background:#fff; }',
+      '    details.fold { border:1px solid var(--line); border-radius:10px; padding:8px 10px; background:#fcfeff; }',
+      '    details.fold > summary { cursor:pointer; list-style:none; font-weight:600; color:#334155; }',
+      '    details.fold > summary::-webkit-details-marker { display:none; }',
+      '    details.fold > summary::before { content:"▶ "; color:#64748b; }',
+      '    details.fold[open] > summary::before { content:"▼ "; }',
+      '    .settings-help-list { margin-top:8px; display:grid; grid-template-columns:1fr; gap:6px; }',
+      '    .settings-help-item { font-size:12px; color:#475569; line-height:1.45; }',
+      '    .settings-help-item b { color:#0f172a; }',
+      '    @media (max-width:1080px) { .layout { grid-template-columns:1fr; padding:10px; } .sidebar { position:relative; top:0; max-height:none; } }',
       '  </style>',
       '</head>',
       '<body>',
@@ -3347,17 +4170,29 @@ export const MemorySystemPlugin = ({ client }) => {
       '      <div class="sub" id="genAt"></div>',
       '      <div class="sub"><label id="langLabel" for="langSel">Language</label>: <select id="langSel"><option value="zh">中文</option><option value="en">English</option></select></div>',
       '      <div class="metrics">',
-      '        <div class="metric"><div class="k">Projects</div><div class="v" id="mProjects">0</div></div>',
-      '        <div class="metric"><div class="k">Sessions</div><div class="v" id="mSessions">0</div></div>',
-      '        <div class="metric"><div class="k">Events</div><div class="v" id="mEvents">0</div></div>',
+      '        <div class="metric"><div class="k" id="mProjectsK">Projects</div><div class="v" id="mProjects">0</div></div>',
+      '        <div class="metric"><div class="k" id="mSessionsK">Sessions</div><div class="v" id="mSessions">0</div></div>',
+      '        <div class="metric"><div class="k" id="mEventsK">Events</div><div class="v" id="mEvents">0</div></div>',
       '      </div>',
       '      <div id="projectList"></div>',
       '    </aside>',
       '    <main class="main">',
-      '      <div class="panel"><h1 id="projectTitle" style="font-size:18px;">No project selected</h1><div class="sub" id="projectMeta"></div></div>',
-      '      <div class="panel"><h1 id="globalTitle" style="font-size:16px;">Global Preferences</h1><div class="sub" id="tokenHint">Token estimate is approximate (chars/4).</div><div id="globalPrefs" class="empty">No global preferences.</div></div>',
-      '      <div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;"><h1 style="font-size:16px;">Sessions</h1><button id="batchDeleteBtn" style="height:30px;">批量删除</button></div><div id="sessionList" class="empty">No sessions.</div></div>',
-      '      <div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;"><h1 style="font-size:16px;">回收站</h1><div style="display:flex;align-items:center;gap:8px;"><label for="trashRetentionSel" style="font-size:12px;color:var(--muted);">保留天数</label><select id="trashRetentionSel"><option value="1">1</option><option value="3">3</option><option value="7">7</option><option value="10">10</option><option value="30" selected>30</option></select><button id="trashCleanupBtn" style="height:30px;">立即清理过期</button><button id="trashDeleteBtn" style="height:30px;" disabled>永久删除(0)</button></div></div><div id="trashMeta" class="sub">-</div><div id="trashList" class="empty">暂无回收站条目</div></div>',
+      '      <div class="panel"><div class="tabbar"><button id="tabSessionsBtn" class="tab-btn active">会话页</button><button id="tabSettingsBtn" class="tab-btn">参数页</button><button id="tabLlmBtn" class="tab-btn">独立LLM</button><button id="tabTrashBtn" class="tab-btn">回收站</button></div></div>',
+      '      <section id="paneSessions" class="tab-pane active">',
+      '        <div class="panel"><h1 id="projectTitle" style="font-size:18px;">No project selected</h1><div class="sub" id="projectMeta"></div></div>',
+      '        <div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;"><h1 id="sessionsTitle" style="font-size:16px;">Sessions</h1><button id="batchDeleteBtn" style="height:30px;">Batch Delete</button></div><div id="sessionList" class="empty">No sessions.</div></div>',
+      '      </section>',
+      '      <section id="paneSettings" class="tab-pane">',
+        '        <div class="panel"><details id="globalPrefsFold" class="fold" open><summary id="globalPrefsFoldSummary">全局偏好设置</summary><div style="margin-top:8px;"><h1 id="globalTitle" style="font-size:16px;">Global Preferences</h1><div class="sub" id="tokenHint">Token estimate is approximate (chars/4).</div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;"><label id="pretrimProfileLabel" for="pretrimProfileSel" style="font-size:12px;color:var(--muted);">Pretrim Profile</label><select id="pretrimProfileSel"><option value="conservative">Conservative</option><option value="balanced" selected>Balanced</option><option value="aggressive">Aggressive</option></select><button id="savePretrimProfileBtn" style="height:30px;">Save</button><span id="pretrimProfileHint" class="sub" style="margin:0;"></span></div><div id="globalPrefs" class="empty">No global preferences.</div></div></details></div>',
+        '        <div class="panel"><h1 id="settingsTitle" style="font-size:16px;">Memory System Settings</h1><div class="sub" id="settingsHint">Adjust runtime behavior. Saved locally and persisted.</div><div id="settingsForm" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:center;margin-top:10px;"></div><div style="margin-top:10px;display:flex;gap:8px;align-items:center;"><button id="settingsSaveBtn" style="height:30px;">Save Settings</button><span id="settingsStatus" class="sub" style="margin:0;"></span></div></div>',
+        '        <div class="panel"><h1 id="llmQuickTitle" style="font-size:16px;">独立LLM总结（快捷查看）</h1><div class="sub" id="llmQuickHint">当前配置摘要。可在此确认是否已启用独立LLM；点击按钮进入完整配置。</div><div style="display:grid;grid-template-columns:180px 1fr;gap:8px;align-items:center;margin-top:8px;"><div class="sub" id="llmQuickModeLabel" style="margin:0;">模式</div><div id="llmQuickMode" style="font-size:13px;">-</div><div class="sub" id="llmQuickProviderLabel" style="margin:0;">Provider</div><div id="llmQuickProvider" style="font-size:13px;">-</div><div class="sub" id="llmQuickModelLabel" style="margin:0;">Model</div><div id="llmQuickModel" style="font-size:13px;">-</div><div class="sub" id="llmQuickBaseLabel" style="margin:0;">BaseURL</div><div id="llmQuickBase" style="font-size:13px;">-</div></div><div style="margin-top:10px;"><button id="goLlmBtn" style="height:30px;">打开独立LLM配置页</button></div></div>',
+      '      </section>',
+      '      <section id="paneLlm" class="tab-pane">',
+      '        <div class="panel"><h1 id="llmTitle" style="font-size:16px;">独立LLM总结配置</h1><div class="sub" id="llmHint">可选。用于发送前LLM总结阶段，保存后立即生效。</div><div id="llmForm" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:center;margin-top:10px;"></div><div style="margin-top:10px;display:flex;gap:8px;align-items:center;"><button id="llmSaveBtn" style="height:30px;">保存LLM配置</button><span id="llmStatus" class="sub" style="margin:0;"></span></div></div>',
+      '      </section>',
+      '      <section id="paneTrash" class="tab-pane">',
+      '        <div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;"><h1 id="trashTitle" style="font-size:16px;">Trash</h1><div style="display:flex;align-items:center;gap:8px;"><label id="trashRetentionLabel" for="trashRetentionSel" style="font-size:12px;color:var(--muted);">Retention Days</label><select id="trashRetentionSel"><option value="1">1</option><option value="3">3</option><option value="7">7</option><option value="10">10</option><option value="30" selected>30</option></select><button id="trashCleanupBtn" style="height:30px;">Cleanup Expired</button><button id="trashDeleteBtn" style="height:30px;" disabled>Delete Permanently(0)</button></div></div><div id="trashMeta" class="sub">-</div><div id="trashList" class="empty">No trash entries</div></div>',
+      '      </section>',
     '    </main>',
       '  </div>',
       '  <div id="editModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9999;align-items:center;justify-content:center;">',
@@ -3379,18 +4214,144 @@ export const MemorySystemPlugin = ({ client }) => {
       '    const projectMeta = $("projectMeta");',
       '    const globalPrefs = $("globalPrefs");',
       '    const langSel = $("langSel");',
-      '    const I18N = { zh:{title:"记忆看板",lang:"语言",global:"全局偏好",token:"Token 估算为近似值（chars/4）",edit:"编辑摘要",del:"删除会话",nos:"暂无会话",noproj:"暂无项目记忆",save:"保存",cancel:"取消",trashTitle:"回收站",trashNone:"暂无回收站条目",trashDelete:"永久删除",trashCleanup:"立即清理过期"}, en:{title:"Memory Dashboard",lang:"Language",global:"Global Preferences",token:"Token estimate is approximate (chars/4).",edit:"Edit summary",del:"Delete session",nos:"No sessions.",noproj:"No project memory yet.",save:"Save",cancel:"Cancel",trashTitle:"Trash",trashNone:"No trash entries",trashDelete:"Delete Permanently",trashCleanup:"Cleanup Expired"} };',
-      '    let LANG = localStorage.getItem("memory_dashboard_lang") || "zh";',
+      '    const pretrimProfileSel = $("pretrimProfileSel");',
+      '    const savePretrimProfileBtn = $("savePretrimProfileBtn");',
+      '    const pretrimProfileHint = $("pretrimProfileHint");',
+      '    const settingsForm = $("settingsForm");',
+      '    const settingsSaveBtn = $("settingsSaveBtn");',
+      '    const settingsStatus = $("settingsStatus");',
+      '    const settingsHelpBody = $("settingsHelpBody");',
+      '    const tabSessionsBtn = $("tabSessionsBtn");',
+      '    const tabSettingsBtn = $("tabSettingsBtn");',
+      '    const tabLlmBtn = $("tabLlmBtn");',
+      '    const tabTrashBtn = $("tabTrashBtn");',
+      '    const paneSessions = $("paneSessions");',
+      '    const paneSettings = $("paneSettings");',
+      '    const paneLlm = $("paneLlm");',
+      '    const paneTrash = $("paneTrash");',
+      '    const llmForm = $("llmForm");',
+      '    const llmSaveBtn = $("llmSaveBtn");',
+      '    const llmStatus = $("llmStatus");',
+      '    const goLlmBtn = $("goLlmBtn");',
+      '    const SETTINGS_SCHEMA = [',
+      '      { key:"sendPretrimEnabled", type:"bool", default:true, labelZh:"发送前自动裁剪", labelEn:"Send-time auto pretrim" },',
+      '      { key:"sendPretrimBudget", type:"int", default:10000, labelZh:"发送前裁剪预算(token)", labelEn:"Send pretrim budget (tokens)" },',
+      '      { key:"sendPretrimTarget", type:"int", default:7500, labelZh:"发送前裁剪目标(token)", labelEn:"Send pretrim target (tokens)" },',
+      '      { key:"sendPretrimHardRatio", type:"float", default:0.9, step:"0.01", labelZh:"硬阈值比例(0-1)", labelEn:"Hard ratio (0-1)" },',
+      '      { key:"sendPretrimDistillTriggerRatio", type:"float", default:0.8, step:"0.01", labelZh:"LLM总结触发比例(0-1)", labelEn:"Distill trigger ratio (0-1)" },',
+      '      { key:"dcpCompatMode", type:"bool", default:true, labelZh:"DCP兼容模式(机械优先)", labelEn:"DCP-compat mode (mechanical first)" },',
+      '      { key:"sendPretrimTurnProtection", type:"int", default:4, labelZh:"近轮保护消息数", labelEn:"Turn protection window" },',
+      '      { key:"sendPretrimMaxRewriteMessages", type:"int", default:28, labelZh:"单次最大重写消息数", labelEn:"Max rewrite messages per run" },',
+      '      { key:"distillSummaryMaxChars", type:"int", default:1600, labelZh:"LLM总结摘要最大字符", labelEn:"Distill summary max chars" },',
+      '      { key:"distillInputMaxChars", type:"int", default:9000, labelZh:"LLM总结输入最大字符", labelEn:"Distill input max chars" },',
+      '      { key:"distillRangeMinMessages", type:"int", default:2, labelZh:"LLM总结最小消息数", labelEn:"Distill range min messages" },',
+      '      { key:"distillRangeMaxMessages", type:"int", default:18, labelZh:"LLM总结最大消息数", labelEn:"Distill range max messages" },',
+      '      { key:"strategyPurgeErrorTurns", type:"int", default:4, labelZh:"错误输入清理轮数", labelEn:"Purge error turns" },',
+      '      { key:"maxEventsPerSession", type:"int", default:120, labelZh:"单会话最大事件数", labelEn:"Max events per session" },',
+      '      { key:"summaryTriggerEvents", type:"int", default:40, labelZh:"自动摘要触发事件数", labelEn:"Summary trigger events" },',
+      '      { key:"summaryKeepRecentEvents", type:"int", default:18, labelZh:"自动摘要保留最近事件数", labelEn:"Summary keep recent events" },',
+      '      { key:"summaryMaxChars", type:"int", default:2400, labelZh:"自动摘要最大字符", labelEn:"Summary max chars" },',
+      '      { key:"summaryMaxCharsBudgetMode", type:"int", default:2600, labelZh:"预算模式摘要最大字符", labelEn:"Budget mode summary max chars" },',
+      '      { key:"discardMaxRemovalsPerPass", type:"int", default:30, labelZh:"单次裁剪最大删除条数", labelEn:"Discard max removals per pass" },',
+      '      { key:"extractEventsPerPass", type:"int", default:24, labelZh:"单次提取最大事件数", labelEn:"Extract events per pass" },',
+      '      { key:"visibleNoticesEnabled", type:"bool", default:true, labelZh:"可见提示", labelEn:"Visible notices" },',
+      '      { key:"notificationMode", type:"enum", default:"minimal", options:["off","minimal","detailed"], labelZh:"通知模式", labelEn:"Notification mode" },',
+      '      { key:"visibleNoticeForDiscard", type:"bool", default:false, labelZh:"显示裁剪提示", labelEn:"Show discard notices" },',
+      '      { key:"visibleNoticeCooldownMs", type:"int", default:120000, labelZh:"可见提示冷却(ms)", labelEn:"Visible notice cooldown (ms)" },',
+      '      { key:"dcpPrunableToolsEnabled", type:"bool", default:true, labelZh:"注入可裁剪工具列表", labelEn:"Inject <prunable-tools>" },',
+      '      { key:"dcpMessageIdTagsEnabled", type:"bool", default:false, labelZh:"注入消息ID标签", labelEn:"Inject message-id tags" },',
+      '      { key:"injectGlobalPrefsOnSessionStart", type:"bool", default:true, labelZh:"会话开始注入全局偏好", labelEn:"Inject global prefs on session start" },',
+      '      { key:"injectMemoryDocsEnabled", type:"bool", default:false, labelZh:"注入记忆文档", labelEn:"Inject memory docs" },',
+      '      { key:"currentSummaryEvery", type:"int", default:5, labelZh:"当前会话摘要注入间隔(用户消息数)", labelEn:"Current summary interval (user messages)" },',
+      '      { key:"currentSummaryTokenBudget", type:"int", default:500, labelZh:"当前会话摘要预算(token)", labelEn:"Current summary budget (tokens)" },',
+      '      { key:"currentSummaryMaxChars", type:"int", default:2200, labelZh:"当前会话摘要最大字符", labelEn:"Current summary max chars" },',
+      '      { key:"currentSummaryMaxEvents", type:"int", default:6, labelZh:"当前会话摘要最大事件数", labelEn:"Current summary max events" },',
+      '      { key:"recallEnabled", type:"bool", default:true, labelZh:"启用跨会话召回", labelEn:"Enable cross-session recall" },',
+      '      { key:"recallTokenBudget", type:"int", default:450, labelZh:"跨会话召回预算(token)", labelEn:"Recall budget (tokens)" },',
+      '      { key:"recallMaxChars", type:"int", default:1800, labelZh:"跨会话召回最大字符", labelEn:"Recall max chars" },',
+      '      { key:"recallTopSessions", type:"int", default:2, labelZh:"跨会话召回会话数", labelEn:"Recall top sessions" },',
+      '      { key:"recallMaxEventsPerSession", type:"int", default:4, labelZh:"每会话召回事件数", labelEn:"Recall events per session" },',
+      '      { key:"recallCooldownMs", type:"int", default:0, labelZh:"跨会话召回冷却(ms)", labelEn:"Recall cooldown (ms)" }',
+      '    ];',
+      '    const LLM_SCHEMA = [',
+      '      { key:"llmSummaryMode", type:"enum", default:"auto", options:["auto","session","independent"], labelZh:"LLM总结模式", labelEn:"LLM summary mode" },',
+      '      { key:"independentLlmEnabled", type:"bool", default:false, labelZh:"启用独立LLM总结", labelEn:"Enable independent LLM summary" },',
+      '      { key:"independentLlmProvider", type:"enum", default:"openai_compatible", options:["openai_compatible","gemini","anthropic"], labelZh:"Provider", labelEn:"Provider" },',
+      '      { key:"independentLlmBaseURL", type:"string", default:"", labelZh:"Base URL", labelEn:"Base URL" },',
+      '      { key:"independentLlmApiKey", type:"string", default:"", labelZh:"API Key", labelEn:"API Key" },',
+      '      { key:"independentLlmModel", type:"string", default:"", labelZh:"模型名", labelEn:"Model" },',
+      '      { key:"independentLlmUseSessionModel", type:"bool", default:true, labelZh:"模型为空时跟随当前会话模型", labelEn:"Use session model when model empty" },',
+      '      { key:"independentLlmTimeoutMs", type:"int", default:12000, labelZh:"请求超时(ms)", labelEn:"Timeout (ms)" },',
+      '      { key:"independentLlmMaxTokens", type:"int", default:420, labelZh:"输出上限(token)", labelEn:"Max output tokens" },',
+      '      { key:"independentLlmTemperature", type:"float", default:0.2, step:"0.01", labelZh:"温度", labelEn:"Temperature" }',
+      '    ];',
+      '    const SETTINGS_HELP = {',
+      '      sendPretrimEnabled:{zh:"是否在每次发送给模型前自动做上下文瘦身。关闭后不做自动省token。",en:"Enable automatic context slimming before each send."},',
+      '      sendPretrimBudget:{zh:"触发瘦身的预算线。正文估算超过它就启动裁剪。",en:"Budget line that triggers pretrim when body estimate exceeds it."},',
+      '      sendPretrimTarget:{zh:"裁剪后的目标线。系统会尽量把正文压到这个值附近。",en:"Target token level after trimming."},',
+      '      sendPretrimHardRatio:{zh:"硬阈值比例，越高越保守，越低越激进。",en:"Hard limit ratio: higher is more conservative."},',
+      '      sendPretrimDistillTriggerRatio:{zh:"机械裁剪后仍超阈值时，达到该比例会进入LLM总结替换。",en:"After mechanical trim, this ratio triggers LLM-summary replacement."},',
+      '      dcpCompatMode:{zh:"开启后：先机械裁剪；仍超阈值再做LLM总结。独立LLM未启用时走内联LLM。",en:"When on: mechanical first, then LLM summary if still over threshold; inline LLM is used unless independent LLM is enabled."},',
+      '      sendPretrimTurnProtection:{zh:"按“最近N条用户消息”保护窗口（不是总消息条目数）。",en:"Protection window by last N user messages (not total message items)."},',
+      '      sendPretrimMaxRewriteMessages:{zh:"单次最多重写多少条旧消息。",en:"Max historical messages rewritten in one pass."},',
+      '      distillSummaryMaxChars:{zh:"单个LLM总结块允许的最大长度。",en:"Max chars for one LLM-summary block."},',
+      '      distillInputMaxChars:{zh:"用于LLM总结的输入上限，防止过长导致慢或失败。",en:"Max input chars fed into LLM summary."},',
+      '      distillRangeMinMessages:{zh:"LLM总结至少覆盖多少条旧消息。",en:"Minimum messages included in one distill range."},',
+      '      distillRangeMaxMessages:{zh:"LLM总结最多覆盖多少条旧消息。",en:"Maximum messages included in one distill range."},',
+      '      strategyPurgeErrorTurns:{zh:"错误工具调用在多少轮后可被清理。",en:"Error tool outputs become purgeable after N turns."},',
+      '      maxEventsPerSession:{zh:"单会话保留的事件上限，超过会自动淘汰更旧条目。",en:"Max retained events per session file."},',
+      '      summaryTriggerEvents:{zh:"累计到多少事件后自动做会话摘要压缩。",en:"Event count threshold for auto session summary."},',
+      '      summaryKeepRecentEvents:{zh:"自动摘要时保留最近事件不压缩。",en:"Recent events kept uncompressed during summary."},',
+      '      summaryMaxChars:{zh:"会话压缩摘要最大长度。",en:"Max chars for session compressed summary."},',
+      '      summaryMaxCharsBudgetMode:{zh:"预算紧张时摘要上限。",en:"Summary max chars under budget pressure."},',
+      '      discardMaxRemovalsPerPass:{zh:"每轮最多删除多少低信号工具输出。",en:"Max low-signal removals per pruning pass."},',
+      '      extractEventsPerPass:{zh:"每轮最多提取多少事件进入摘要块。",en:"Max extracted events per pass into summary block."},',
+      '      visibleNoticesEnabled:{zh:"是否在会话中显示可见提示。",en:"Show visible in-chat notices."},',
+      '      notificationMode:{zh:"通知展示模式：关闭/简洁/详细。仅影响可见提示，不影响裁剪本身。",en:"Notification display mode: off/minimal/detailed. Affects visibility only."},',
+      '      visibleNoticeForDiscard:{zh:"是否显示“已裁剪”提示。",en:"Show notices for discard actions."},',
+      '      visibleNoticeCooldownMs:{zh:"可见提示冷却时间，避免刷屏。",en:"Cooldown for visible notices."},',
+      '      dcpPrunableToolsEnabled:{zh:"发送前注入 <prunable-tools> 列表，便于后续精确裁剪。",en:"Inject <prunable-tools> context before send."},',
+      '      dcpMessageIdTagsEnabled:{zh:"发送前注入 message-id 标签。开启后token会增加。",en:"Inject message-id tags before send (adds tokens)."},',
+      '      injectGlobalPrefsOnSessionStart:{zh:"新会话首条消息后自动注入全局偏好。",en:"Inject global preferences at session start."},',
+      '      injectMemoryDocsEnabled:{zh:"是否注入记忆系统文档规则。",en:"Inject memory-doc helper block."},',
+      '      currentSummaryEvery:{zh:"每多少条用户消息自动注入一次当前会话摘要。",en:"Inject current-session summary every N user messages."},',
+      '      currentSummaryTokenBudget:{zh:"当前会话摘要注入预算。",en:"Token budget for current-session summary injection."},',
+      '      currentSummaryMaxChars:{zh:"当前会话摘要最大字符数。",en:"Max chars of current-session summary."},',
+      '      currentSummaryMaxEvents:{zh:"当前会话摘要最多纳入的事件数。",en:"Max events included in current-session summary."},',
+      '      recallEnabled:{zh:"是否启用跨会话召回。",en:"Enable cross-session recall."},',
+      '      recallTokenBudget:{zh:"跨会话召回注入预算。",en:"Token budget for recall injection."},',
+      '      recallMaxChars:{zh:"跨会话召回文本最大字符数。",en:"Max chars of recall text."},',
+      '      recallTopSessions:{zh:"召回时最多检索的会话数量。",en:"How many top sessions to recall from."},',
+      '      recallMaxEventsPerSession:{zh:"每个被召回会话最多带入多少事件。",en:"Max events per recalled session."},',
+      '      recallCooldownMs:{zh:"同类召回触发冷却时间。",en:"Cooldown for repeated recall triggers."}',
+      '    };',
+      '    const LLM_HELP = {',
+      '      llmSummaryMode:{zh:"auto=先机械裁剪，若仍超阈值则独立LLM(已启用)否则内联LLM；session=仅内联LLM；independent=仅独立LLM。",en:"auto=mechanical first, then independent(if enabled) else inline LLM; session=inline only; independent=independent only."},',
+      '      independentLlmEnabled:{zh:"开启后允许调用独立LLM执行发送前LLM总结。",en:"Allow independent LLM for send-time summary."},',
+      '      independentLlmProvider:{zh:"独立LLM提供商协议类型。",en:"Protocol/provider for independent LLM."},',
+      '      independentLlmBaseURL:{zh:"独立LLM接口地址。OpenAI兼容通常填 .../v1。",en:"Base URL for independent LLM endpoint."},',
+      '      independentLlmApiKey:{zh:"独立LLM密钥。仅本地保存到 ~/.opencode/memory/config.json。",en:"API key stored locally in ~/.opencode/memory/config.json."},',
+      '      independentLlmModel:{zh:"独立LLM模型名。留空时可按下面开关跟随当前会话模型。",en:"Model id. Leave empty to use current session model if enabled."},',
+      '      independentLlmUseSessionModel:{zh:"当上面模型名为空时，是否跟随当前会话模型。",en:"Use active session model when model is empty."},',
+      '      independentLlmTimeoutMs:{zh:"独立LLM请求超时。",en:"Request timeout for independent LLM."},',
+      '      independentLlmMaxTokens:{zh:"独立LLM单次总结输出上限。",en:"Max output tokens for one summary call."},',
+      '      independentLlmTemperature:{zh:"独立LLM温度。",en:"Temperature for independent LLM summary."}',
+      '    };',
+      '    const I18N = { zh:{title:"记忆看板",lang:"语言",global:"全局偏好",token:"Token 估算为近似值（chars/4）",generatedLabel:"生成时间",noProjectSelected:"未选择项目",noGlobalPrefs:"暂无全局偏好",noEvents:"暂无事件",compressedSummary:"压缩摘要",compressedBlocks:"压缩块",pretrimTraces:"发送前裁剪轨迹（最近 8 条）",edit:"编辑摘要",del:"删除会话",nos:"暂无会话",noproj:"暂无项目记忆",save:"保存",cancel:"取消",sessions:"会话",tabSessions:"会话页",tabSettings:"参数页",tabLlm:"独立LLM",tabTrash:"回收站",trashTitle:"回收站",trashNone:"暂无回收站条目",trashDelete:"永久删除",trashCleanup:"立即清理过期",trashRetentionLabel:"保留天数",batchDelete:"批量删除",batchSelectFirst:"请先勾选要删除的会话",batchDeleteConfirm:"批量删除 {n} 个会话记忆？将写入审计日志。",pretrimProfileLabel:"裁剪档位",pretrimConservative:"保守",pretrimBalanced:"平衡",pretrimAggressive:"激进",pretrimSave:"保存并立即生效",pretrimCurrent:"当前档位：",pretrimSaved:"已保存，下一次发送前裁剪立即按该档位生效。",settingsTitle:"记忆系统设置",settingsHint:"可视化调节关键机制，保存到本地并持久化。",settingsSave:"保存设置",settingsSaved:"设置已保存，后续请求自动生效。",settingsHelpFoldSummary:"参数说明（默认折叠）",globalPrefsFoldSummary:"全局偏好设置",metricProjects:"项目数",metricSessions:"会话数",metricEvents:"事件数",projectMetaFmt:"会话={sessions} · 事件={events} · 技术栈={tech}",projectListMetaFmt:"会话={sessions} · 事件={events}",sessionStatPrune:"修剪",sessionStatPretrim:"发送前裁剪",sessionStatSaved:"节省",sessionStatBlocks:"压缩块",sessionStatBody:"正文约",sessionStatPretrimLast:"最近发送前裁剪",settingsSendPretrimEnabled:"发送前自动裁剪",settingsSendPretrimBudget:"发送前裁剪预算(token)",settingsSendPretrimTarget:"发送前裁剪目标(token)",settingsVisibleNoticesEnabled:"可见提示",settingsVisibleNoticeForDiscard:"显示裁剪提示",settingsNotificationMode:"通知模式",settingsDcpPrunableToolsEnabled:"注入可裁剪工具列表",settingsDcpMessageIdTagsEnabled:"注入消息ID标签",settingsInjectGlobalPrefsOnSessionStart:"会话开始注入全局偏好",settingsInjectMemoryDocsEnabled:"注入记忆文档",settingsRecallEnabled:"启用跨会话召回",settingsCurrentSummaryEvery:"当前会话摘要注入间隔(用户消息数)",settingsCurrentSummaryTokenBudget:"当前会话摘要预算(token)",settingsRecallTokenBudget:"跨会话召回预算(token)",settingsRecallTopSessions:"跨会话召回会话数",settingsRecallMaxEventsPerSession:"每会话召回事件数",settingsRecallCooldownMs:"跨会话召回冷却(ms)",settingsVisibleNoticeCooldownMs:"可见提示冷却(ms)",llmTitle:"独立LLM总结配置",llmHint:"可选。用于发送前LLM总结阶段，保存后立即生效。",llmSave:"保存LLM配置",llmSaved:"LLM配置已保存，后续请求立即生效。",llmQuickTitle:"独立LLM总结（快捷查看）",llmQuickHint:"当前配置摘要。可在此确认是否启用独立LLM，点击按钮进入完整配置。",llmQuickModeLabel:"模式",llmQuickProviderLabel:"Provider",llmQuickModelLabel:"Model",llmQuickBaseLabel:"BaseURL",llmQuickGo:"打开独立LLM配置页"}, en:{title:"Memory Dashboard",lang:"Language",global:"Global Preferences",token:"Token estimate is approximate (chars/4).",generatedLabel:"Generated",noProjectSelected:"No project selected",noGlobalPrefs:"No global preferences.",noEvents:"No events.",compressedSummary:"compressed summary",compressedBlocks:"compressed blocks",pretrimTraces:"pretrim traces (latest 8)",edit:"Edit summary",del:"Delete session",nos:"No sessions.",noproj:"No project memory yet.",save:"Save",cancel:"Cancel",sessions:"Sessions",tabSessions:"Sessions",tabSettings:"Settings",tabLlm:"LLM",tabTrash:"Trash",trashTitle:"Trash",trashNone:"No trash entries",trashDelete:"Delete Permanently",trashCleanup:"Cleanup Expired",trashRetentionLabel:"Retention Days",batchDelete:"Batch Delete",batchSelectFirst:"Select sessions first",batchDeleteConfirm:"Batch delete {n} session memories? This writes audit logs.",pretrimProfileLabel:"Pretrim Profile",pretrimConservative:"Conservative",pretrimBalanced:"Balanced",pretrimAggressive:"Aggressive",pretrimSave:"Save (effective next send)",pretrimCurrent:"Current profile: ",pretrimSaved:"Saved. Effective for next send pretrim.",settingsTitle:"Memory System Settings",settingsHint:"Tune runtime behaviors with persistent local config.",settingsSave:"Save Settings",settingsSaved:"Settings saved. Effective for next requests.",settingsHelpFoldSummary:"Parameter Explanations (collapsed)",globalPrefsFoldSummary:"Global Preferences",metricProjects:"Projects",metricSessions:"Sessions",metricEvents:"Events",projectMetaFmt:"sessions={sessions} · events={events} · tech={tech}",projectListMetaFmt:"sessions={sessions} · events={events}",sessionStatPrune:"prune",sessionStatPretrim:"pretrim",sessionStatSaved:"saved",sessionStatBlocks:"blocks",sessionStatBody:"body~",sessionStatPretrimLast:"last pretrim",settingsSendPretrimEnabled:"Send-time auto pretrim",settingsSendPretrimBudget:"Send pretrim budget (tokens)",settingsSendPretrimTarget:"Send pretrim target (tokens)",settingsVisibleNoticesEnabled:"Visible notices",settingsVisibleNoticeForDiscard:"Show discard notices",settingsNotificationMode:"Notification mode",settingsDcpPrunableToolsEnabled:"Inject <prunable-tools>",settingsDcpMessageIdTagsEnabled:"Inject message-id tags",settingsInjectGlobalPrefsOnSessionStart:"Inject global prefs on session start",settingsInjectMemoryDocsEnabled:"Inject memory docs",settingsRecallEnabled:"Enable cross-session recall",settingsCurrentSummaryEvery:"Current summary interval (user messages)",settingsCurrentSummaryTokenBudget:"Current summary budget (tokens)",settingsRecallTokenBudget:"Recall budget (tokens)",settingsRecallTopSessions:"Recall top sessions",settingsRecallMaxEventsPerSession:"Recall events per session",settingsRecallCooldownMs:"Recall cooldown (ms)",settingsVisibleNoticeCooldownMs:"Visible notice cooldown (ms)",llmTitle:"Independent LLM Summary",llmHint:"Optional. Used for send-time LLM summary and effective immediately after save.",llmSave:"Save LLM Config",llmSaved:"LLM config saved and effective for next requests.",llmQuickTitle:"Independent LLM Summary (Quick View)",llmQuickHint:"Snapshot of current config. Click to open full LLM settings.",llmQuickModeLabel:"Mode",llmQuickProviderLabel:"Provider",llmQuickModelLabel:"Model",llmQuickBaseLabel:"BaseURL",llmQuickGo:"Open Full LLM Settings"} };',
+      '    function normalizeLang(v){ const s=String(v||"").trim().toLowerCase(); return (s==="zh"||s==="en")?s:"zh"; }',
+      '    let LANG = normalizeLang(localStorage.getItem("memory_dashboard_lang") || "zh");',
       '    const __selectedSessionIDs = new Set();',
       '    const __trashSelectedPaths = new Set();',
       '    let __trashData = { retentionDays:30, entries:[] };',
       '    let __activeProjectName = "";',
-      '    function updateBatchDeleteBtn(){ const b=$("batchDeleteBtn"); if(!b) return; const n=__selectedSessionIDs.size; b.textContent=n>0?("批量删除("+n+")"):"批量删除"; b.disabled=n===0; }',
+      '    function updateBatchDeleteBtn(){ const b=$("batchDeleteBtn"); if(!b) return; const n=__selectedSessionIDs.size; const base=t("batchDelete"); b.textContent=n>0?(base+"("+n+")"):base; b.disabled=n===0; }',
       '    function updateTrashDeleteBtn(){ const b=$("trashDeleteBtn"); if(!b) return; const n=__trashSelectedPaths.size; b.textContent=t("trashDelete")+"(" + n + ")"; b.disabled=n===0; }',
       '    function t(k){ return (I18N[LANG]&&I18N[LANG][k]) || (I18N.en&&I18N.en[k]) || k; }',
+      '    let __activeTab = "sessions";',
+      '    function setActiveTab(tab){ __activeTab=tab; const maps=[["sessions",tabSessionsBtn,paneSessions],["settings",tabSettingsBtn,paneSettings],["llm",tabLlmBtn,paneLlm],["trash",tabTrashBtn,paneTrash]]; maps.forEach(([k,b,p])=>{ if(b) b.classList.toggle("active",k===tab); if(p) p.classList.toggle("active",k===tab); }); }',
       '    function updateMetrics(){',
       '      const gen = DATA && DATA.generatedAt ? new Date(DATA.generatedAt).toLocaleString() : "-";',
-      '      $("genAt").textContent = "Generated: " + gen;',
+      '      $("genAt").textContent = t("generatedLabel") + ": " + gen;',
       '      const s = (DATA && DATA.summary) || {projectCount:0,sessionCount:0,eventCount:0};',
       '      $("mProjects").textContent = s.projectCount || 0;',
       '      $("mSessions").textContent = s.sessionCount || 0;',
@@ -3403,6 +4364,9 @@ export const MemorySystemPlugin = ({ client }) => {
       '        if (r.ok) { DATA = await r.json(); __lastRefreshAt = Date.now(); }',
       '      } catch (_) {}',
       '      updateMetrics();',
+      '      renderSettings();',
+      '      renderLlmSettings();',
+      '      renderLlmQuickSummary();',
       '      renderGlobalPrefs();',
       '      renderProjects();',
       '      await refreshTrashData();',
@@ -3412,18 +4376,28 @@ export const MemorySystemPlugin = ({ client }) => {
       '    function renderTrash(){ const list=$("trashList"); const meta=$("trashMeta"); const sel=$("trashRetentionSel"); if(!list||!meta||!sel) return; const entries=Array.isArray(__trashData.entries)?__trashData.entries:[]; const keep=Number(__trashData.retentionDays||30); sel.value=String(keep); meta.textContent=(LANG==="en"?("Retention "+keep+" days · entries="+entries.length):("保留 "+keep+" 天 · 条目="+entries.length)); if(!entries.length){ list.className="empty"; list.textContent=t("trashNone"); __trashSelectedPaths.clear(); updateTrashDeleteBtn(); return; } list.className=""; list.innerHTML=""; entries.forEach((e)=>{ const row=document.createElement("div"); row.className="trash-row"; const cb=document.createElement("input"); cb.type="checkbox"; cb.checked=__trashSelectedPaths.has(e.path||""); cb.addEventListener("change",(ev)=>{ if(ev.target.checked) __trashSelectedPaths.add(e.path||""); else __trashSelectedPaths.delete(e.path||""); updateTrashDeleteBtn(); }); const box=document.createElement("div"); box.style.display="flex"; box.style.flexDirection="column"; box.style.gap="4px"; const m1=document.createElement("div"); m1.className="meta"; m1.textContent=(e.projectName||"-")+" · "+(e.fileName||"-")+" · "+new Date(e.mtime||Date.now()).toLocaleString()+" · "+(e.size||0)+" bytes"; const m2=document.createElement("div"); m2.className="path"; m2.textContent=e.path||""; box.appendChild(m1); box.appendChild(m2); row.appendChild(cb); row.appendChild(box); list.appendChild(row); }); updateTrashDeleteBtn(); }',
       '    async function cleanupTrashNow(){ const sel=$("trashRetentionSel"); const days=Number(sel&&sel.value||30); if(!window.confirm((LANG==="en"?"Cleanup expired trash with retention ":"按保留期清理过期回收站条目：")+days+(LANG==="en"?" days?":" 天？"))) return; try{ await apiPost("/api/memory/trash/cleanup",{days,confirm:true,source:"dashboard"}); __trashSelectedPaths.clear(); await refreshTrashData(); }catch(e){ alert("Trash cleanup failed: "+e.message);} }',
       '    async function deleteTrashSelected(){ const entries=[...__trashSelectedPaths].filter(Boolean); if(!entries.length) return; if(!window.confirm((LANG==="en"?"Delete selected trash entries permanently? ":"永久删除所选回收站条目？ ")+entries.length)) return; try{ await apiPost("/api/memory/trash/delete",{confirm:true,entries,source:"dashboard"}); __trashSelectedPaths.clear(); await refreshTrashData(); }catch(e){ alert("Trash delete failed: "+e.message);} }',
+      '    function normalizePretrimProfile(v){ const s=String(v||"").trim().toLowerCase(); if(["conservative","balanced","aggressive"].includes(s)) return s; return "balanced"; }',
+      '    function updatePretrimProfileUi(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const v=normalizePretrimProfile(prefs.pretrimProfile||prefs.pretrim_profile||"balanced"); if(pretrimProfileSel) pretrimProfileSel.value=v; const label=(v==="conservative")?t("pretrimConservative"):(v==="aggressive")?t("pretrimAggressive"):t("pretrimBalanced"); if(pretrimProfileHint) pretrimProfileHint.textContent=t("pretrimCurrent")+label; }',
+      '    async function savePretrimProfile(){ if(!pretrimProfileSel) return; const v=normalizePretrimProfile(pretrimProfileSel.value); try{ await apiPost("/api/memory/global/preferences",{key:"pretrimProfile",value:v,confirm:true,source:"dashboard"}); if(pretrimProfileHint) pretrimProfileHint.textContent=t("pretrimSaved"); await refreshDashboardData(); }catch(e){ alert("Save profile failed: "+e.message);} }',
+      '    function getSettingsMap(){ const s=(DATA&&DATA.settings&&DATA.settings.memorySystem)||{}; return (s&&typeof s==="object")?s:{}; }',
+      '    function toBool(v, d){ if(typeof v==="boolean") return v; const s=String(v||"").trim().toLowerCase(); if(["1","true","yes","on"].includes(s)) return true; if(["0","false","no","off"].includes(s)) return false; return d; }',
+      '    function renderSettings(){ if(!settingsForm) return; const map=getSettingsMap(); settingsForm.innerHTML=""; SETTINGS_SCHEMA.forEach((it)=>{ const id="setting_"+it.key; const label=document.createElement("label"); label.htmlFor=id; label.style.fontSize="14px"; label.style.color="#111827"; label.style.fontWeight="600"; label.textContent=(LANG==="zh"?(it.labelZh||""):(it.labelEn||"")) || t("settings"+it.key.charAt(0).toUpperCase()+it.key.slice(1)); let input; if(it.type==="enum"){ input=document.createElement("select"); const options=Array.isArray(it.options)?it.options:[]; const enumZh={off:"关闭",minimal:"简洁",detailed:"详细"}; options.forEach((opt)=>{ const o=document.createElement("option"); o.value=String(opt); o.textContent=LANG==="zh"?(enumZh[String(opt)]||String(opt)):String(opt); input.appendChild(o); }); input.value=String((map[it.key]!==undefined&&map[it.key]!==null)?map[it.key]:it.default); input.style.width="100%"; input.style.height="30px"; } else { input=document.createElement("input"); input.id=id; input.dataset.key=it.key; if(it.type==="bool"){ input.type="checkbox"; input.checked=toBool(map[it.key], Boolean(it.default)); input.style.justifySelf="start"; } else { input.type="number"; if(it.type==="float") input.step=String(it.step||"0.01"); input.value=String((map[it.key]!==undefined&&map[it.key]!==null)?map[it.key]:it.default); input.style.width="100%"; input.style.height="30px"; } } input.id=id; input.dataset.key=it.key; settingsForm.appendChild(label); settingsForm.appendChild(input); const help=SETTINGS_HELP[it.key]||{}; const desc=document.createElement("div"); desc.className="sub"; desc.style.gridColumn="1 / span 2"; desc.style.margin="-2px 0 8px 0"; desc.style.fontSize="12px"; desc.style.color="#6b7280"; desc.textContent=(LANG==="zh"?(help.zh||""):(help.en||"")); settingsForm.appendChild(desc); }); if(settingsHelpBody){ settingsHelpBody.innerHTML=""; } }',
+      '    async function saveSettings(){ if(!settingsForm) return; const patch={}; SETTINGS_SCHEMA.forEach((it)=>{ const el=$("setting_"+it.key); if(!el) return; if(it.type==="bool"){ patch[it.key]=Boolean(el.checked); return; } if(it.type==="enum"){ patch[it.key]=String(el.value||it.default||""); return; } const raw=String(el.value||it.default||0); patch[it.key]=(it.type==="float")?Number.parseFloat(raw):Number(raw); if(!Number.isFinite(patch[it.key])) patch[it.key]=it.default||0; }); try{ await apiPost("/api/memory/settings",{memorySystem:patch,confirm:true,source:"dashboard"}); if(settingsStatus) settingsStatus.textContent=t("settingsSaved"); await refreshDashboardData(); }catch(e){ alert("Save settings failed: "+e.message);} }',
+      '    function renderLlmQuickSummary(){ const map=getSettingsMap(); const mode=String((map.llmSummaryMode!==undefined&&map.llmSummaryMode!==null)?map.llmSummaryMode:"auto"); const provider=String((map.independentLlmProvider!==undefined&&map.independentLlmProvider!==null)?map.independentLlmProvider:"openai_compatible"); const model=String((map.independentLlmModel!==undefined&&map.independentLlmModel!==null)?map.independentLlmModel:""); const base=String((map.independentLlmBaseURL!==undefined&&map.independentLlmBaseURL!==null)?map.independentLlmBaseURL:""); const m=$("llmQuickMode"); const p=$("llmQuickProvider"); const md=$("llmQuickModel"); const b=$("llmQuickBase"); if(m) m.textContent=mode||"-"; if(p) p.textContent=provider||"-"; if(md) md.textContent=model||"-"; if(b) b.textContent=base?"(configured)":"-"; }',
+      '    function renderLlmSettings(){ if(!llmForm) return; const map=getSettingsMap(); llmForm.innerHTML=""; LLM_SCHEMA.forEach((it)=>{ const id="llm_"+it.key; const label=document.createElement("label"); label.htmlFor=id; label.style.fontSize="14px"; label.style.color="#111827"; label.style.fontWeight="600"; label.textContent=(LANG==="zh"?(it.labelZh||""):(it.labelEn||""))||it.key; let input; if(it.type==="enum"){ input=document.createElement("select"); const opts=Array.isArray(it.options)?it.options:[]; const enumZh={auto:"自动",session:"内联",independent:"独立",openai_compatible:"OpenAI兼容",gemini:"Gemini",anthropic:"Anthropic"}; opts.forEach((opt)=>{ const o=document.createElement("option"); o.value=String(opt); o.textContent=LANG==="zh"?(enumZh[String(opt)]||String(opt)):String(opt); input.appendChild(o); }); input.value=String((map[it.key]!==undefined&&map[it.key]!==null)?map[it.key]:it.default); input.style.width="100%"; input.style.height="30px"; } else if(it.type==="bool"){ input=document.createElement("input"); input.type="checkbox"; input.checked=toBool(map[it.key], Boolean(it.default)); input.style.justifySelf="start"; } else if(it.type==="string"){ input=document.createElement("input"); input.type=(it.key.toLowerCase().includes("apikey"))?"password":"text"; input.value=String((map[it.key]!==undefined&&map[it.key]!==null)?map[it.key]:it.default||""); input.style.width="100%"; input.style.height="30px"; } else { input=document.createElement("input"); input.type="number"; if(it.type==="float") input.step=String(it.step||"0.01"); input.value=String((map[it.key]!==undefined&&map[it.key]!==null)?map[it.key]:it.default||0); input.style.width="100%"; input.style.height="30px"; } input.id=id; input.dataset.key=it.key; llmForm.appendChild(label); llmForm.appendChild(input); const help=LLM_HELP[it.key]||{}; const desc=document.createElement("div"); desc.className="sub"; desc.style.gridColumn="1 / span 2"; desc.style.margin="-2px 0 8px 0"; desc.style.fontSize="12px"; desc.style.color="#6b7280"; desc.textContent=(LANG==="zh"?(help.zh||""):(help.en||"")); llmForm.appendChild(desc); }); }',
+      '    async function saveLlmSettings(){ if(!llmForm) return; const patch={}; LLM_SCHEMA.forEach((it)=>{ const el=$("llm_"+it.key); if(!el) return; if(it.type==="bool"){ patch[it.key]=Boolean(el.checked); return; } if(it.type==="enum"||it.type==="string"){ patch[it.key]=String(el.value||it.default||""); return; } const raw=String(el.value||it.default||0); patch[it.key]=(it.type==="float")?Number.parseFloat(raw):Number(raw); if(!Number.isFinite(patch[it.key])) patch[it.key]=it.default||0; }); try{ await apiPost("/api/memory/settings",{memorySystem:patch,confirm:true,source:"dashboard"}); if(llmStatus) llmStatus.textContent=t("llmSaved"); await refreshDashboardData(); }catch(e){ alert("Save LLM settings failed: "+e.message);} }',
       '    async function editSummary(projectName,sessionID,current){ const modal=$("editModal"); const ta=$("editTextarea"); const saveBtn=$("editSaveBtn"); const cancelBtn=$("editCancelBtn"); $("editTitle").textContent=t("edit")+" - "+sessionID; ta.value=current||""; $("editCancelBtn").textContent=t("cancel"); $("editSaveBtn").textContent=t("save"); modal.style.display="flex"; const close=()=>{ modal.style.display="none"; }; cancelBtn.onclick=close; saveBtn.onclick=async()=>{ if(!window.confirm("Apply summary update and write audit log?")) return; try{ await apiPost("/api/memory/session/summary",{projectName,sessionID,summaryText:ta.value,confirm:true,source:"dashboard"}); close(); window.location.reload(); }catch(e){ alert("Update failed: "+e.message);} }; }',
       '    async function deleteSession(projectName,sessionID){ if(!window.confirm("Delete this session memory file? This writes an audit log.")) return; try{ await apiPost("/api/memory/session/delete",{projectName,sessionID,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Delete failed: "+e.message);} }',
-      '    async function batchDeleteSessions(projectName){ const ids=[...__selectedSessionIDs].filter(Boolean); if(!ids.length){ alert("请先勾选要删除的会话"); return; } if(!window.confirm("批量删除 "+ids.length+" 个会话记忆？将写入审计日志。")) return; try{ await apiPost("/api/memory/sessions/delete",{projectName,sessionIDs:ids,confirm:true,source:"dashboard"}); ids.forEach((id)=>__selectedSessionIDs.delete(id)); updateBatchDeleteBtn(); await refreshDashboardData(); }catch(e){ alert("Batch delete failed: "+e.message);} }',
-      '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); const c=$("trashCleanupBtn"); if(c) c.textContent=t("trashCleanup"); updateTrashDeleteBtn(); }',
-      '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); if(!entries.length){globalPrefs.textContent=t("noproj")==="No project memory yet."?"No global preferences.":"暂无全局偏好"; return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
-      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; const _title=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:(s.sessionID||""); sid.textContent=_title+"  id:"+(s.sessionID||""); sid.style.whiteSpace="normal"; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const sp=s.sendPretrim||{}; const spLast=(sp.lastSavedTokens||0)>0?(" · 最近pretrim:"+(sp.lastBeforeTokens||0)+"→"+(sp.lastAfterTokens||0)+" (save~"+(sp.lastSavedTokens||0)+")"):""; const strictNow=(sp.traces&&sp.traces.length&&sp.traces[sp.traces.length-1].strictApplied)?(" · strict:ON("+((sp.traces[sp.traces.length-1].strictReplacedMessages)||0)+")"):""; const risk=(s.alerts&&s.alerts.contextStackRisk)?" · 风险:上下文叠加疑似":""; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · prune:auto\"+(pa.autoRuns||0)+\"/manual\"+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · pretrim:auto\"+(sp.autoRuns||0)+\" saved~\"+(sp.savedTokensTotal||0)+spLast+strictNow+risk+\" · blocks:\"+(((s.summaryBlocks&&s.summaryBlocks.count)||0))+\" · 正文~\"+bt+\" tokens\"; const metaWrap=document.createElement("div"); metaWrap.style.display="flex"; metaWrap.style.flexDirection="column"; metaWrap.style.alignItems="flex-start"; metaWrap.style.gap="4px"; metaWrap.appendChild(sid); metaWrap.appendChild(st); head.appendChild(sel); head.appendChild(metaWrap); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent="No events."; events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } if(s.summaryBlocks&&Array.isArray(s.summaryBlocks.recent)&&s.summaryBlocks.recent.length){ const blk=document.createElement("div"); blk.className="ev"; const bm=document.createElement("div"); bm.className="meta"; bm.textContent="compressed blocks (latest "+s.summaryBlocks.recent.length+")"; const bt=document.createElement("div"); bt.className="txt"; bt.textContent=s.summaryBlocks.recent.map((b)=>`b${b.blockId} | ${b.source||"pretrim"} | m:${b.consumedMessages||0} | ${b.summaryPreview||""}`).join("\n"); blk.appendChild(bm); blk.appendChild(bt); events.appendChild(blk); } if(s.sendPretrim&&Array.isArray(s.sendPretrim.traces)&&s.sendPretrim.traces.length){ const tr=document.createElement("div"); tr.className="ev"; const m=document.createElement("div"); m.className="meta"; m.textContent="pretrim traces (latest 8)"; const t=document.createElement("div"); t.className="txt"; const rows=s.sendPretrim.traces.slice(-8).map((x)=>{ const ts=x.ts?new Date(x.ts).toLocaleString():"-"; const strict=x.strictApplied?(` | strict:${x.strictReplacedMessages||0}`):\"\"; const distill=x.distillUsed?(` | distill:${x.distillProvider||\"\"}/${x.distillModel||\"\"}`):(x.distillStatus?(` | distill-fail:${x.distillStatus}`):\"\"); const strat=((x.strategyDedup||0)||(x.strategySupersedeWrites||0)||(x.strategyPurgedErrors||0)||(x.strategyPhaseTrim||0))?(` | strat:d${x.strategyDedup||0}/s${x.strategySupersedeWrites||0}/p${x.strategyPurgedErrors||0}/ph${x.strategyPhaseTrim||0}`):\"\"; const block=(x.blockId?(` | block:b${x.blockId}`):\"\"); const anchor=x.anchorReplaceApplied?(` | anchor:${x.anchorReplaceMessages||0}/b${x.anchorReplaceBlocks||0}`):\"\"; const comp=(()=>{ const b=x.compositionBefore||{}; const a=x.compositionAfter||{}; const bt=(b.total||0), at=(a.total||0); if(!bt||!at) return \"\"; const pct=(v,t)=>Math.round((100*v)/Math.max(1,t)); return ` | comp S:${pct(b.system||0,bt)}→${pct(a.system||0,at)} U:${pct(b.user||0,bt)}→${pct(a.user||0,at)} T:${pct(b.tool||0,bt)}→${pct(a.tool||0,at)}`; })(); return `${ts} | ${x.beforeTokens||0}→${x.afterTokens||0} | save~${x.savedTokens||0} | rw:${x.rewrittenMessages||0}/${x.rewrittenParts||0} | ex:${x.extractedMessages||0}${strict}${distill}${strat}${block}${anchor}${comp} | ${x.reason||""}`; }); t.textContent=rows.join("\n"); tr.appendChild(m); tr.appendChild(t); events.appendChild(tr); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
-      '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); __activeProjectName=project.name||""; __selectedSessionIDs.clear(); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent="sessions="+project.sessionCount+" · events="+project.totalEvents+" · tech="+ts; const b=$("batchDeleteBtn"); if(b) b.onclick=()=>batchDeleteSessions(project.name); renderSessions(project); updateBatchDeleteBtn(); }',
-      '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent="sessions="+p.sessionCount+" · events="+p.totalEvents; item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
+      '    async function batchDeleteSessions(projectName){ const ids=[...__selectedSessionIDs].filter(Boolean); if(!ids.length){ alert(t("batchSelectFirst")); return; } if(!window.confirm(t("batchDeleteConfirm").replace("{n}", String(ids.length)))) return; try{ await apiPost("/api/memory/sessions/delete",{projectName,sessionIDs:ids,confirm:true,source:"dashboard"}); ids.forEach((id)=>__selectedSessionIDs.delete(id)); updateBatchDeleteBtn(); await refreshDashboardData(); }catch(e){ alert("Batch delete failed: "+e.message);} }',
+      '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); const mpk=$("mProjectsK"); if(mpk) mpk.textContent=t("metricProjects"); const msk=$("mSessionsK"); if(msk) msk.textContent=t("metricSessions"); const mek=$("mEventsK"); if(mek) mek.textContent=t("metricEvents"); if(tabSessionsBtn) tabSessionsBtn.textContent=t("tabSessions"); if(tabSettingsBtn) tabSettingsBtn.textContent=t("tabSettings"); if(tabLlmBtn) tabLlmBtn.textContent=t("tabLlm"); if(tabTrashBtn) tabTrashBtn.textContent=t("tabTrash"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); const gf=$("globalPrefsFoldSummary"); if(gf) gf.textContent=t("globalPrefsFoldSummary"); const sh=$("settingsHelpFoldSummary"); if(sh) sh.textContent=t("settingsHelpFoldSummary"); if(!__activeProjectName) projectTitle.textContent=t("noProjectSelected"); const settingsTitle=$("settingsTitle"); if(settingsTitle) settingsTitle.textContent=t("settingsTitle"); const llmTitle=$("llmTitle"); if(llmTitle) llmTitle.textContent=t("llmTitle"); const llmHint=$("llmHint"); if(llmHint) llmHint.textContent=t("llmHint"); const settingsHint=$("settingsHint"); if(settingsHint) settingsHint.textContent=t("settingsHint"); const settingsSaveBtnEl=$("settingsSaveBtn"); if(settingsSaveBtnEl) settingsSaveBtnEl.textContent=t("settingsSave"); const llmSaveBtnEl=$("llmSaveBtn"); if(llmSaveBtnEl) llmSaveBtnEl.textContent=t("llmSave"); const sessionsTitle=$("sessionsTitle"); if(sessionsTitle) sessionsTitle.textContent=t("sessions"); const trashTitle=$("trashTitle"); if(trashTitle) trashTitle.textContent=t("trashTitle"); const retentionLabel=$("trashRetentionLabel"); if(retentionLabel) retentionLabel.textContent=t("trashRetentionLabel"); const c=$("trashCleanupBtn"); if(c) c.textContent=t("trashCleanup"); const pLabel=$("pretrimProfileLabel"); if(pLabel) pLabel.textContent=t("pretrimProfileLabel"); const llmQuickTitle=$("llmQuickTitle"); if(llmQuickTitle) llmQuickTitle.textContent=t("llmQuickTitle"); const llmQuickHint=$("llmQuickHint"); if(llmQuickHint) llmQuickHint.textContent=t("llmQuickHint"); const llmQuickModeLabel=$("llmQuickModeLabel"); if(llmQuickModeLabel) llmQuickModeLabel.textContent=t("llmQuickModeLabel"); const llmQuickProviderLabel=$("llmQuickProviderLabel"); if(llmQuickProviderLabel) llmQuickProviderLabel.textContent=t("llmQuickProviderLabel"); const llmQuickModelLabel=$("llmQuickModelLabel"); if(llmQuickModelLabel) llmQuickModelLabel.textContent=t("llmQuickModelLabel"); const llmQuickBaseLabel=$("llmQuickBaseLabel"); if(llmQuickBaseLabel) llmQuickBaseLabel.textContent=t("llmQuickBaseLabel"); const goLlmBtnEl=$("goLlmBtn"); if(goLlmBtnEl) goLlmBtnEl.textContent=t("llmQuickGo"); if(pretrimProfileSel&&pretrimProfileSel.options&&pretrimProfileSel.options.length>=3){ pretrimProfileSel.options[0].text=t("pretrimConservative"); pretrimProfileSel.options[1].text=t("pretrimBalanced"); pretrimProfileSel.options[2].text=t("pretrimAggressive"); } const pSave=$("savePretrimProfileBtn"); if(pSave) pSave.textContent=t("pretrimSave"); updateBatchDeleteBtn(); updateTrashDeleteBtn(); renderSettings(); renderLlmSettings(); renderLlmQuickSummary(); }',
+      '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); updatePretrimProfileUi(); if(!entries.length){globalPrefs.textContent=t("noGlobalPrefs"); return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
+      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; const _title=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:(s.sessionID||""); sid.textContent=_title+"  id:"+(s.sessionID||""); sid.style.whiteSpace="normal"; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const sp=s.sendPretrim||{}; const lastTrace=(sp.traces&&sp.traces.length)?sp.traces[sp.traces.length-1]:null; const summaryMode=lastTrace?(lastTrace.distillUsed?(String(lastTrace.distillProvider||"").includes("session-inline")?"LLM总结(内联)":"LLM总结(独立)"):"机械裁剪"):"无"; const spLast=(sp.lastSavedTokens||0)>0?(" · "+t("sessionStatPretrimLast")+":"+(sp.lastBeforeTokens||0)+"→"+(sp.lastAfterTokens||0)+" (save~"+(sp.lastSavedTokens||0)+")"):""; const strictNow=(sp.traces&&sp.traces.length&&sp.traces[sp.traces.length-1].strictApplied)?(" · strict:ON("+((sp.traces[sp.traces.length-1].strictReplacedMessages)||0)+")"):""; const risk=(s.alerts&&s.alerts.contextStackRisk)?" · 风险:上下文叠加疑似":""; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · \"+t(\"sessionStatPrune\")+\":auto\"+(pa.autoRuns||0)+\"/manual\"+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · \"+t(\"sessionStatPretrim\")+\":auto\"+(sp.autoRuns||0)+\" \"+t(\"sessionStatSaved\")+\"~\"+(sp.savedTokensTotal||0)+\" · LLM总结:\"+summaryMode+spLast+strictNow+risk+\" · \"+t(\"sessionStatBlocks\")+\":\"+(((s.summaryBlocks&&s.summaryBlocks.count)||0))+\" · \"+t(\"sessionStatBody\")+bt+\" tokens\"; const metaWrap=document.createElement("div"); metaWrap.style.display="flex"; metaWrap.style.flexDirection="column"; metaWrap.style.alignItems="flex-start"; metaWrap.style.gap="4px"; metaWrap.appendChild(sid); metaWrap.appendChild(st); head.appendChild(sel); head.appendChild(metaWrap); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noEvents"); events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } if(s.summaryBlocks&&Array.isArray(s.summaryBlocks.recent)&&s.summaryBlocks.recent.length){ const blk=document.createElement("div"); blk.className="ev"; const bm=document.createElement("div"); bm.className="meta"; bm.textContent=t("compressedBlocks")+" (latest "+s.summaryBlocks.recent.length+")"; const bt=document.createElement("div"); bt.className="txt"; bt.textContent=s.summaryBlocks.recent.map((b)=>`b${b.blockId} | ${b.source||"pretrim"} | m:${b.consumedMessages||0} | ${b.summaryPreview||""}`).join("\\n"); blk.appendChild(bm); blk.appendChild(bt); events.appendChild(blk); } if(s.sendPretrim&&Array.isArray(s.sendPretrim.traces)&&s.sendPretrim.traces.length){ const tr=document.createElement("div"); tr.className="ev"; const m=document.createElement("div"); m.className="meta"; m.textContent=t("pretrimTraces"); const traceTxt=document.createElement("div"); traceTxt.className="txt"; const rows=s.sendPretrim.traces.slice(-8).map((x)=>{ const ts=x.ts?new Date(x.ts).toLocaleString():"-"; const strict=x.strictApplied?(` | strict:${x.strictReplacedMessages||0}`):\"\"; const llmMode=x.distillUsed?((String(x.distillProvider||\"\").includes(\"session-inline\"))?` | LLM总结(内联):${x.distillModel||\"current-session\"}`:` | LLM总结(独立):${x.distillProvider||\"\"}/${x.distillModel||\"\"}`):((x.distillStatus&&x.distillStatus.includes(\"fail\"))?` | LLM总结失败:${x.distillStatus}`:\" | 机械裁剪\"); const strat=((x.strategyDedup||0)||(x.strategySupersedeWrites||0)||(x.strategyPurgedErrors||0)||(x.strategyPhaseTrim||0))?(` | strat:d${x.strategyDedup||0}/s${x.strategySupersedeWrites||0}/p${x.strategyPurgedErrors||0}/ph${x.strategyPhaseTrim||0}`):\"\"; const block=(x.blockId?(` | block:b${x.blockId}`):\"\"); const anchor=x.anchorReplaceApplied?(` | anchor:${x.anchorReplaceMessages||0}/b${x.anchorReplaceBlocks||0}`):\"\"; const comp=(()=>{ const b=x.compositionBefore||{}; const a=x.compositionAfter||{}; const bt=(b.total||0), at=(a.total||0); if(!bt||!at) return \"\"; const pct=(v,t)=>Math.round((100*v)/Math.max(1,t)); return ` | comp S:${pct(b.system||0,bt)}→${pct(a.system||0,at)} U:${pct(b.user||0,bt)}→${pct(a.user||0,at)} T:${pct(b.tool||0,bt)}→${pct(a.tool||0,at)}`; })(); return `${ts} | ${x.beforeTokens||0}→${x.afterTokens||0} | save~${x.savedTokens||0} | rw:${x.rewrittenMessages||0}/${x.rewrittenParts||0} | ex:${x.extractedMessages||0}${strict}${llmMode}${strat}${block}${anchor}${comp} | ${x.reason||""}`; }); traceTxt.textContent=rows.join("\\n"); tr.appendChild(m); tr.appendChild(traceTxt); events.appendChild(tr); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
+      '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); __activeProjectName=project.name||""; __selectedSessionIDs.clear(); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent=t("projectMetaFmt").replace("{sessions}",String(project.sessionCount||0)).replace("{events}",String(project.totalEvents||0)).replace("{tech}",ts); const b=$("batchDeleteBtn"); if(b) b.onclick=()=>batchDeleteSessions(project.name); renderSessions(project); updateBatchDeleteBtn(); }',
+      '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); projectTitle.textContent=t("noProjectSelected"); projectMeta.textContent=""; const b=$("batchDeleteBtn"); if(b) b.onclick=null; renderSessions(null); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent=t("projectListMetaFmt").replace("{sessions}",String(p.sessionCount||0)).replace("{events}",String(p.totalEvents||0)); item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
       '    let __autoRefreshTimer = null;',
       '    function startAutoRefresh(){ if(__autoRefreshTimer) clearInterval(__autoRefreshTimer); __autoRefreshTimer = setInterval(()=>{ refreshDashboardData(); }, 60000); }',
       '    document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState!=="visible") return; const now=Date.now(); if(now-(__lastRefreshAt||0)>=60000) refreshDashboardData(); });',
-      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=langSel.value; localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); renderTrash(); }; const cleanupBtn=$("trashCleanupBtn"); if(cleanupBtn) cleanupBtn.onclick=cleanupTrashNow; const delBtn=$("trashDeleteBtn"); if(delBtn) delBtn.onclick=deleteTrashSelected; const retentionSel=$("trashRetentionSel"); if(retentionSel) retentionSel.onchange=()=>{ __trashData.retentionDays=Number(retentionSel.value||30); renderTrash(); }; applyLang(); updateTrashDeleteBtn(); refreshDashboardData(); startAutoRefresh();',
+      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=normalizeLang(langSel.value); localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); renderTrash(); }; const cleanupBtn=$("trashCleanupBtn"); if(cleanupBtn) cleanupBtn.onclick=cleanupTrashNow; const delBtn=$("trashDeleteBtn"); if(delBtn) delBtn.onclick=deleteTrashSelected; const retentionSel=$("trashRetentionSel"); if(retentionSel) retentionSel.onchange=()=>{ __trashData.retentionDays=Number(retentionSel.value||30); renderTrash(); }; if(savePretrimProfileBtn) savePretrimProfileBtn.onclick=savePretrimProfile; if(settingsSaveBtn) settingsSaveBtn.onclick=saveSettings; if(llmSaveBtn) llmSaveBtn.onclick=saveLlmSettings; if(goLlmBtn) goLlmBtn.onclick=()=>setActiveTab("llm"); if(tabSessionsBtn) tabSessionsBtn.onclick=()=>setActiveTab("sessions"); if(tabSettingsBtn) tabSettingsBtn.onclick=()=>setActiveTab("settings"); if(tabLlmBtn) tabLlmBtn.onclick=()=>setActiveTab("llm"); if(tabTrashBtn) tabTrashBtn.onclick=()=>setActiveTab("trash"); setActiveTab("sessions"); applyLang(); updateTrashDeleteBtn(); refreshDashboardData(); startAutoRefresh();',
       '  </script>',
       '</body>',
       '</html>'
@@ -3472,7 +4446,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           properties: {
             command: {
               type: 'string',
-              enum: ['learn', 'project', 'global', 'set', 'prefer', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'context', 'stats', 'doctor'],
+              enum: ['learn', 'project', 'global', 'set', 'prefer', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'distill', 'compress', 'context', 'stats', 'doctor'],
               description: 'The memory command to execute'
             },
             args: {
@@ -3505,6 +4479,8 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
             '- discard [session <id>|current] [aggressive]',
             '- extract [session <id>|current] [maxEvents]',
             '- prune [session <id>|current]',
+            '- distill <id:distillation> [id:distillation] ...',
+            '- compress <topic> <summary...>',
             '- context [session <id>|current]',
             '- stats [project|session <id>]',
             '- doctor [session <id>|current]'
@@ -3872,22 +4848,22 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                   enabled: isSendPretrimEnabled(),
                   strictMode: isStrictModeEnabled(),
                   dryRun: AUTO_SEND_PRETRIM_DRY_RUN,
-                  budget: AUTO_SEND_PRETRIM_BUDGET,
-                  target: AUTO_SEND_PRETRIM_TARGET,
+                  budget: getSendPretrimBudget(),
+                  target: getSendPretrimTarget(),
                   stage2Trigger: Math.max(
-                    AUTO_SEND_PRETRIM_TARGET + 200,
+                    getSendPretrimTarget() + 200,
                     Math.min(
-                      Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_HARD_RATIO),
-                      Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_DISTILL_TRIGGER_RATIO)
+                      Math.floor(getSendPretrimBudget() * getSendPretrimHardRatio()),
+                      Math.floor(getSendPretrimBudget() * getSendPretrimDistillTriggerRatio())
                     )
                   ),
-                  turnProtection: AUTO_SEND_PRETRIM_TURN_PROTECTION
+                  turnProtection: getSendPretrimTurnProtection()
                 },
                 strategyConfig: {
                   deduplication: AUTO_STRATEGY_DEDUP_ENABLED,
                   supersedeWrites: AUTO_STRATEGY_SUPERSEDE_WRITES_ENABLED,
                   purgeErrors: AUTO_STRATEGY_PURGE_ERRORS_ENABLED,
-                  purgeErrorTurns: AUTO_STRATEGY_PURGE_ERROR_TURNS,
+                  purgeErrorTurns: getStrategyPurgeErrorTurns(),
                   phaseAwareTrim: true
                 },
                 distillConfig: {
@@ -3941,22 +4917,22 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                   enabled: isSendPretrimEnabled(),
                   strictMode: isStrictModeEnabled(),
                   dryRun: AUTO_SEND_PRETRIM_DRY_RUN,
-                  budget: AUTO_SEND_PRETRIM_BUDGET,
-                  target: AUTO_SEND_PRETRIM_TARGET,
+                  budget: getSendPretrimBudget(),
+                  target: getSendPretrimTarget(),
                   stage2Trigger: Math.max(
-                    AUTO_SEND_PRETRIM_TARGET + 200,
+                    getSendPretrimTarget() + 200,
                     Math.min(
-                      Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_HARD_RATIO),
-                      Math.floor(AUTO_SEND_PRETRIM_BUDGET * AUTO_SEND_PRETRIM_DISTILL_TRIGGER_RATIO)
+                      Math.floor(getSendPretrimBudget() * getSendPretrimHardRatio()),
+                      Math.floor(getSendPretrimBudget() * getSendPretrimDistillTriggerRatio())
                     )
                   ),
-                  turnProtection: AUTO_SEND_PRETRIM_TURN_PROTECTION
+                  turnProtection: getSendPretrimTurnProtection()
                 },
                 strategyConfig: {
                   deduplication: AUTO_STRATEGY_DEDUP_ENABLED,
                   supersedeWrites: AUTO_STRATEGY_SUPERSEDE_WRITES_ENABLED,
                   purgeErrors: AUTO_STRATEGY_PURGE_ERRORS_ENABLED,
-                  purgeErrorTurns: AUTO_STRATEGY_PURGE_ERROR_TURNS,
+                  purgeErrorTurns: getStrategyPurgeErrorTurns(),
                   phaseAwareTrim: true
                 },
                 distillConfig: {
@@ -4024,8 +5000,24 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                 + Number(inject.triggerRecallCount || 0)
                 + Number(inject.memoryDocsCount || 0);
               const lastTrace = Array.isArray(sp.traces) && sp.traces.length ? sp.traces[sp.traces.length - 1] : null;
+              const distillRuns = Array.isArray(sp.traces)
+                ? sp.traces.filter((t) => Boolean(t?.distillUsed)).length
+                : 0;
+              const pretrimBudget = getSendPretrimBudget();
+              const pretrimTarget = getSendPretrimTarget();
+              const hardLimit = Math.floor(pretrimBudget * getSendPretrimHardRatio());
+              const distillTrigger = Math.floor(pretrimBudget * getSendPretrimDistillTriggerRatio());
+              const stage2Limit = Math.max(pretrimTarget + 200, Math.min(hardLimit, distillTrigger));
               const payload = {
                 sessionID: sid,
+                policy: {
+                  currentSummaryRefreshEveryUserMessages: getCurrentSessionRefreshEvery(),
+                  currentSummaryTokenBudget: getCurrentSessionSummaryTokenBudget(),
+                  pretrimBudget,
+                  pretrimTarget,
+                  pretrimStage2DistillTrigger: stage2Limit,
+                  pretrimDistillMode: getDistillMode()
+                },
                 injected: {
                   happened: injectedCount > 0,
                   total: injectedCount,
@@ -4043,11 +5035,13 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                 },
                 pretrim: {
                   happened: Number(sp.autoRuns || 0) + Number(sp.manualRuns || 0) > 0,
+                  profile: getPretrimProfile(),
                   strictModeEnabled: isStrictModeEnabled(),
                   suppressCurrentSummaryNow: shouldSuppressCurrentSummaryInjection(sid, projectName),
                   autoRuns: Number(sp.autoRuns || 0),
                   manualRuns: Number(sp.manualRuns || 0),
                   savedTokensTotal: Number(sp.savedTokensTotal || 0),
+                  distillRuns,
                   last: lastTrace ? {
                     at: lastTrace.ts || null,
                     beforeTokens: Number(lastTrace.beforeTokens || 0),
@@ -4063,6 +5057,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                     strategySupersedeWrites: Number(lastTrace.strategySupersedeWrites || 0),
                     strategyPurgedErrors: Number(lastTrace.strategyPurgedErrors || 0),
                     strategyPhaseTrim: Number(lastTrace.strategyPhaseTrim || 0),
+                    pretrimProfile: String(lastTrace.pretrimProfile || getPretrimProfile()),
                     adaptiveLevel: Number(lastTrace.adaptiveLevel || 0),
                     adaptiveRatio: Number(lastTrace.adaptiveRatio || 0),
                     anchorReplaceApplied: Boolean(lastTrace.anchorReplaceApplied),
@@ -4111,7 +5106,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
               const sess = loadSessionMemory(sid, projectName);
               const res = discardLowValueToolEvents(sess, {
                 keepRecent: aggressive ? 4 : AUTO_DISCARD_KEEP_RECENT_TOOL_EVENTS,
-                maxRemovals: aggressive ? 60 : AUTO_DISCARD_MAX_REMOVALS_PER_PASS
+                maxRemovals: aggressive ? 60 : getDiscardMaxRemovalsPerPass()
               });
               const c = compactConversationByBudget(sess) || { extracted: 0 };
               const est = estimateBodyTokens(sess);
@@ -4123,7 +5118,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
               });
               persistSessionMemory(sess, projectName);
               writeDashboardFiles();
-              if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && (res.removed || 0) > 0) {
+              if (getVisibleNoticeForDiscard() && (res.removed || 0) > 0) {
                 await emitVisibleNotice(
                   sid,
                   `已裁剪 ${res.removed} 条低信号工具输出，正文估算 ~${est} tokens`,
@@ -4135,7 +5130,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
 
             case 'extract': {
               let targetSessionID = '';
-              let maxEvents = AUTO_EXTRACT_EVENTS_PER_PASS;
+              let maxEvents = getExtractEventsPerPass();
               if (!args.length || args[0] === 'current') {
                 targetSessionID = '';
                 if (args[1] && /^\d+$/.test(args[1])) maxEvents = Number(args[1]);
@@ -4161,10 +5156,10 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
               });
               persistSessionMemory(sess, projectName);
               writeDashboardFiles();
-              if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && (res.extracted || 0) > 0) {
+              if (getVisibleNoticeForDiscard() && (res.extracted || 0) > 0) {
                 await emitVisibleNotice(
                   sid,
-                  `已蒸馏 ${res.extracted} 条历史对话到结构化摘要，正文估算 ~${est} tokens`,
+                  `已做LLM总结 ${res.extracted} 条历史对话到结构化摘要，正文估算 ~${est} tokens`,
                   'extract:manual'
                 );
               }
@@ -4174,29 +5169,46 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
             case 'prune': {
               let targetSessionID = '';
               if (args[0] === 'session') targetSessionID = args[1] || '';
-              const sid = targetSessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
-              if (!sid) return 'No active session id found. Use: /memory prune session <id>';
-              const sess = loadSessionMemory(sid, projectName);
-              const d = discardLowValueToolEvents(sess);
-              const e = extractSessionContext(sess);
-              const c = compactConversationByBudget(sess) || { extracted: 0 };
-              const est = estimateBodyTokens(sess);
-              recordPruneAudit(sess, {
-                source: 'manual-prune',
-                discardRemoved: Number(d.removed || 0),
-                extractMoved: Number(e.extracted || 0) + Number(c.extracted || 0),
-                estimatedTokens: est
-              });
-              persistSessionMemory(sess, projectName);
-              writeDashboardFiles();
-              if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && ((d.removed || 0) > 0 || (e.extracted || 0) > 0)) {
+              const res = executePruneForSession(targetSessionID, projectName, 'manual-prune');
+              if (!res.ok) return res.message;
+              if (getVisibleNoticeForDiscard() && ((res.discardRemoved || 0) > 0 || (res.extractMoved || 0) > 0)) {
                 await emitVisibleNotice(
-                  sid,
-                  `已执行裁剪：discard=${d.removed || 0}，extract=${e.extracted || 0}，正文估算 ~${est} tokens`,
+                  res.sessionID,
+                  `已执行裁剪：discard=${res.discardRemoved || 0}，extract=${res.extractMoved || 0}，正文估算 ~${res.estimatedTokens} tokens`,
                   'prune:manual'
                 );
               }
-              return `Prune completed for ${sid}: discard=${d.removed || 0}, extract=${e.extracted || 0}, estBodyTokens=${est}`;
+              return `Prune completed for ${res.sessionID}: discard=${res.discardRemoved || 0}, extract=${res.extractMoved || 0}, estBodyTokens=${res.estimatedTokens}`;
+            }
+
+            case 'distill': {
+              if (!args.length) return 'Usage: /memory distill <id:distillation> [id:distillation] ...';
+              const targets = [];
+              for (const raw of args) {
+                const item = String(raw || '');
+                const idx = item.indexOf(':');
+                if (idx <= 0) continue;
+                const id = item.slice(0, idx).trim();
+                const distillation = item.slice(idx + 1).trim();
+                if (id && distillation) targets.push({ id, distillation });
+              }
+              if (!targets.length) return 'Usage: /memory distill <id:distillation> [id:distillation] ...';
+              const res = executeDistillForSession({ targets, projectName });
+              if (!res.ok) return res.message;
+              return `Distill completed for ${res.sessionID}: targets=${res.targets}, blockAdded=${res.blockAdded}, blockId=${res.blockId}, blocks(before=${res.debugBlocksBeforePersist},after=${res.debugBlocksAfterPersist}), estBodyTokens=${res.estimatedTokens}`;
+            }
+
+            case 'compress': {
+              if (args.length < 2) return 'Usage: /memory compress <topic> <summary...>';
+              const topic = args[0];
+              const summary = args.slice(1).join(' ');
+              const res = executeCompressForSession({
+                topic,
+                content: { summary },
+                projectName
+              });
+              if (!res.ok) return res.message;
+              return `Compress completed for ${res.sessionID}: topic=${res.topic}, blockAdded=${res.blockAdded}, blockId=${res.blockId}, blocks(after=${res.debugBlocksAfterPersist}), estBodyTokens=${res.estimatedTokens}`;
             }
 
             case 'recall': {
@@ -4208,7 +5220,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                 maxSessions: 3,
                 maxEventsPerSession: 5,
                 maxChars: 2200,
-                tokenBudget: AUTO_RECALL_TOKEN_BUDGET
+                tokenBudget: getRecallTokenBudget()
               });
 
               if (!text || !hits.length) return `No relevant memory found for query: ${query}`;
@@ -4299,7 +5311,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           const sess = loadSessionMemory(sid, projectName);
           const d = discardLowValueToolEvents(sess, {
             keepRecent: aggressive ? 4 : AUTO_DISCARD_KEEP_RECENT_TOOL_EVENTS,
-            maxRemovals: aggressive ? 60 : AUTO_DISCARD_MAX_REMOVALS_PER_PASS
+            maxRemovals: aggressive ? 60 : getDiscardMaxRemovalsPerPass()
           });
           const c = compactConversationByBudget(sess) || { extracted: 0 };
           const est = estimateBodyTokens(sess);
@@ -4311,7 +5323,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           });
           persistSessionMemory(sess, projectName);
           writeDashboardFiles();
-          if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && (d.removed || 0) > 0) {
+          if (getVisibleNoticeForDiscard() && (d.removed || 0) > 0) {
             await emitVisibleNotice(
               sid,
               `已裁剪 ${d.removed} 条低信号工具输出，正文估算 ~${est} tokens`,
@@ -4330,12 +5342,12 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
             maxEvents: { type: 'number' }
           }
         },
-        execute: async ({ sessionID = '', maxEvents = AUTO_EXTRACT_EVENTS_PER_PASS } = {}) => {
+        execute: async ({ sessionID = '', maxEvents = getExtractEventsPerPass() } = {}) => {
           const projectName = getProjectName();
           const sid = sessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
           if (!sid) return 'No active session id found.';
           const sess = loadSessionMemory(sid, projectName);
-          const e = extractSessionContext(sess, { maxExtract: Number(maxEvents || AUTO_EXTRACT_EVENTS_PER_PASS) });
+          const e = extractSessionContext(sess, { maxExtract: Number(maxEvents || getExtractEventsPerPass()) });
           const c = compactConversationByBudget(sess) || { extracted: 0 };
           const est = estimateBodyTokens(sess);
           recordPruneAudit(sess, {
@@ -4346,21 +5358,94 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           });
           persistSessionMemory(sess, projectName);
           writeDashboardFiles();
-          if (AUTO_VISIBLE_NOTICE_FOR_DISCARD && (e.extracted || 0) > 0) {
+          if (getVisibleNoticeForDiscard() && (e.extracted || 0) > 0) {
             await emitVisibleNotice(
               sid,
-              `已蒸馏 ${e.extracted} 条历史对话到结构化摘要，正文估算 ~${est} tokens`,
+              `已做LLM总结 ${e.extracted} 条历史对话到结构化摘要，正文估算 ~${est} tokens`,
               'extract:tool'
             );
           }
           return `extract ok: session=${sid}, extracted=${e.extracted || 0}, estBodyTokens=${est}`;
         }
+      },
+      prune: defineTool({
+        description: 'DCP-style prune entry: discard low-value tool outputs and extract older context',
+        args: {
+          sessionID: defineTool.schema.string().optional()
+        },
+        async execute({ sessionID = '' } = {}) {
+          const res = executePruneForSession(sessionID, getProjectName(), 'tool-prune');
+          if (!res.ok) return res.message;
+          return `prune ok: session=${res.sessionID}, discard=${res.discardRemoved}, extract=${res.extractMoved}, estBodyTokens=${res.estimatedTokens}`;
+        }
+      }),
+      distill: defineTool({
+        description: 'DCP-style distill: provide high-fidelity distillation per target id from <prunable-tools>',
+        args: {
+          sessionID: defineTool.schema.string().optional(),
+          targets: defineTool.schema.array(
+            defineTool.schema.object({
+              id: defineTool.schema.string().describe('Numeric/anchor ID in prunable scope'),
+              distillation: defineTool.schema.string().describe('High-fidelity technical distillation text')
+            })
+          )
+        },
+        async execute({ sessionID = '', targets = [] } = {}) {
+          const res = executeDistillForSession({ sessionID, targets, projectName: getProjectName() });
+          if (!res.ok) return res.message;
+          return `distill ok: session=${res.sessionID}, targets=${res.targets}, blockAdded=${res.blockAdded}, blockId=${res.blockId}, blocks(before=${res.debugBlocksBeforePersist},after=${res.debugBlocksAfterPersist}), estBodyTokens=${res.estimatedTokens}`;
+        }
+      }),
+      compress: defineTool({
+        description: 'DCP-style compress: replace a finished phase with a dense technical summary',
+        args: {
+          sessionID: defineTool.schema.string().optional(),
+          topic: defineTool.schema.string(),
+          content: defineTool.schema.object({
+            startId: defineTool.schema.string().optional(),
+            endId: defineTool.schema.string().optional(),
+            summary: defineTool.schema.string()
+          })
+        },
+        async execute({ sessionID = '', topic = '', content = {} } = {}) {
+          const res = executeCompressForSession({ sessionID, topic, content, projectName: getProjectName() });
+          if (!res.ok) return res.message;
+          return `compress ok: session=${res.sessionID}, topic=${res.topic}, blockAdded=${res.blockAdded}, blockId=${res.blockId}, blocks(after=${res.debugBlocksAfterPersist}), estBodyTokens=${res.estimatedTokens}`;
+        }
+      })
+    },
+    config: async (opencodeConfig = {}) => {
+      try {
+        const toolsToAdd = ['distill', 'compress', 'prune'];
+        const existingPrimary = Array.isArray(opencodeConfig?.experimental?.primary_tools)
+          ? opencodeConfig.experimental.primary_tools
+          : [];
+        const mergedPrimary = [...new Set([...existingPrimary, ...toolsToAdd])];
+        opencodeConfig.experimental = {
+          ...(opencodeConfig.experimental || {}),
+          primary_tools: mergedPrimary
+        };
+
+        const currentPerm = opencodeConfig.permission && typeof opencodeConfig.permission === 'object'
+          ? opencodeConfig.permission
+          : {};
+        opencodeConfig.permission = {
+          ...currentPerm,
+          distill: currentPerm.distill || 'allow',
+          compress: currentPerm.compress || 'allow',
+          prune: currentPerm.prune || 'allow'
+        };
+      } catch (err) {
+        console.error('memory-system config mutation failed:', err);
       }
     },
     "experimental.chat.messages.transform": async (_input, output) => {
       try {
         const messages = Array.isArray(output?.messages) ? output.messages : [];
         if (!messages.length) return;
+        clearInjectedHintParts(messages);
+        injectMessageIdTags(messages);
+        injectPrunableToolsHint(messages);
 
         const sid = inferSessionIDFromMessages(messages);
         let lastUser = null;

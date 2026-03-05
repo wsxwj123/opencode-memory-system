@@ -7,6 +7,7 @@
 - 自动保存会话记忆到本地 JSON 文件
 - 按需做跨会话召回（减少上下文污染）
 - 提供可编辑记忆的可视化页面（`37777`）
+- 前端新增“独立LLM”同级页面，可直接配置 LLM 总结 provider/baseURL/apiKey/model
 - 与 OpenCode 启停联动（OpenCode 启动则面板启动，OpenCode 关闭则面板自动停止）
 
 ---
@@ -120,7 +121,7 @@ mv ~/.config/opencode/plugins/chinese-settings.js ~/.config/opencode/plugins/chi
 - `/memory clear session <id>`：删除某个 session 记忆
 - `/memory clear sessions <id1,id2,...>`：批量删除多个 session 记忆
 - `/memory discard [session <id>|current] [aggressive]`：清理低信号工具噪音
-- `/memory extract [session <id>|current] [maxEvents]`：把旧正文蒸馏进摘要
+- `/memory extract [session <id>|current] [maxEvents]`：把旧正文LLM总结进摘要
 - `/memory prune [session <id>|current]`：执行组合裁剪
 - `/memory dashboard`：重建 dashboard 数据
 
@@ -136,18 +137,19 @@ mv ~/.config/opencode/plugins/chinese-settings.js ~/.config/opencode/plugins/chi
 - 策略是两阶段：
   - 阶段 1：低信号内容替换（pending/running/噪音工具输出）
   - 阶段 2：替换式摘要锚点（把旧历史折叠成一段摘要，而不是简单追加）
-    - 会先做“候选区间评分”（结果/失败/路径加权，pending/running 降权），再选连续区间做蒸馏，避免把不相关片段混在一起
+    - 会先做“候选区间评分”（结果/失败/路径加权，pending/running 降权），再选连续区间做LLM总结，避免把不相关片段混在一起
     - 新增 block 占位追踪：每次范围压缩会生成 `bN` 记录（含起止消息、消耗条目数、摘要）
     - 摘要头会携带本次预测 block 编号（如 `pretrim-distill b7`），便于和 `summaryBlocks` 审计对齐
-- 默认是 DCP 风格（无需额外配置）：
-  - `auto` 模式（默认）：优先用独立 distill（若已配置），否则自动回退到 `session` 内联蒸馏
-  - `session` 模式：在发送前用当前会话上下文做结构化蒸馏替换（无需额外 key/base_url）
+- 默认是 DCP 兼容风格（无需额外配置）：
+  - 永远先机械裁剪（阶段1），只有“仍超阈值”才进入LLM总结（阶段2）
+  - `auto` 模式（默认）：若已手动开启并配置独立LLM则走独立LLM，否则走 `session` 内联LLM总结
+  - `session` 模式：在发送前用当前会话上下文做结构化LLM总结替换（无需额外 key/base_url）
 - 新增“替换闭环”：
   - 当仍超预算且已有 `bN` 压缩块时，会启用 `anchor-replace`，把旧 assistant/tool 原始轨迹替换为“compressed blocks anchor”，避免 A+B+C 叠加
 - 新增“自适应策略”：
   - 根据本次发送前 token/budget 比例自动调节裁剪强度（rewrite 上限、保护窗口、phase-aware trim）
   - phase-aware trim 会优先压缩 discovery/verify/network 类工具输出，保守保留 modify 类输出
-- 可选“独立 Distill LLM”增强：
+- 可选“独立 Distill LLM”增强（手动开启后才会在 auto 模式优先使用）：
   - 仅当你显式设置 `OPENCODE_MEMORY_DISTILL_MODE=independent` 时启用
   - 启用后优先用独立模型生成高保真摘要
   - 若失败，自动回退到 `session` 模式或机械提炼（不阻塞主会话）
@@ -173,11 +175,11 @@ OPENCODE_MEMORY_DISTILL_TEMPERATURE=0.2
 
 查看是否生效：
 
-- `/memory doctor current` 看 `pretrim.last.distillUsed/distillStatus`
+- `/memory doctor current` 看 `pretrim.last.distillUsed/distillStatus`（判断是否用了LLM总结、是否失败回退）
 - `/memory doctor current` 看 `pretrim.last.anchorReplaceApplied/anchorReplaceMessages`
 - `/memory doctor current` 看 `pretrim.last.adaptiveLevel/adaptiveRatio`
 - `/memory doctor current` 看 `pretrim.last.compositionBefore/compositionAfter`（system/user/tool 占比）
-- `/memory context current` 看 `distillConfig.mode`
+- `/memory context current` 看 `llmSummaryConfig.mode`
 - `/memory doctor current` 的 `blocks.latest` 可看到最近一次 `bN`
 - `37777` 页面会显示 `blocks` 计数与最近 block 摘要，并在 block 预览里展示 `range:start->end` 与 `save~tokens`
 - `37777` 的 `pretrim traces` 行会显示 `comp S/U/T` 百分比（发送前后 system/user/tool 占比变化）
@@ -274,16 +276,24 @@ OPENCODE_MEMORY_DISTILL_TEMPERATURE=0.2
 
 #### 8.8 自检命令（推荐）
 
-仓库内置仿真自检脚本（覆盖 system/MCP/tool 噪声裁剪与 doctor 诊断）：
+仓库内置最小回归脚本（6场景）：
 
 ```bash
-node scripts/selfcheck.mjs
+node scripts/minimal_regression_suite.mjs
 ```
 
 通过标准：
-- 输出包含 `SELFTEST PASS`
-- 包含 `pretrim reduced tokens (before -> after)`
-- 包含 `system message preserved`
+- 依次输出 6 个场景：
+  - 无触发
+  - 机械裁剪触发
+  - 内联LLM触发
+  - 内联LLM触发失败并回退
+  - 独立LLM触发
+  - 独立LLM触发失败并回退
+
+失败并回退的典型触发条件：
+- 内联LLM失败：当前会话 provider/model 不可用、接口超时、HTTP 非 2xx、返回空文本或低质量摘要。
+- 独立LLM失败：`independentLlmEnabled=true` 但 baseURL/key/model 缺失或错误，或接口超时/HTTP 非 2xx。
 
 ---
 
@@ -341,6 +351,7 @@ Typical paths:
 - Dashboard: `http://127.0.0.1:37777`
 - Stop OpenCode -> dashboard stops in ~10-20s
 - Dashboard auto-refresh interval: `60s` (tab-focus refresh only if >=60s since last refresh)
+- Dashboard tabs: `Sessions` / `Settings` / `Independent LLM` / `Trash`
 - Dashboard data source is dynamic: `/api/dashboard` (not static-only snapshot rendering)
 
 ### 4. Commands
@@ -356,17 +367,18 @@ Typical paths:
 - `/memory prune [session <id>|current]`
 - `/memory dashboard`
 
-### 4.1 Send-time pretrim + distill modes (new)
+### 4.1 Send-time pretrim + LLM summary modes (new)
 
 - Pretrim runs before sending messages to reduce prompt size.
 - Stage 1 rewrites low-signal content.
 - Stage 2 performs replacement-style anchor compaction (replace old history with one distilled anchor, not append-only).
-- Default is `auto` (DCP-style):
-  - `auto`: prefer independent distill when configured, otherwise fallback to `session` inline distill.
-  - `session`: inline structured distillation in transform path.
+- Default is `auto` (DCP-compatible):
+  - Mechanical trim always runs first.
+  - If still over threshold: use independent LLM only when explicitly enabled/configured; otherwise use session-inline LLM summary.
+  - `session`: inline structured LLM summary in transform path.
 - Replacement loop:
   - If still over budget and there are existing `bN` blocks, plugin applies `anchor-replace` to substitute older assistant/tool traces with a compact block anchor.
-- Optional independent distill:
+- Optional independent LLM summary:
   - Set `OPENCODE_MEMORY_DISTILL_MODE=independent` and provide provider config.
   - On failure/misconfiguration, plugin falls back to session mode or deterministic extraction.
 - Quality gate is enforced before replacement (too-short/no-structure/missing key path => fallback).
@@ -392,7 +404,7 @@ OPENCODE_MEMORY_DISTILL_TEMPERATURE=0.2
 Verification:
 
 - `/memory doctor current` -> `pretrim.last.distillUsed/distillStatus`
-- `/memory context current` -> `distillConfig`
+- `/memory context current` -> `llmSummaryConfig`
 
 ### 5. Runtime data paths
 
