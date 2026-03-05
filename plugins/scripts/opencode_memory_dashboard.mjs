@@ -11,12 +11,15 @@ const port = Number(process.argv[3] || 37777);
 const isServeMode = action === 'serve';
 const parentPidArg = Number(process.argv[4] || 0);
 const opencodePortArg = Number(process.argv[5] || 4096);
+const watchdogIntervalMs = Math.max(500, Number(process.env.OPENCODE_MEMORY_DASHBOARD_WATCHDOG_INTERVAL_MS || 10000));
+const watchdogMaxMiss = Math.max(2, Number(process.env.OPENCODE_MEMORY_DASHBOARD_WATCHDOG_MAX_MISS || 12));
 const thisFile = fileURLToPath(import.meta.url);
 
 const home = os.homedir();
 const isWindows = process.platform === 'win32';
 const memoryDir = path.join(home, '.opencode', 'memory');
 const projectsDir = path.join(memoryDir, 'projects');
+const globalMemoryPath = path.join(memoryDir, 'global.json');
 const dashboardDir = path.join(home, '.opencode', 'memory', 'dashboard');
 const indexPath = path.join(dashboardDir, 'index.html');
 const dataPath = path.join(dashboardDir, 'data.json');
@@ -58,15 +61,29 @@ function writeJson(p, obj) {
 
 function readMemoryConfig() {
   const cfg = safeReadJson(memoryConfigPath);
-  if (!cfg || typeof cfg !== 'object') return { trashRetentionDays: DEFAULT_RETENTION_DAYS };
+  if (!cfg || typeof cfg !== 'object') return { trashRetentionDays: DEFAULT_RETENTION_DAYS, memorySystem: {} };
   const raw = Number(cfg.trashRetentionDays || DEFAULT_RETENTION_DAYS);
   const days = RETENTION_OPTIONS.has(raw) ? raw : DEFAULT_RETENTION_DAYS;
-  return { ...cfg, trashRetentionDays: days };
+  const memorySystem = cfg.memorySystem && typeof cfg.memorySystem === 'object' ? cfg.memorySystem : {};
+  return { ...cfg, trashRetentionDays: days, memorySystem };
 }
 
 function getTrashRetentionDays() {
   const cfg = readMemoryConfig();
   return Number(cfg.trashRetentionDays || DEFAULT_RETENTION_DAYS);
+}
+
+function getMemorySystemSettings() {
+  const cfg = readMemoryConfig();
+  return cfg.memorySystem && typeof cfg.memorySystem === 'object' ? cfg.memorySystem : {};
+}
+
+function updateMemorySystemSettings(patch = {}) {
+  const cfg = readMemoryConfig();
+  const current = cfg.memorySystem && typeof cfg.memorySystem === 'object' ? cfg.memorySystem : {};
+  cfg.memorySystem = { ...current, ...patch };
+  writeJson(memoryConfigPath, cfg);
+  return cfg.memorySystem;
 }
 
 function listTrashEntries() {
@@ -164,6 +181,14 @@ function appendAudit(entry) {
 function sendJson(res, status, payload) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload));
+}
+
+function readGlobalMemory() {
+  const gm = safeReadJson(globalMemoryPath);
+  if (!gm || typeof gm !== 'object') return { preferences: {}, snippets: {} };
+  if (!gm.preferences || typeof gm.preferences !== 'object') gm.preferences = {};
+  if (!gm.snippets || typeof gm.snippets !== 'object') gm.snippets = {};
+  return gm;
 }
 
 function normalizeText(value) {
@@ -351,6 +376,9 @@ function buildLiveDashboardData() {
   const global = (safeReadJson(path.join(memoryDir, 'global.json')) || {});
   const data = {
     generatedAt: new Date().toISOString(),
+    settings: {
+      memorySystem: getMemorySystemSettings()
+    },
     global: {
       preferences: global?.preferences && typeof global.preferences === 'object' ? global.preferences : {},
       snippets: global?.snippets && typeof global.snippets === 'object' ? global.snippets : {},
@@ -655,20 +683,24 @@ function serve() {
   const opencodePort = opencodePortArg > 0 ? opencodePortArg : 4096;
   let miss = 0;
   const watchdog = setInterval(async () => {
-    const byPort = await isTcpPortListening(opencodePort);
+    // Prefer process-based liveness over raw port check:
+    // raw port check can be false-positive when another app reuses the port.
+    // Keep port as weak fallback only.
+    const byProcess = isOpencodeRunning();
     const byParent = parentPid > 0 ? isPidAlive(parentPid) : false;
-    const alive = byParent || byPort;
+    const byPort = await isTcpPortListening(opencodePort);
+    const alive = byParent || byProcess || (byPort && byProcess);
     if (alive) {
       miss = 0;
       return;
     }
     miss += 1;
-    if (miss >= 12) {
+    if (miss >= watchdogMaxMiss) {
       clearInterval(trashGcTimer);
       clearInterval(watchdog);
       process.exit(0);
     }
-  }, 10000);
+  }, watchdogIntervalMs);
 
   const server = http.createServer(async (req, res) => {
     const method = (req.method || 'GET').toUpperCase();
@@ -685,6 +717,33 @@ function serve() {
         retentionDays: getTrashRetentionDays(),
         entries: listTrashEntries()
       });
+      return;
+    }
+
+    if (method === 'GET' && rawPath === '/api/memory/settings') {
+      sendJson(res, 200, { memorySystem: getMemorySystemSettings() });
+      return;
+    }
+
+    if (method === 'POST' && rawPath === '/api/memory/settings') {
+      try {
+        const body = await readJsonBody(req);
+        if (!body?.confirm) {
+          sendJson(res, 400, { error: 'confirm=true required' });
+          return;
+        }
+        const patch = body?.memorySystem && typeof body.memorySystem === 'object' ? body.memorySystem : {};
+        const settings = updateMemorySystemSettings(patch);
+        appendAudit({
+          action: 'update_memory_settings',
+          source: body?.source || 'dashboard',
+          keys: Object.keys(patch || {})
+        });
+        const live = buildLiveDashboardData();
+        sendJson(res, 200, { ok: true, settings, dashboard: live.settings || {} });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || String(err) });
+      }
       return;
     }
 
@@ -857,6 +916,36 @@ function serve() {
           legacyRemoved,
           deletedPaths
         });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || String(err) });
+      }
+      return;
+    }
+
+    if (method === 'POST' && rawPath === '/api/memory/global/preferences') {
+      try {
+        const body = await readJsonBody(req);
+        if (!body?.confirm) {
+          sendJson(res, 400, { error: 'confirm=true required' });
+          return;
+        }
+        const key = normalizeText(String(body.key || ''));
+        const value = String(body.value || '').trim();
+        if (!key) {
+          sendJson(res, 400, { error: 'key is required' });
+          return;
+        }
+        const gm = readGlobalMemory();
+        gm.preferences[key] = value;
+        writeJson(globalMemoryPath, gm);
+        appendAudit({
+          action: 'update_global_preference',
+          source: body.source || 'dashboard',
+          key,
+          value: truncateText(value, 120)
+        });
+        const live = buildLiveDashboardData();
+        sendJson(res, 200, { ok: true, key, value, global: live.global });
       } catch (err) {
         sendJson(res, 500, { error: err?.message || String(err) });
       }

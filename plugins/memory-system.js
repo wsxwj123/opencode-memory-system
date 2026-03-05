@@ -33,7 +33,7 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_SEND_PRETRIM_HARD_RATIO = 0.9;
   const AUTO_SEND_PRETRIM_DISTILL_TRIGGER_RATIO = 0.8;
   const AUTO_SEND_PRETRIM_TRACE_LIMIT = 25;
-  const AUTO_SEND_PRETRIM_TURN_PROTECTION = 4;
+  const AUTO_SEND_PRETRIM_TURN_PROTECTION = 10;
   const AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES = 28;
   const AUTO_SEND_PRETRIM_PROTECTED_TOOLS = ['write', 'edit', 'bash', 'read'];
   const AUTO_STRATEGY_DEDUP_ENABLED = true;
@@ -4240,7 +4240,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '      { key:"sendPretrimHardRatio", type:"float", default:0.9, step:"0.01", labelZh:"硬阈值比例(0-1)", labelEn:"Hard ratio (0-1)" },',
       '      { key:"sendPretrimDistillTriggerRatio", type:"float", default:0.8, step:"0.01", labelZh:"LLM总结触发比例(0-1)", labelEn:"Distill trigger ratio (0-1)" },',
       '      { key:"dcpCompatMode", type:"bool", default:true, labelZh:"DCP兼容模式(机械优先)", labelEn:"DCP-compat mode (mechanical first)" },',
-      '      { key:"sendPretrimTurnProtection", type:"int", default:4, labelZh:"近轮保护消息数", labelEn:"Turn protection window" },',
+      '      { key:"sendPretrimTurnProtection", type:"int", default:10, labelZh:"近轮保护消息数", labelEn:"Turn protection window" },',
       '      { key:"sendPretrimMaxRewriteMessages", type:"int", default:28, labelZh:"单次最大重写消息数", labelEn:"Max rewrite messages per run" },',
       '      { key:"distillSummaryMaxChars", type:"int", default:1600, labelZh:"LLM总结摘要最大字符", labelEn:"Distill summary max chars" },',
       '      { key:"distillInputMaxChars", type:"int", default:9000, labelZh:"LLM总结输入最大字符", labelEn:"Distill input max chars" },',
