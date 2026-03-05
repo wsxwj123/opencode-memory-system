@@ -35,6 +35,9 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_SEND_PRETRIM_TRACE_LIMIT = 25;
   const AUTO_SEND_PRETRIM_TURN_PROTECTION = 10;
   const AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES = 28;
+  const AUTO_SEND_PRETRIM_WARMUP_ENABLED = true;
+  const AUTO_SEND_PRETRIM_WARMUP_MIN_RATIO = 0.8;
+  const AUTO_SEND_PRETRIM_WARMUP_MAX_AGE_MS = 10 * 60 * 1000;
   const AUTO_SEND_PRETRIM_PROTECTED_TOOLS = ['write', 'edit', 'bash', 'read'];
   const AUTO_STRATEGY_DEDUP_ENABLED = true;
   const AUTO_STRATEGY_SUPERSEDE_WRITES_ENABLED = true;
@@ -304,6 +307,10 @@ export const MemorySystemPlugin = ({ client }) => {
     return getIntPreference(['sendPretrimMaxRewriteMessages', 'send_pretrim_max_rewrite_messages'], AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES, 4, 120);
   }
 
+  function getSendPretrimWarmupEnabled() {
+    return getBoolSetting(['sendPretrimWarmupEnabled', 'send_pretrim_warmup_enabled'], AUTO_SEND_PRETRIM_WARMUP_ENABLED);
+  }
+
   function getDistillSummaryMaxChars() {
     return getIntPreference(['distillSummaryMaxChars', 'distill_summary_max_chars'], AUTO_DISTILL_SUMMARY_MAX_CHARS, 400, 8000);
   }
@@ -509,6 +516,7 @@ export const MemorySystemPlugin = ({ client }) => {
   const sessionUserDedupeState = new Map();
   const sessionStrictHitAt = new Map();
   const sessionNoticeState = new Map();
+  const pretrimWarmupTasks = new Map();
 
   // Recall trigger patterns
   const RECALL_TRIGGER_PATTERNS = [
@@ -1488,6 +1496,164 @@ export const MemorySystemPlugin = ({ client }) => {
     }
   }
 
+  function buildDistillSourceHash(sourceItems = []) {
+    const compact = (Array.isArray(sourceItems) ? sourceItems : []).map((it, idx) => ({
+      i: idx + 1,
+      role: normalizeText(String(it?.role || 'assistant')).toLowerCase(),
+      snippets: (Array.isArray(it?.snippets) ? it.snippets : [])
+        .map((s) => truncateText(normalizeText(String(s || '')), 160))
+        .filter(Boolean)
+        .slice(0, 3)
+    }));
+    return stableTextHash(JSON.stringify(compact));
+  }
+
+  function buildWarmupSummaryText(warmup = {}, predictedBlockId = 0) {
+    const text = truncateText(String(warmup?.summary || '').trim(), getDistillSummaryMaxChars());
+    if (!text) return '';
+    const bid = Number(predictedBlockId || 0) > 0 ? ` b${Number(predictedBlockId || 0)}` : '';
+    const mode = String(warmup?.mode || 'llm');
+    const tag = mode === 'llm' ? `[pretrim-distill-warmup${bid}]` : `[pretrim-extract-warmup${bid}]`;
+    return `${tag}\n${text}`;
+  }
+
+  function getWarmupCacheHit(sessionData, sourceHash = '') {
+    const sp = ensureSendPretrim(sessionData);
+    const warm = sp?.warmup && typeof sp.warmup === 'object' ? sp.warmup : null;
+    if (!warm) return null;
+    if (!sourceHash || String(warm.sourceHash || '') !== String(sourceHash || '')) return null;
+    const ts = Date.parse(String(warm.preparedAt || '')) || 0;
+    if (!ts || (Date.now() - ts) > AUTO_SEND_PRETRIM_WARMUP_MAX_AGE_MS) return null;
+    const summary = buildWarmupSummaryText(warm);
+    if (!summary) return null;
+    return { ...warm, summary };
+  }
+
+  function markWarmupPrepared(sessionData, payload = {}) {
+    const sp = ensureSendPretrim(sessionData);
+    const cur = sp?.warmup && typeof sp.warmup === 'object' ? sp.warmup : {};
+    sp.warmup = {
+      sourceHash: String(payload.sourceHash || cur.sourceHash || ''),
+      summary: truncateText(String(payload.summary || cur.summary || '').trim(), getDistillSummaryMaxChars()),
+      mode: String(payload.mode || cur.mode || ''),
+      provider: String(payload.provider || cur.provider || ''),
+      model: String(payload.model || cur.model || ''),
+      status: String(payload.status || cur.status || ''),
+      preparedAt: payload.preparedAt || new Date().toISOString(),
+      usedAt: cur.usedAt || null
+    };
+  }
+
+  function markWarmupUsed(sessionData) {
+    const sp = ensureSendPretrim(sessionData);
+    const cur = sp?.warmup && typeof sp.warmup === 'object' ? sp.warmup : null;
+    if (!cur) return;
+    cur.usedAt = new Date().toISOString();
+    sp.warmup = cur;
+  }
+
+  async function schedulePretrimWarmupFromMessages(sessionID, messages = []) {
+    if (!getSendPretrimWarmupEnabled() || !sessionID || !Array.isArray(messages) || !messages.length) return;
+    if (pretrimWarmupTasks.has(sessionID)) return;
+
+    const pretrimBudget = getSendPretrimBudget();
+    const pretrimTarget = getSendPretrimTarget();
+    const before = estimateOutgoingMessagesTokens(messages);
+    if (before <= Math.floor(pretrimBudget * AUTO_SEND_PRETRIM_WARMUP_MIN_RATIO)) return;
+
+    const task = (async () => {
+      try {
+        const protectFrom = getProtectFromByUserTurns(messages, getSendPretrimTurnProtection(), 8);
+        const selectedRange = selectDistillCandidateRange(messages, protectFrom);
+        const candidateIndices = Array.isArray(selectedRange.indices) ? selectedRange.indices : [];
+        const candidateItems = Array.isArray(selectedRange.items) ? selectedRange.items : [];
+        if (candidateIndices.length < 2 || !candidateItems.length) return;
+
+        const sourceItems = [];
+        for (const it of candidateItems) {
+          sourceItems.push(it);
+          if (JSON.stringify(sourceItems).length > getDistillInputMaxChars()) break;
+        }
+        if (!sourceItems.length) return;
+
+        const sourceHash = buildDistillSourceHash(sourceItems);
+        let summaryText = '';
+        let mode = 'extract';
+        let provider = '';
+        let model = '';
+        let status = 'no_candidate';
+
+        const runMode = getDistillMode();
+        const independentCfg = getIndependentDistillConfig();
+        const sessionInlineCfg = resolveSessionInlineProviderConfig(messages);
+        let llmCfg = null;
+        if (runMode === 'session') llmCfg = sessionInlineCfg;
+        else if (runMode === 'independent') llmCfg = canUseIndependentDistill(independentCfg) ? independentCfg : null;
+        else llmCfg = canUseIndependentDistill(independentCfg) ? independentCfg : sessionInlineCfg;
+
+        if (llmCfg) {
+          const distill = await runIndependentDistillLLM(messages, sourceItems, llmCfg);
+          provider = String(distill?.provider || '');
+          model = String(distill?.model || '');
+          status = String(distill?.reason || '');
+          if (distill?.ok && distill?.text) {
+            const quality = evaluateDistillSummaryQuality(distill.text, sourceItems);
+            if (quality.ok) {
+              summaryText = truncateText(distill.text, getDistillSummaryMaxChars());
+              mode = 'llm';
+              status = 'ok';
+            } else {
+              status = `low_quality:${quality.reason}`;
+            }
+          }
+        }
+
+        if (!summaryText) {
+          const inline = runSessionInlineSummaryFallback(sourceItems);
+          const quality = evaluateDistillSummaryQuality(inline, sourceItems);
+          if (quality.ok && inline) {
+            summaryText = truncateText(inline, getDistillSummaryMaxChars());
+            mode = 'llm';
+            provider = provider || 'session-inline-fallback';
+            model = model || 'current-session';
+            status = status ? `${status}|fallback:ok_inline` : 'fallback:ok_inline';
+          } else {
+            const fallbackLines = sourceItems
+              .flatMap((it) => Array.isArray(it.snippets) ? it.snippets : [])
+              .slice(0, 12)
+              .map((x) => `- ${truncateText(x, 140)}`);
+            summaryText = truncateText(fallbackLines.join('\n'), getDistillSummaryMaxChars());
+            mode = 'extract';
+            status = status ? `${status}|fallback:extract` : 'fallback:extract';
+          }
+        }
+
+        if (!summaryText) return;
+        if (before <= pretrimTarget) return;
+
+        const sess = loadSessionMemory(sessionID);
+        markWarmupPrepared(sess, {
+          sourceHash,
+          summary: summaryText,
+          mode,
+          provider,
+          model,
+          status,
+          preparedAt: new Date().toISOString()
+        });
+        persistSessionMemory(sess);
+        writeDashboardFiles();
+      } catch (err) {
+        // warmup errors should never block normal chat flow
+        console.error('memory-system warmup failed:', err);
+      } finally {
+        pretrimWarmupTasks.delete(sessionID);
+      }
+    })();
+
+    pretrimWarmupTasks.set(sessionID, task);
+  }
+
   function buildStrictSummaryAnchorFromMessages(items = []) {
     const lines = [];
     const state = { chars: 0, maxChars: AUTO_STRICT_ANCHOR_MAX_CHARS };
@@ -1590,6 +1756,8 @@ export const MemorySystemPlugin = ({ client }) => {
       distillStatus: '',
       distillSource: '',
       distillFallbackUsed: false,
+      warmupCacheHit: false,
+      warmupPreparedAt: '',
       strategyDedup: 0,
       strategySupersedeWrites: 0,
       strategyPurgedErrors: 0,
@@ -1714,45 +1882,71 @@ export const MemorySystemPlugin = ({ client }) => {
           sourceItems.push(it);
           if (JSON.stringify(sourceItems).length > getDistillInputMaxChars()) break;
         }
-        const mode = getDistillMode();
-        const dcpCompat = isDcpCompatModeEnabled();
-        const independentCfg = getIndependentDistillConfig();
-        const sessionInlineCfg = resolveSessionInlineProviderConfig(messages);
-        let llmCfg = null;
-        if (mode === 'session') llmCfg = sessionInlineCfg;
-        else if (mode === 'independent') llmCfg = canUseIndependentDistill(independentCfg) ? independentCfg : null;
-        else {
-          // auto:
-          // compat=true  -> mechanical first + inline unless independent was explicitly enabled/configured
-          // compat=false -> keep previous behavior (still prefers independent when configured)
-          llmCfg = canUseIndependentDistill(independentCfg) ? independentCfg : sessionInlineCfg;
-        }
-        if (!dcpCompat && mode === 'auto' && !llmCfg) {
-          // explicit marker for diagnostics when auto mode found no runnable LLM path.
-          result.distillStatus = result.distillStatus || 'auto_no_runnable_llm';
+        const sourceHash = buildDistillSourceHash(sourceItems);
+
+        if (sessionID && sourceItems.length) {
+          try {
+            const sessWarm = loadSessionMemory(sessionID);
+            const warmHit = getWarmupCacheHit(sessWarm, sourceHash);
+            if (warmHit?.summary) {
+              summary = buildWarmupSummaryText(warmHit, result.predictedBlockId);
+              result.distillUsed = warmHit.mode === 'llm';
+              result.distillProvider = String(warmHit.provider || 'warmup-cache');
+              result.distillModel = String(warmHit.model || '');
+              result.distillStatus = String(warmHit.status || 'warmup_cache_hit');
+              result.distillSource = 'warmup-cache';
+              result.warmupCacheHit = true;
+              result.warmupPreparedAt = String(warmHit.preparedAt || '');
+              markWarmupUsed(sessWarm);
+              persistSessionMemory(sessWarm);
+            }
+          } catch (_) {}
         }
 
-        if (llmCfg) {
-          const sourceTag = (llmCfg === sessionInlineCfg) ? 'session-model' : 'independent';
-          const distill = await runIndependentDistillLLM(messages, sourceItems, llmCfg);
-          const providerRaw = String(distill?.provider || '');
-          result.distillProvider = sourceTag === 'session-model'
-            ? `session-inline/${providerRaw || 'current-provider'}`
-            : providerRaw;
-          result.distillModel = String(distill?.model || '');
-          result.distillStatus = String(distill?.reason || '');
-          result.distillSource = sourceTag;
-          if (distill?.ok && distill?.text) {
-            const quality = evaluateDistillSummaryQuality(distill.text, sourceItems);
-            result.distillStatus = quality.ok ? 'ok' : `low_quality:${quality.reason}`;
-            if (quality.ok) {
-              const bid = result.predictedBlockId > 0 ? ` b${result.predictedBlockId}` : '';
-              summary = `[pretrim-distill${bid}]\n${truncateText(distill.text, getDistillSummaryMaxChars())}`;
-              result.distillUsed = true;
-            }
+        if (!summary && !sourceItems.length) {
+          result.distillStatus = result.distillStatus || 'empty_source_items';
+        }
+        if (!summary) {
+          const mode = getDistillMode();
+          const dcpCompat = isDcpCompatModeEnabled();
+          const independentCfg = getIndependentDistillConfig();
+          const sessionInlineCfg = resolveSessionInlineProviderConfig(messages);
+          let llmCfg = null;
+          if (mode === 'session') llmCfg = sessionInlineCfg;
+          else if (mode === 'independent') llmCfg = canUseIndependentDistill(independentCfg) ? independentCfg : null;
+          else {
+            // auto:
+            // compat=true  -> mechanical first + inline unless independent was explicitly enabled/configured
+            // compat=false -> keep previous behavior (still prefers independent when configured)
+            llmCfg = canUseIndependentDistill(independentCfg) ? independentCfg : sessionInlineCfg;
           }
-        } else {
-          result.distillStatus = result.distillStatus || 'llm_unavailable_fallback';
+          if (!dcpCompat && mode === 'auto' && !llmCfg) {
+            // explicit marker for diagnostics when auto mode found no runnable LLM path.
+            result.distillStatus = result.distillStatus || 'auto_no_runnable_llm';
+          }
+
+          if (llmCfg) {
+            const sourceTag = (llmCfg === sessionInlineCfg) ? 'session-model' : 'independent';
+            const distill = await runIndependentDistillLLM(messages, sourceItems, llmCfg);
+            const providerRaw = String(distill?.provider || '');
+            result.distillProvider = sourceTag === 'session-model'
+              ? `session-inline/${providerRaw || 'current-provider'}`
+              : providerRaw;
+            result.distillModel = String(distill?.model || '');
+            result.distillStatus = String(distill?.reason || '');
+            result.distillSource = sourceTag;
+            if (distill?.ok && distill?.text) {
+              const quality = evaluateDistillSummaryQuality(distill.text, sourceItems);
+              result.distillStatus = quality.ok ? 'ok' : `low_quality:${quality.reason}`;
+              if (quality.ok) {
+                const bid = result.predictedBlockId > 0 ? ` b${result.predictedBlockId}` : '';
+                summary = `[pretrim-distill${bid}]\n${truncateText(distill.text, getDistillSummaryMaxChars())}`;
+                result.distillUsed = true;
+              }
+            }
+          } else {
+            result.distillStatus = result.distillStatus || 'llm_unavailable_fallback';
+          }
         }
 
         if (!summary) {
@@ -1881,6 +2075,16 @@ export const MemorySystemPlugin = ({ client }) => {
       lastAt: null,
       lastReason: '',
       lastStatus: '',
+      warmup: {
+        sourceHash: '',
+        summary: '',
+        mode: '',
+        provider: '',
+        model: '',
+        status: '',
+        preparedAt: null,
+        usedAt: null
+      },
       traces: []
     };
   }
@@ -1900,6 +2104,16 @@ export const MemorySystemPlugin = ({ client }) => {
       lastAt: cur.lastAt || null,
       lastReason: cur.lastReason || '',
       lastStatus: cur.lastStatus || '',
+      warmup: {
+        sourceHash: String(cur?.warmup?.sourceHash || ''),
+        summary: truncateText(String(cur?.warmup?.summary || '').trim(), getDistillSummaryMaxChars()),
+        mode: String(cur?.warmup?.mode || ''),
+        provider: String(cur?.warmup?.provider || ''),
+        model: String(cur?.warmup?.model || ''),
+        status: String(cur?.warmup?.status || ''),
+        preparedAt: cur?.warmup?.preparedAt || null,
+        usedAt: cur?.warmup?.usedAt || null
+      },
       traces: Array.isArray(cur.traces) ? cur.traces.slice(-AUTO_SEND_PRETRIM_TRACE_LIMIT) : []
     };
     return sessionData.sendPretrim;
@@ -1937,6 +2151,8 @@ export const MemorySystemPlugin = ({ client }) => {
       distillStatus: String(stats.distillStatus || ''),
       distillSource: String(stats.distillSource || ''),
       distillFallbackUsed: Boolean(stats.distillFallbackUsed),
+      warmupCacheHit: Boolean(stats.warmupCacheHit),
+      warmupPreparedAt: String(stats.warmupPreparedAt || ''),
       strategyDedup: Number(stats.strategyDedup || 0),
       strategySupersedeWrites: Number(stats.strategySupersedeWrites || 0),
       strategyPurgedErrors: Number(stats.strategyPurgedErrors || 0),
@@ -4048,6 +4264,15 @@ export const MemorySystemPlugin = ({ client }) => {
           lastAt: sess?.sendPretrim?.lastAt || null,
           lastReason: sess?.sendPretrim?.lastReason || '',
           lastStatus: sess?.sendPretrim?.lastStatus || '',
+          warmup: {
+            sourceHash: String(sess?.sendPretrim?.warmup?.sourceHash || ''),
+            status: String(sess?.sendPretrim?.warmup?.status || ''),
+            mode: String(sess?.sendPretrim?.warmup?.mode || ''),
+            provider: String(sess?.sendPretrim?.warmup?.provider || ''),
+            model: String(sess?.sendPretrim?.warmup?.model || ''),
+            preparedAt: sess?.sendPretrim?.warmup?.preparedAt || null,
+            usedAt: sess?.sendPretrim?.warmup?.usedAt || null
+          },
           traces: Array.isArray(sess?.sendPretrim?.traces) ? sess.sendPretrim.traces.slice(-8) : []
         },
         alerts: sess?.alerts && typeof sess.alerts === 'object' ? sess.alerts : {}
@@ -4235,6 +4460,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    const goLlmBtn = $("goLlmBtn");',
       '    const SETTINGS_SCHEMA = [',
       '      { key:"sendPretrimEnabled", type:"bool", default:true, labelZh:"发送前自动裁剪", labelEn:"Send-time auto pretrim" },',
+      '      { key:"sendPretrimWarmupEnabled", type:"bool", default:true, labelZh:"后台预总结加速", labelEn:"Background warmup summary" },',
       '      { key:"sendPretrimBudget", type:"int", default:10000, labelZh:"发送前裁剪预算(token)", labelEn:"Send pretrim budget (tokens)" },',
       '      { key:"sendPretrimTarget", type:"int", default:7500, labelZh:"发送前裁剪目标(token)", labelEn:"Send pretrim target (tokens)" },',
       '      { key:"sendPretrimHardRatio", type:"float", default:0.9, step:"0.01", labelZh:"硬阈值比例(0-1)", labelEn:"Hard ratio (0-1)" },',
@@ -4287,6 +4513,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    ];',
       '    const SETTINGS_HELP = {',
       '      sendPretrimEnabled:{zh:"是否在每次发送给模型前自动做上下文瘦身。关闭后不做自动省token。",en:"Enable automatic context slimming before each send."},',
+      '      sendPretrimWarmupEnabled:{zh:"在上一轮后后台预生成候选总结，减少下一次发送等待。",en:"Prepare candidate summary in background after previous turn to reduce next-send latency."},',
       '      sendPretrimBudget:{zh:"触发瘦身的预算线。正文估算超过它就启动裁剪。",en:"Budget line that triggers pretrim when body estimate exceeds it."},',
       '      sendPretrimTarget:{zh:"裁剪后的目标线。系统会尽量把正文压到这个值附近。",en:"Target token level after trimming."},',
       '      sendPretrimHardRatio:{zh:"硬阈值比例，越高越保守，越低越激进。",en:"Hard limit ratio: higher is more conservative."},',
@@ -4382,7 +4609,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    function getSettingsMap(){ const s=(DATA&&DATA.settings&&DATA.settings.memorySystem)||{}; return (s&&typeof s==="object")?s:{}; }',
       '    function toBool(v, d){ if(typeof v==="boolean") return v; const s=String(v||"").trim().toLowerCase(); if(["1","true","yes","on"].includes(s)) return true; if(["0","false","no","off"].includes(s)) return false; return d; }',
       '    function renderSettings(){ if(!settingsForm) return; const map=getSettingsMap(); settingsForm.innerHTML=""; SETTINGS_SCHEMA.forEach((it)=>{ const id="setting_"+it.key; const label=document.createElement("label"); label.htmlFor=id; label.style.fontSize="14px"; label.style.color="#111827"; label.style.fontWeight="600"; label.textContent=(LANG==="zh"?(it.labelZh||""):(it.labelEn||"")) || t("settings"+it.key.charAt(0).toUpperCase()+it.key.slice(1)); let input; if(it.type==="enum"){ input=document.createElement("select"); const options=Array.isArray(it.options)?it.options:[]; const enumZh={off:"关闭",minimal:"简洁",detailed:"详细"}; options.forEach((opt)=>{ const o=document.createElement("option"); o.value=String(opt); o.textContent=LANG==="zh"?(enumZh[String(opt)]||String(opt)):String(opt); input.appendChild(o); }); input.value=String((map[it.key]!==undefined&&map[it.key]!==null)?map[it.key]:it.default); input.style.width="100%"; input.style.height="30px"; } else { input=document.createElement("input"); input.id=id; input.dataset.key=it.key; if(it.type==="bool"){ input.type="checkbox"; input.checked=toBool(map[it.key], Boolean(it.default)); input.style.justifySelf="start"; } else { input.type="number"; if(it.type==="float") input.step=String(it.step||"0.01"); input.value=String((map[it.key]!==undefined&&map[it.key]!==null)?map[it.key]:it.default); input.style.width="100%"; input.style.height="30px"; } } input.id=id; input.dataset.key=it.key; settingsForm.appendChild(label); settingsForm.appendChild(input); const help=SETTINGS_HELP[it.key]||{}; const desc=document.createElement("div"); desc.className="sub"; desc.style.gridColumn="1 / span 2"; desc.style.margin="-2px 0 8px 0"; desc.style.fontSize="12px"; desc.style.color="#6b7280"; desc.textContent=(LANG==="zh"?(help.zh||""):(help.en||"")); settingsForm.appendChild(desc); }); if(settingsHelpBody){ settingsHelpBody.innerHTML=""; } }',
-      '    function __settingPriority(k){ const p={ sendPretrimEnabled:1,dcpCompatMode:2,sendPretrimBudget:3,sendPretrimTarget:4,sendPretrimDistillTriggerRatio:5,sendPretrimHardRatio:6,sendPretrimTurnProtection:7,sendPretrimMaxRewriteMessages:8,distillSummaryMaxChars:9,distillInputMaxChars:10,distillRangeMinMessages:11,distillRangeMaxMessages:12,recallEnabled:13,recallTokenBudget:14,recallTopSessions:15,recallMaxEventsPerSession:16,recallMaxChars:17,recallCooldownMs:18,currentSummaryEvery:19,currentSummaryTokenBudget:20,currentSummaryMaxChars:21,currentSummaryMaxEvents:22,injectGlobalPrefsOnSessionStart:23,injectMemoryDocsEnabled:24,dcpPrunableToolsEnabled:25,dcpMessageIdTagsEnabled:26,visibleNoticesEnabled:27,notificationMode:28,visibleNoticeForDiscard:29,visibleNoticeCooldownMs:30,strategyPurgeErrorTurns:31,maxEventsPerSession:32,summaryTriggerEvents:33,summaryKeepRecentEvents:34,summaryMaxChars:35,summaryMaxCharsBudgetMode:36,discardMaxRemovalsPerPass:37,extractEventsPerPass:38 }; return Number(p[k]||999); }',
+      '    function __settingPriority(k){ const p={ sendPretrimEnabled:1,dcpCompatMode:2,sendPretrimWarmupEnabled:3,sendPretrimBudget:4,sendPretrimTarget:5,sendPretrimDistillTriggerRatio:6,sendPretrimHardRatio:7,sendPretrimTurnProtection:8,sendPretrimMaxRewriteMessages:9,distillSummaryMaxChars:10,distillInputMaxChars:11,distillRangeMinMessages:12,distillRangeMaxMessages:13,recallEnabled:14,recallTokenBudget:15,recallTopSessions:16,recallMaxEventsPerSession:17,recallMaxChars:18,recallCooldownMs:19,currentSummaryEvery:20,currentSummaryTokenBudget:21,currentSummaryMaxChars:22,currentSummaryMaxEvents:23,injectGlobalPrefsOnSessionStart:24,injectMemoryDocsEnabled:25,dcpPrunableToolsEnabled:26,dcpMessageIdTagsEnabled:27,visibleNoticesEnabled:28,notificationMode:29,visibleNoticeForDiscard:30,visibleNoticeCooldownMs:31,strategyPurgeErrorTurns:32,maxEventsPerSession:33,summaryTriggerEvents:34,summaryKeepRecentEvents:35,summaryMaxChars:36,summaryMaxCharsBudgetMode:37,discardMaxRemovalsPerPass:38,extractEventsPerPass:39 }; return Number(p[k]||999); }',
       '    function __renderSettingRow(it,map){ const id="setting_"+it.key; const label=document.createElement("label"); label.htmlFor=id; label.style.fontSize="14px"; label.style.color="#111827"; label.style.fontWeight="600"; label.textContent=(LANG==="zh"?(it.labelZh||""):(it.labelEn||"")) || t("settings"+it.key.charAt(0)+it.key.slice(1)); let input; if(it.type==="enum"){ input=document.createElement("select"); const options=Array.isArray(it.options)?it.options:[]; const enumZh={off:"关闭",minimal:"简洁",detailed:"详细"}; options.forEach((opt)=>{ const o=document.createElement("option"); o.value=String(opt); o.textContent=LANG==="zh"?(enumZh[String(opt)]||String(opt)):String(opt); input.appendChild(o); }); input.value=String((map[it.key]!==undefined&&map[it.key]!==null)?map[it.key]:it.default); input.style.width="100%"; input.style.height="30px"; } else { input=document.createElement("input"); if(it.type==="bool"){ input.type="checkbox"; input.checked=toBool(map[it.key], Boolean(it.default)); input.style.justifySelf="start"; } else { input.type="number"; if(it.type==="float") input.step=String(it.step||"0.01"); input.value=String((map[it.key]!==undefined&&map[it.key]!==null)?map[it.key]:it.default); input.style.width="100%"; input.style.height="30px"; } } input.id=id; input.dataset.key=it.key; settingsForm.appendChild(label); settingsForm.appendChild(input); const help=SETTINGS_HELP[it.key]||{}; const desc=document.createElement("div"); desc.className="sub"; desc.style.gridColumn="1 / span 2"; desc.style.margin="-2px 0 8px 0"; desc.style.fontSize="12px"; desc.style.color="#6b7280"; desc.textContent=(LANG==="zh"?(help.zh||""):(help.en||"")); settingsForm.appendChild(desc); }',
       '    function __renderSettingsGroup(title,items,map){ if(!items.length) return; const header=document.createElement("div"); header.style.gridColumn="1 / span 2"; header.style.margin="8px 0 4px 0"; header.style.fontWeight="700"; header.style.color="#0f172a"; header.style.fontSize="14px"; header.textContent=title; settingsForm.appendChild(header); items.forEach((it)=>__renderSettingRow(it,map)); }',
       '    function renderSettings(){ if(!settingsForm) return; const map=getSettingsMap(); settingsForm.innerHTML=""; const ordered=SETTINGS_SCHEMA.slice().sort((a,b)=>__settingPriority(a.key)-__settingPriority(b.key)); const toggles=ordered.filter((it)=>it.type==="bool"||it.type==="enum"); const numerics=ordered.filter((it)=>it.type==="int"||it.type==="float"); __renderSettingsGroup(LANG==="zh"?"开关参数（按重要性）":"Toggle Params (by importance)",toggles,map); __renderSettingsGroup(LANG==="zh"?"数值参数（按重要性）":"Numeric Params (by importance)",numerics,map); if(settingsHelpBody){ settingsHelpBody.innerHTML=""; } }',
@@ -5020,7 +5247,8 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                   pretrimBudget,
                   pretrimTarget,
                   pretrimStage2DistillTrigger: stage2Limit,
-                  pretrimDistillMode: getDistillMode()
+                  pretrimDistillMode: getDistillMode(),
+                  pretrimWarmupEnabled: getSendPretrimWarmupEnabled()
                 },
                 injected: {
                   happened: injectedCount > 0,
@@ -5046,6 +5274,16 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                   manualRuns: Number(sp.manualRuns || 0),
                   savedTokensTotal: Number(sp.savedTokensTotal || 0),
                   distillRuns,
+                  warmup: {
+                    enabled: getSendPretrimWarmupEnabled(),
+                    sourceHash: String(sp?.warmup?.sourceHash || ''),
+                    status: String(sp?.warmup?.status || ''),
+                    mode: String(sp?.warmup?.mode || ''),
+                    provider: String(sp?.warmup?.provider || ''),
+                    model: String(sp?.warmup?.model || ''),
+                    preparedAt: sp?.warmup?.preparedAt || null,
+                    usedAt: sp?.warmup?.usedAt || null
+                  },
                   last: lastTrace ? {
                     at: lastTrace.ts || null,
                     beforeTokens: Number(lastTrace.beforeTokens || 0),
@@ -5057,6 +5295,8 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                     distillProvider: String(lastTrace.distillProvider || ''),
                     distillModel: String(lastTrace.distillModel || ''),
                     distillStatus: String(lastTrace.distillStatus || ''),
+                    warmupCacheHit: Boolean(lastTrace.warmupCacheHit),
+                    warmupPreparedAt: String(lastTrace.warmupPreparedAt || ''),
                     strategyDedup: Number(lastTrace.strategyDedup || 0),
                     strategySupersedeWrites: Number(lastTrace.strategySupersedeWrites || 0),
                     strategyPurgedErrors: Number(lastTrace.strategyPurgedErrors || 0),
@@ -5447,6 +5687,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
       try {
         const messages = Array.isArray(output?.messages) ? output.messages : [];
         if (!messages.length) return;
+        const warmupSnapshot = JSON.parse(JSON.stringify(messages));
         clearInjectedHintParts(messages);
         injectMessageIdTags(messages);
         injectPrunableToolsHint(messages);
@@ -5477,6 +5718,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
           if (stats.strictApplied) sessionStrictHitAt.set(sid, Date.now());
           recordSendPretrimAudit(sid, stats, 'auto');
           if (stats.savedTokens > 0) writeDashboardFiles();
+          void schedulePretrimWarmupFromMessages(sid, warmupSnapshot);
         }
       } catch (err) {
         console.error('memory-system send pretrim hook failed:', err);
@@ -5625,6 +5867,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
         sessionTitleByID.delete(sessionID);
         sessionUserDedupeState.delete(sessionID);
         sessionStrictHitAt.delete(sessionID);
+        pretrimWarmupTasks.delete(sessionID);
       }
 
       if (event.type === 'session.deleted') {
@@ -5633,6 +5876,7 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
         sessionTitleByID.delete(sessionID);
         sessionUserDedupeState.delete(sessionID);
         sessionStrictHitAt.delete(sessionID);
+        pretrimWarmupTasks.delete(sessionID);
       }
     }
   };

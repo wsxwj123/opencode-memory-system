@@ -78,6 +78,11 @@ Windows（默认）：
 1. 机械裁剪（低信号工具输出、噪音内容降权/替换）
 2. 若仍超预算，再做 LLM 总结（内联或独立）
 3. 失败自动回退，不阻断主对话
+4. 若开启 `sendPretrimWarmupEnabled`，会在上一轮后后台预生成候选总结，减少下一轮发送等待
+
+说明：
+- 裁剪/LLM总结发生在“发送前”，所以可能带来本次发送前等待。
+- 开启后台预总结后，下一轮更容易命中缓存（`warmup-cache`），体感更平滑。
 
 ---
 
@@ -87,6 +92,7 @@ Windows（默认）：
 
 #### 5.1 开关参数
 - `sendPretrimEnabled`：是否启用发送前裁剪。
+- `sendPretrimWarmupEnabled`：是否启用后台预总结缓存（降低下一轮发送卡顿）。
 - `dcpCompatMode`：DCP兼容模式（机械裁剪优先，超阈值再LLM总结）。
 - `independentLlmEnabled`：是否启用独立LLM总结通路。
 - `injectGlobalPrefsOnSessionStart`：新会话首条是否注入全局偏好。
@@ -176,11 +182,17 @@ Restart OpenCode.
 3. Pre-send trim (mechanical first)
 4. If still over budget, run LLM summarization
 5. Fallback automatically if summarization fails
+6. Optional background warmup prepares next-turn summary cache (`warmup-cache`)
+
+Note:
+- Trimming/LLM summary runs before sending, so that turn may wait briefly.
+- Warmup can reduce the next-send latency.
 
 ### 5. Key parameters
 
 Toggles:
 - `sendPretrimEnabled`
+- `sendPretrimWarmupEnabled`
 - `dcpCompatMode`
 - `independentLlmEnabled`
 - `injectGlobalPrefsOnSessionStart`
