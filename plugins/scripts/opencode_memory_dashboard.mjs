@@ -3,6 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import http from 'http';
+import vm from 'vm';
 import { spawnSync, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
@@ -32,6 +33,85 @@ const dockerContainer = `opencode-memory-dashboard-${port}`;
 const RETENTION_OPTIONS = new Set([1, 3, 7, 10, 30]);
 const DEFAULT_RETENTION_DAYS = 30;
 
+function pickPluginSourcePath() {
+  const candidates = [
+    path.join(home, '.config', 'opencode', 'plugins', 'memory-system.js'),
+    path.join(home, 'AppData', 'Roaming', 'opencode', 'plugins', 'memory-system.js')
+  ];
+  let best = '';
+  let bestMtime = 0;
+  for (const p of candidates) {
+    try {
+      const st = fs.statSync(p);
+      if (st.isFile() && st.mtimeMs > bestMtime) {
+        best = p;
+        bestMtime = st.mtimeMs;
+      }
+    } catch {
+      // ignore missing candidate
+    }
+  }
+  return best;
+}
+
+function extractFunctionText(source, fnName) {
+  const sig = `function ${fnName}(data) {`;
+  const start = source.indexOf(sig);
+  if (start < 0) return '';
+  let i = source.indexOf('{', start);
+  let depth = 0;
+  let end = -1;
+  for (; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end < 0) return '';
+  return source.slice(start, end + 1);
+}
+
+function getDashboardDataFallback() {
+  return {
+    generatedAt: new Date().toISOString(),
+    settings: { memorySystem: {} },
+    global: { preferences: {}, snippets: {}, feedback: [] },
+    projects: [],
+    summary: { projectCount: 0, sessionCount: 0, eventCount: 0 }
+  };
+}
+
+function syncDashboardHtmlFromPlugin() {
+  try {
+    const pluginPath = pickPluginSourcePath();
+    if (!pluginPath) return { ok: false, reason: 'plugin_source_not_found' };
+    const src = fs.readFileSync(pluginPath, 'utf8');
+    const fnText = extractFunctionText(src, 'buildDashboardHtml');
+    if (!fnText) return { ok: false, reason: 'buildDashboardHtml_not_found' };
+    const data = safeReadJson(dataPath) || getDashboardDataFallback();
+    const context = { __data: data, __html: '' };
+    vm.createContext(context);
+    vm.runInContext(`${fnText}\n__html = buildDashboardHtml(__data);`, context, { timeout: 3000 });
+    const html = String(context.__html || '');
+    if (!html.includes('<!doctype html>') || !html.includes('/api/dashboard')) {
+      return { ok: false, reason: 'generated_html_invalid' };
+    }
+    const oldHtml = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '';
+    if (oldHtml !== html) {
+      fs.writeFileSync(indexPath, html, 'utf8');
+      return { ok: true, reason: 'updated', source: pluginPath };
+    }
+    return { ok: true, reason: 'already_latest', source: pluginPath };
+  } catch (err) {
+    return { ok: false, reason: String(err?.message || err) };
+  }
+}
+
 function ensureDashboardDir() {
   fs.mkdirSync(dashboardDir, { recursive: true });
   fs.mkdirSync(auditDir, { recursive: true });
@@ -45,6 +125,8 @@ function ensureDashboardDir() {
       'utf8'
     );
   }
+  // Keep dashboard template aligned with latest plugin source on every startup.
+  syncDashboardHtmlFromPlugin();
 }
 
 function safeReadJson(p) {
@@ -199,6 +281,130 @@ function truncateText(value, max = 240) {
   const s = String(value || '');
   if (s.length <= max) return s;
   return `${s.slice(0, max)}...`;
+}
+
+function normalizeProvider(value) {
+  const p = normalizeText(String(value || '')).toLowerCase();
+  if (p === 'anthropic' || p === 'gemini') return p;
+  return 'openai_compatible';
+}
+
+function normalizeBaseURL(value, provider = 'openai_compatible') {
+  const raw = normalizeText(String(value || ''));
+  if (!raw) return '';
+  const base = raw.replace(/\/+$/, '');
+  if (provider === 'gemini') {
+    return /\/v1beta$/i.test(base) ? base : `${base}/v1beta`;
+  }
+  return base;
+}
+
+async function fetchIndependentModels({ provider, baseURL, apiKey, timeoutMs = 12000 }) {
+  const p = normalizeProvider(provider);
+  const base = normalizeBaseURL(baseURL, p);
+  const key = normalizeText(String(apiKey || ''));
+  if (!base || !key) return { ok: false, error: 'baseURL/apiKey required', models: [] };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(3000, Number(timeoutMs || 12000)));
+  try {
+    let url = '';
+    const headers = {};
+    if (p === 'anthropic') {
+      url = `${base}/v1/models`;
+      headers['x-api-key'] = key;
+      headers['anthropic-version'] = '2023-06-01';
+    } else if (p === 'gemini') {
+      url = `${base}/models?key=${encodeURIComponent(key)}`;
+    } else {
+      url = `${base}/models`;
+      headers.Authorization = `Bearer ${key}`;
+    }
+    const resp = await fetch(url, { method: 'GET', headers, signal: controller.signal });
+    const raw = await resp.text();
+    if (!resp.ok) return { ok: false, error: `http_${resp.status}`, models: [] };
+    let json = {};
+    try { json = JSON.parse(raw); } catch { return { ok: false, error: 'non_json_response', models: [] }; }
+    let models = [];
+    if (p === 'gemini') {
+      const arr = Array.isArray(json?.models) ? json.models : [];
+      models = arr
+        .map((m) => String(m?.name || '').replace(/^models\//, '').trim())
+        .filter(Boolean);
+    } else {
+      const arr = Array.isArray(json?.data) ? json.data : [];
+      models = arr
+        .map((m) => normalizeText(String(m?.id || m?.name || '')))
+        .filter(Boolean);
+    }
+    models = [...new Set(models)].sort();
+    return { ok: true, models, count: models.length };
+  } catch (err) {
+    const msg = err?.name === 'AbortError' ? 'timeout' : String(err?.message || err || 'unknown_error');
+    return { ok: false, error: msg, models: [] };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function validateIndependentLlm({ provider, baseURL, apiKey, model, timeoutMs = 12000 }) {
+  const p = normalizeProvider(provider);
+  const base = normalizeBaseURL(baseURL, p);
+  const key = normalizeText(String(apiKey || ''));
+  const m = normalizeText(String(model || ''));
+  if (!base || !key || !m) return { ok: false, error: 'provider/baseURL/apiKey/model required' };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(3000, Number(timeoutMs || 12000)));
+  try {
+    let url = '';
+    let headers = { 'content-type': 'application/json' };
+    let body = {};
+    if (p === 'anthropic') {
+      url = `${base}/v1/messages`;
+      headers = {
+        'content-type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01'
+      };
+      body = {
+        model: m,
+        max_tokens: 16,
+        temperature: 0,
+        messages: [{ role: 'user', content: 'Reply only: OK' }]
+      };
+    } else if (p === 'gemini') {
+      url = `${base}/models/${encodeURIComponent(m)}:generateContent?key=${encodeURIComponent(key)}`;
+      body = {
+        generationConfig: { maxOutputTokens: 16, temperature: 0 },
+        contents: [{ role: 'user', parts: [{ text: 'Reply only: OK' }] }]
+      };
+    } else {
+      url = `${base}/chat/completions`;
+      headers.Authorization = `Bearer ${key}`;
+      body = {
+        model: m,
+        temperature: 0,
+        max_tokens: 16,
+        messages: [
+          { role: 'system', content: 'Reply only OK.' },
+          { role: 'user', content: 'Reply only: OK' }
+        ]
+      };
+    }
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const raw = await resp.text();
+    if (!resp.ok) return { ok: false, error: `http_${resp.status}`, detail: truncateText(raw, 280) };
+    return { ok: true, status: 'ok' };
+  } catch (err) {
+    const msg = err?.name === 'AbortError' ? 'timeout' : String(err?.message || err || 'unknown_error');
+    return { ok: false, error: msg };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function sanitizeCompressedSummaryText(value) {
@@ -743,6 +949,39 @@ function serve() {
         sendJson(res, 200, { ok: true, settings, dashboard: live.settings || {} });
       } catch (err) {
         sendJson(res, 500, { error: err?.message || String(err) });
+      }
+      return;
+    }
+
+    if (method === 'POST' && rawPath === '/api/memory/llm/models') {
+      try {
+        const body = await readJsonBody(req);
+        const result = await fetchIndependentModels({
+          provider: body?.provider,
+          baseURL: body?.baseURL,
+          apiKey: body?.apiKey,
+          timeoutMs: body?.timeoutMs
+        });
+        sendJson(res, 200, result);
+      } catch (err) {
+        sendJson(res, 500, { ok: false, error: err?.message || String(err), models: [] });
+      }
+      return;
+    }
+
+    if (method === 'POST' && rawPath === '/api/memory/llm/validate') {
+      try {
+        const body = await readJsonBody(req);
+        const result = await validateIndependentLlm({
+          provider: body?.provider,
+          baseURL: body?.baseURL,
+          apiKey: body?.apiKey,
+          model: body?.model,
+          timeoutMs: body?.timeoutMs
+        });
+        sendJson(res, 200, result);
+      } catch (err) {
+        sendJson(res, 500, { ok: false, error: err?.message || String(err) });
       }
       return;
     }
