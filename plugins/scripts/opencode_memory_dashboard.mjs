@@ -304,45 +304,126 @@ async function fetchIndependentModels({ provider, baseURL, apiKey, timeoutMs = 1
   const base = normalizeBaseURL(baseURL, p);
   const key = normalizeText(String(apiKey || ''));
   if (!base || !key) return { ok: false, error: 'baseURL/apiKey required', models: [] };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(3000, Number(timeoutMs || 12000)));
+  const timeout = Math.max(3000, Number(timeoutMs || 12000));
+
+  async function fetchJson(url, headers = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const resp = await fetch(url, { method: 'GET', headers, signal: controller.signal });
+      const raw = await resp.text();
+      if (!resp.ok) return { ok: false, error: `http_${resp.status}`, json: null };
+      let json = {};
+      try {
+        json = JSON.parse(raw);
+      } catch {
+        return { ok: false, error: 'non_json_response', json: null };
+      }
+      return { ok: true, error: '', json };
+    } catch (err) {
+      const msg = err?.name === 'AbortError' ? 'timeout' : String(err?.message || err || 'unknown_error');
+      return { ok: false, error: msg, json: null };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function extractModelIDs(json) {
+    const out = [];
+    const push = (v) => {
+      const s = normalizeText(String(v || '')).replace(/^models\//, '').trim();
+      if (s) out.push(s);
+    };
+
+    const addFromArray = (arr) => {
+      if (!Array.isArray(arr)) return;
+      for (const m of arr) {
+        if (!m || typeof m !== 'object') continue;
+        push(m.id || m.name || m.model || m.model_id || m.slug);
+      }
+    };
+
+    addFromArray(json?.data);
+    addFromArray(json?.models);
+    addFromArray(json?.result?.models);
+    addFromArray(json?.items);
+
+    // Fallback: shallow recursive scan for common list keys.
+    const stack = [json];
+    let depth = 0;
+    while (stack.length && depth < 3) {
+      const node = stack.shift();
+      depth += 1;
+      if (!node || typeof node !== 'object') continue;
+      for (const [k, v] of Object.entries(node)) {
+        if (Array.isArray(v) && /(data|models|items|list)/i.test(k)) addFromArray(v);
+        if (v && typeof v === 'object') stack.push(v);
+      }
+    }
+    return out;
+  }
+
   try {
-    let url = '';
     const headers = {};
+    const all = [];
+    let lastError = '';
     if (p === 'anthropic') {
-      url = `${base}/v1/models`;
       headers['x-api-key'] = key;
       headers['anthropic-version'] = '2023-06-01';
+      const r = await fetchJson(`${base}/v1/models`, headers);
+      if (!r.ok) return { ok: false, error: r.error, models: [] };
+      all.push(...extractModelIDs(r.json));
     } else if (p === 'gemini') {
-      url = `${base}/models?key=${encodeURIComponent(key)}`;
+      let pageToken = '';
+      for (let i = 0; i < 6; i += 1) {
+        const qp = pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '';
+        const url = `${base}/models?key=${encodeURIComponent(key)}${qp}`;
+        const r = await fetchJson(url);
+        if (!r.ok) {
+          lastError = r.error;
+          break;
+        }
+        all.push(...extractModelIDs(r.json));
+        pageToken = normalizeText(String(r.json?.nextPageToken || r.json?.next_page_token || ''));
+        if (!pageToken) break;
+      }
+      if (!all.length && lastError) return { ok: false, error: lastError, models: [] };
     } else {
-      url = `${base}/models`;
       headers.Authorization = `Bearer ${key}`;
+      let next = `${base}/models`;
+      for (let i = 0; i < 6; i += 1) {
+        const r = await fetchJson(next, headers);
+        if (!r.ok) {
+          lastError = r.error;
+          break;
+        }
+        all.push(...extractModelIDs(r.json));
+        const nextByField = normalizeText(String(r.json?.next || r.json?.next_page || r.json?.nextPage || ''));
+        const hasMore = Boolean(r.json?.has_more);
+        const lastID = normalizeText(String(r.json?.last_id || ''));
+        if (nextByField) {
+          next = /^https?:\/\//i.test(nextByField) ? nextByField : `${base}${nextByField.startsWith('/') ? '' : '/'}${nextByField}`;
+          continue;
+        }
+        if (hasMore && lastID) {
+          const joiner = next.includes('?') ? '&' : '?';
+          next = `${base}/models${joiner}after=${encodeURIComponent(lastID)}`;
+          continue;
+        }
+        break;
+      }
+      // Fallback endpoint used by some OpenAI-compatible proxies.
+      if (!all.length) {
+        const r = await fetchJson(`${base}/v1/models`, headers);
+        if (r.ok) all.push(...extractModelIDs(r.json));
+        else if (lastError) return { ok: false, error: lastError, models: [] };
+      }
     }
-    const resp = await fetch(url, { method: 'GET', headers, signal: controller.signal });
-    const raw = await resp.text();
-    if (!resp.ok) return { ok: false, error: `http_${resp.status}`, models: [] };
-    let json = {};
-    try { json = JSON.parse(raw); } catch { return { ok: false, error: 'non_json_response', models: [] }; }
-    let models = [];
-    if (p === 'gemini') {
-      const arr = Array.isArray(json?.models) ? json.models : [];
-      models = arr
-        .map((m) => String(m?.name || '').replace(/^models\//, '').trim())
-        .filter(Boolean);
-    } else {
-      const arr = Array.isArray(json?.data) ? json.data : [];
-      models = arr
-        .map((m) => normalizeText(String(m?.id || m?.name || '')))
-        .filter(Boolean);
-    }
-    models = [...new Set(models)].sort();
+    const models = [...new Set(all)].filter(Boolean).sort();
     return { ok: true, models, count: models.length };
   } catch (err) {
-    const msg = err?.name === 'AbortError' ? 'timeout' : String(err?.message || err || 'unknown_error');
+    const msg = String(err?.message || err || 'unknown_error');
     return { ok: false, error: msg, models: [] };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
