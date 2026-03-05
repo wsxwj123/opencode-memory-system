@@ -1332,6 +1332,34 @@ export const MemorySystemPlugin = ({ client }) => {
     return { indices: best.indices, items: best.items };
   }
 
+  function getActiveSummaryTemplateTextForLLM() {
+    let settings = {};
+    try {
+      const raw = fs.readFileSync(globalMemoryPath, 'utf8');
+      const gm = JSON.parse(raw || '{}');
+      settings = (gm && gm.preferences && typeof gm.preferences === 'object') ? gm.preferences : {};
+    } catch {
+      settings = {};
+    }
+    const readAlias = (aliases, fallback) => {
+      for (const k of aliases) {
+        if (Object.prototype.hasOwnProperty.call(settings, k)) return settings[k];
+      }
+      return fallback;
+    };
+    const activeTemplateName = normalizeText(String(readAlias(['activeSummaryTemplateName', 'active_summary_template_name'], '')));
+    const templateStore = readAlias(['summaryTemplates', 'summary_templates'], {});
+    let customTpl = '';
+    if (templateStore && typeof templateStore === 'object' && !Array.isArray(templateStore)) {
+      const store = templateStore;
+      if (activeTemplateName && typeof store[activeTemplateName] === 'string') customTpl = normalizeText(String(store[activeTemplateName]));
+      if (!customTpl && typeof store.default === 'string') customTpl = normalizeText(String(store.default));
+    }
+    if (!customTpl) customTpl = normalizeText(String(readAlias(['summaryTemplateText', 'summary_template_text'], '')));
+    if (!customTpl) return '';
+    return truncateText(customTpl, 1200);
+  }
+
   function buildDistillPrompt(candidateItems, maxChars = getDistillSummaryMaxChars()) {
     const cleanItems = Array.isArray(candidateItems) ? candidateItems : [];
     const payload = cleanItems.map((it, idx) => {
@@ -1339,6 +1367,10 @@ export const MemorySystemPlugin = ({ client }) => {
       const snippets = Array.isArray(it?.snippets) ? it.snippets : [];
       return `${idx + 1}. role=${role}\n${snippets.map((s) => `- ${s}`).join('\n')}`;
     }).join('\n\n');
+    const template = getActiveSummaryTemplateTextForLLM();
+    const templateBlock = template
+      ? `\nPreferred output template (fill with best-effort content, keep concise):\n${template}\n`
+      : '';
 
     return [
       'You are compressing historical chat context for token saving.',
@@ -1350,6 +1382,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '3) Decisions/constraints',
       '4) Open risks/next steps',
       'Do not include tool schema definitions, pending/running logs, or duplicated traces.',
+      templateBlock,
       '',
       'Source snippets:',
       payload
