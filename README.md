@@ -83,6 +83,7 @@ Windows（默认）：
 说明：
 - 裁剪/LLM总结发生在“发送前”，所以可能带来本次发送前等待。
 - 开启后台预总结后，下一轮更容易命中缓存（`warmup-cache`），体感更平滑。
+- warmup 含保护机制：30 秒最小间隔、预算线触发、消息 ID 绑定校验（防串会话缓存）。
 
 ---
 
@@ -141,6 +142,15 @@ Windows（默认）：
 - 先刷新页面。
 - 检查 OpenCode 是否已启动。
 
+#### 7.4 如何看 warmup 是否生效
+- 会话行会显示 `warmup:h/m/s/f` 与 `绑定ID`、`warmup状态`：
+  - `h`=命中缓存次数（hit）
+  - `m`=缓存未命中次数（miss）
+  - `s`=跳过次数（预算不足/间隔冷却）
+  - `f`=失败次数（fail）
+- 展开会话可查看 `warmup日志`（最近事件）。
+- `/memory doctor current` 可查看 warmup 详细字段（包括绑定 ID 与命中/未命中统计）。
+
 ---
 
 ## English Guide
@@ -187,6 +197,7 @@ Restart OpenCode.
 Note:
 - Trimming/LLM summary runs before sending, so that turn may wait briefly.
 - Warmup can reduce the next-send latency.
+- Warmup guards: 30s minimum interval, budget-triggered start, and user-message-id binding to avoid cross-window cache mismatch.
 
 ### 5. Key parameters
 
@@ -220,3 +231,12 @@ LLM summary mode:
 - `~/.opencode/memory/dashboard/`
 - `~/.opencode/memory/trash/`
 - `~/.opencode/memory/audit/memory-audit.jsonl`
+
+### 7. Warmup observability
+- Session row shows `warmup:h/m/s/f` plus binding/status:
+  - `h`=cache hit count
+  - `m`=cache miss count
+  - `s`=skipped count (budget/cooldown)
+  - `f`=failure count
+- Expand a session to view `warmup logs` (recent entries).
+- Use `/memory doctor current` for detailed warmup state.

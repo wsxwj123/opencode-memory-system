@@ -36,8 +36,10 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_SEND_PRETRIM_TURN_PROTECTION = 10;
   const AUTO_SEND_PRETRIM_MAX_REWRITE_MESSAGES = 28;
   const AUTO_SEND_PRETRIM_WARMUP_ENABLED = true;
-  const AUTO_SEND_PRETRIM_WARMUP_MIN_RATIO = 0.8;
+  const AUTO_SEND_PRETRIM_WARMUP_MIN_RATIO = 0.85;
+  const AUTO_SEND_PRETRIM_WARMUP_MIN_INTERVAL_MS = 30 * 1000;
   const AUTO_SEND_PRETRIM_WARMUP_MAX_AGE_MS = 10 * 60 * 1000;
+  const AUTO_SEND_PRETRIM_WARMUP_LOG_LIMIT = 20;
   const AUTO_SEND_PRETRIM_PROTECTED_TOOLS = ['write', 'edit', 'bash', 'read'];
   const AUTO_STRATEGY_DEDUP_ENABLED = true;
   const AUTO_STRATEGY_SUPERSEDE_WRITES_ENABLED = true;
@@ -1237,6 +1239,17 @@ export const MemorySystemPlugin = ({ client }) => {
     );
   }
 
+  function inferLatestUserMessageID(messages = []) {
+    if (!Array.isArray(messages) || !messages.length) return '';
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const role = normalizeText(String(messages[i]?.info?.role || '')).toLowerCase();
+      if (role !== 'user') continue;
+      const mid = extractMessageIDFromOutgoing(messages[i]);
+      if (mid) return mid;
+    }
+    return '';
+  }
+
   function inferSessionModelFromMessages(messages) {
     if (!Array.isArray(messages) || !messages.length) return { providerID: '', modelID: '' };
     for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -1517,11 +1530,12 @@ export const MemorySystemPlugin = ({ client }) => {
     return `${tag}\n${text}`;
   }
 
-  function getWarmupCacheHit(sessionData, sourceHash = '') {
+  function getWarmupCacheHit(sessionData, sourceHash = '', lastUserMessageID = '') {
     const sp = ensureSendPretrim(sessionData);
     const warm = sp?.warmup && typeof sp.warmup === 'object' ? sp.warmup : null;
     if (!warm) return null;
     if (!sourceHash || String(warm.sourceHash || '') !== String(sourceHash || '')) return null;
+    if (lastUserMessageID && String(warm.lastUserMessageID || '') && String(warm.lastUserMessageID || '') !== String(lastUserMessageID || '')) return null;
     const ts = Date.parse(String(warm.preparedAt || '')) || 0;
     if (!ts || (Date.now() - ts) > AUTO_SEND_PRETRIM_WARMUP_MAX_AGE_MS) return null;
     const summary = buildWarmupSummaryText(warm);
@@ -1539,9 +1553,33 @@ export const MemorySystemPlugin = ({ client }) => {
       provider: String(payload.provider || cur.provider || ''),
       model: String(payload.model || cur.model || ''),
       status: String(payload.status || cur.status || ''),
+      lastUserMessageID: String(payload.lastUserMessageID || cur.lastUserMessageID || ''),
+      lastAttemptAt: payload.lastAttemptAt || cur.lastAttemptAt || null,
+      consecutiveFails: Number(payload.consecutiveFails !== undefined ? payload.consecutiveFails : (cur.consecutiveFails || 0)),
+      failCount: Number(payload.failCount !== undefined ? payload.failCount : (cur.failCount || 0)),
+      hitCount: Number(payload.hitCount !== undefined ? payload.hitCount : (cur.hitCount || 0)),
+      missCount: Number(payload.missCount !== undefined ? payload.missCount : (cur.missCount || 0)),
+      skipBudgetCount: Number(payload.skipBudgetCount !== undefined ? payload.skipBudgetCount : (cur.skipBudgetCount || 0)),
+      skipCooldownCount: Number(payload.skipCooldownCount !== undefined ? payload.skipCooldownCount : (cur.skipCooldownCount || 0)),
+      skipPausedCount: Number(payload.skipPausedCount !== undefined ? payload.skipPausedCount : (cur.skipPausedCount || 0)),
       preparedAt: payload.preparedAt || new Date().toISOString(),
-      usedAt: cur.usedAt || null
+      usedAt: cur.usedAt || null,
+      logs: Array.isArray(cur.logs) ? cur.logs.slice(-AUTO_SEND_PRETRIM_WARMUP_LOG_LIMIT) : []
     };
+  }
+
+  function pushWarmupLog(sessionData, level = 'info', message = '') {
+    if (!sessionData || !message) return;
+    const sp = ensureSendPretrim(sessionData);
+    const cur = sp?.warmup && typeof sp.warmup === 'object' ? sp.warmup : {};
+    const logs = Array.isArray(cur.logs) ? cur.logs.slice(-AUTO_SEND_PRETRIM_WARMUP_LOG_LIMIT) : [];
+    logs.push({
+      ts: new Date().toISOString(),
+      level: String(level || 'info'),
+      message: truncateText(String(message || ''), 240)
+    });
+    cur.logs = logs.slice(-AUTO_SEND_PRETRIM_WARMUP_LOG_LIMIT);
+    sp.warmup = cur;
   }
 
   function markWarmupUsed(sessionData) {
@@ -1549,6 +1587,16 @@ export const MemorySystemPlugin = ({ client }) => {
     const cur = sp?.warmup && typeof sp.warmup === 'object' ? sp.warmup : null;
     if (!cur) return;
     cur.usedAt = new Date().toISOString();
+    cur.hitCount = Number(cur.hitCount || 0) + 1;
+    pushWarmupLog(sessionData, 'info', 'warmup cache hit');
+    sp.warmup = cur;
+  }
+
+  function markWarmupMiss(sessionData) {
+    const sp = ensureSendPretrim(sessionData);
+    const cur = sp?.warmup && typeof sp.warmup === 'object' ? sp.warmup : {};
+    cur.missCount = Number(cur.missCount || 0) + 1;
+    pushWarmupLog(sessionData, 'info', 'warmup cache miss');
     sp.warmup = cur;
   }
 
@@ -1559,10 +1607,27 @@ export const MemorySystemPlugin = ({ client }) => {
     const pretrimBudget = getSendPretrimBudget();
     const pretrimTarget = getSendPretrimTarget();
     const before = estimateOutgoingMessagesTokens(messages);
-    if (before <= Math.floor(pretrimBudget * AUTO_SEND_PRETRIM_WARMUP_MIN_RATIO)) return;
+    const triggerLine = Math.floor(pretrimBudget * AUTO_SEND_PRETRIM_WARMUP_MIN_RATIO);
+    const warmSess = loadSessionMemory(sessionID);
+    const warmState = ensureSendPretrim(warmSess)?.warmup || {};
+    const now = Date.now();
+    const lastAttemptTs = Date.parse(String(warmState.lastAttemptAt || '')) || 0;
+    if (lastAttemptTs > 0 && (now - lastAttemptTs) < AUTO_SEND_PRETRIM_WARMUP_MIN_INTERVAL_MS) {
+      markWarmupPrepared(warmSess, { skipCooldownCount: Number(warmState.skipCooldownCount || 0) + 1 });
+      pushWarmupLog(warmSess, 'info', 'warmup skipped by cooldown');
+      persistSessionMemory(warmSess);
+      return;
+    }
+    if (before <= triggerLine) {
+      markWarmupPrepared(warmSess, { skipBudgetCount: Number(warmState.skipBudgetCount || 0) + 1 });
+      pushWarmupLog(warmSess, 'info', 'warmup skipped by budget threshold');
+      persistSessionMemory(warmSess);
+      return;
+    }
 
     const task = (async () => {
       try {
+        const latestUserMessageID = inferLatestUserMessageID(messages);
         const protectFrom = getProtectFromByUserTurns(messages, getSendPretrimTurnProtection(), 8);
         const selectedRange = selectDistillCandidateRange(messages, protectFrom);
         const candidateIndices = Array.isArray(selectedRange.indices) ? selectedRange.indices : [];
@@ -1632,6 +1697,16 @@ export const MemorySystemPlugin = ({ client }) => {
         if (before <= pretrimTarget) return;
 
         const sess = loadSessionMemory(sessionID);
+        const prevWarm = ensureSendPretrim(sess)?.warmup || {};
+        let consecutiveFails = Number(prevWarm.consecutiveFails || 0);
+        let failCount = Number(prevWarm.failCount || 0);
+        const failedUpstream = /http_|timeout|empty_text|non_json_response|missing_model|disabled_or_incomplete_config/i.test(String(status || ''));
+        if (failedUpstream) {
+          consecutiveFails += 1;
+          failCount += 1;
+        } else {
+          consecutiveFails = 0;
+        }
         markWarmupPrepared(sess, {
           sourceHash,
           summary: summaryText,
@@ -1639,13 +1714,38 @@ export const MemorySystemPlugin = ({ client }) => {
           provider,
           model,
           status,
-          preparedAt: new Date().toISOString()
+          lastUserMessageID: latestUserMessageID,
+          lastAttemptAt: new Date().toISOString(),
+          preparedAt: new Date().toISOString(),
+          consecutiveFails,
+          failCount
         });
+        pushWarmupLog(
+          sess,
+          failedUpstream ? 'warn' : 'info',
+          failedUpstream
+            ? `warmup fallback: ${truncateText(String(status || 'unknown'), 120)}`
+            : `warmup prepared (${mode})`
+        );
         persistSessionMemory(sess);
         writeDashboardFiles();
       } catch (err) {
         // warmup errors should never block normal chat flow
         console.error('memory-system warmup failed:', err);
+        try {
+          const sess = loadSessionMemory(sessionID);
+          const prevWarm = ensureSendPretrim(sess)?.warmup || {};
+          const consecutiveFails = Number(prevWarm.consecutiveFails || 0) + 1;
+          const failCount = Number(prevWarm.failCount || 0) + 1;
+          markWarmupPrepared(sess, {
+            status: `runtime_error:${truncateText(String(err?.message || err || ''), 160)}`,
+            lastAttemptAt: new Date().toISOString(),
+            consecutiveFails,
+            failCount
+          });
+          pushWarmupLog(sess, 'error', `warmup runtime error: ${truncateText(String(err?.message || err || ''), 120)}`);
+          persistSessionMemory(sess);
+        } catch (_) {}
       } finally {
         pretrimWarmupTasks.delete(sessionID);
       }
@@ -1883,11 +1983,12 @@ export const MemorySystemPlugin = ({ client }) => {
           if (JSON.stringify(sourceItems).length > getDistillInputMaxChars()) break;
         }
         const sourceHash = buildDistillSourceHash(sourceItems);
+        const lastUserMessageID = inferLatestUserMessageID(messages);
 
         if (sessionID && sourceItems.length) {
           try {
             const sessWarm = loadSessionMemory(sessionID);
-            const warmHit = getWarmupCacheHit(sessWarm, sourceHash);
+            const warmHit = getWarmupCacheHit(sessWarm, sourceHash, lastUserMessageID);
             if (warmHit?.summary) {
               summary = buildWarmupSummaryText(warmHit, result.predictedBlockId);
               result.distillUsed = warmHit.mode === 'llm';
@@ -1898,6 +1999,9 @@ export const MemorySystemPlugin = ({ client }) => {
               result.warmupCacheHit = true;
               result.warmupPreparedAt = String(warmHit.preparedAt || '');
               markWarmupUsed(sessWarm);
+              persistSessionMemory(sessWarm);
+            } else {
+              markWarmupMiss(sessWarm);
               persistSessionMemory(sessWarm);
             }
           } catch (_) {}
@@ -2082,8 +2186,18 @@ export const MemorySystemPlugin = ({ client }) => {
         provider: '',
         model: '',
         status: '',
+        lastUserMessageID: '',
+        lastAttemptAt: null,
+        consecutiveFails: 0,
+        failCount: 0,
+        hitCount: 0,
+        missCount: 0,
+        skipBudgetCount: 0,
+        skipCooldownCount: 0,
+        skipPausedCount: 0,
         preparedAt: null,
-        usedAt: null
+        usedAt: null,
+        logs: []
       },
       traces: []
     };
@@ -2111,8 +2225,20 @@ export const MemorySystemPlugin = ({ client }) => {
         provider: String(cur?.warmup?.provider || ''),
         model: String(cur?.warmup?.model || ''),
         status: String(cur?.warmup?.status || ''),
+        lastUserMessageID: String(cur?.warmup?.lastUserMessageID || ''),
+        lastAttemptAt: cur?.warmup?.lastAttemptAt || null,
+        consecutiveFails: Number(cur?.warmup?.consecutiveFails || 0),
+        failCount: Number(cur?.warmup?.failCount || 0),
+        hitCount: Number(cur?.warmup?.hitCount || 0),
+        missCount: Number(cur?.warmup?.missCount || 0),
+        skipBudgetCount: Number(cur?.warmup?.skipBudgetCount || 0),
+        skipCooldownCount: Number(cur?.warmup?.skipCooldownCount || 0),
+        skipPausedCount: Number(cur?.warmup?.skipPausedCount || 0),
         preparedAt: cur?.warmup?.preparedAt || null,
-        usedAt: cur?.warmup?.usedAt || null
+        usedAt: cur?.warmup?.usedAt || null,
+        logs: Array.isArray(cur?.warmup?.logs)
+          ? cur.warmup.logs.slice(-AUTO_SEND_PRETRIM_WARMUP_LOG_LIMIT)
+          : []
       },
       traces: Array.isArray(cur.traces) ? cur.traces.slice(-AUTO_SEND_PRETRIM_TRACE_LIMIT) : []
     };
@@ -4270,8 +4396,20 @@ export const MemorySystemPlugin = ({ client }) => {
             mode: String(sess?.sendPretrim?.warmup?.mode || ''),
             provider: String(sess?.sendPretrim?.warmup?.provider || ''),
             model: String(sess?.sendPretrim?.warmup?.model || ''),
+            lastUserMessageID: String(sess?.sendPretrim?.warmup?.lastUserMessageID || ''),
+            lastAttemptAt: sess?.sendPretrim?.warmup?.lastAttemptAt || null,
+            consecutiveFails: Number(sess?.sendPretrim?.warmup?.consecutiveFails || 0),
+            failCount: Number(sess?.sendPretrim?.warmup?.failCount || 0),
+            hitCount: Number(sess?.sendPretrim?.warmup?.hitCount || 0),
+            missCount: Number(sess?.sendPretrim?.warmup?.missCount || 0),
+            skipBudgetCount: Number(sess?.sendPretrim?.warmup?.skipBudgetCount || 0),
+            skipCooldownCount: Number(sess?.sendPretrim?.warmup?.skipCooldownCount || 0),
+            skipPausedCount: Number(sess?.sendPretrim?.warmup?.skipPausedCount || 0),
             preparedAt: sess?.sendPretrim?.warmup?.preparedAt || null,
-            usedAt: sess?.sendPretrim?.warmup?.usedAt || null
+            usedAt: sess?.sendPretrim?.warmup?.usedAt || null,
+            logs: Array.isArray(sess?.sendPretrim?.warmup?.logs)
+              ? sess.sendPretrim.warmup.logs.slice(-AUTO_SEND_PRETRIM_WARMUP_LOG_LIMIT)
+              : []
           },
           traces: Array.isArray(sess?.sendPretrim?.traces) ? sess.sendPretrim.traces.slice(-8) : []
         },
@@ -4622,7 +4760,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    async function batchDeleteSessions(projectName){ const ids=[...__selectedSessionIDs].filter(Boolean); if(!ids.length){ alert(t("batchSelectFirst")); return; } if(!window.confirm(t("batchDeleteConfirm").replace("{n}", String(ids.length)))) return; try{ await apiPost("/api/memory/sessions/delete",{projectName,sessionIDs:ids,confirm:true,source:"dashboard"}); ids.forEach((id)=>__selectedSessionIDs.delete(id)); updateBatchDeleteBtn(); await refreshDashboardData(); }catch(e){ alert("Batch delete failed: "+e.message);} }',
       '    function applyLang(){ $("titleMain").textContent=t("title"); $("langLabel").textContent=t("lang"); const mpk=$("mProjectsK"); if(mpk) mpk.textContent=t("metricProjects"); const msk=$("mSessionsK"); if(msk) msk.textContent=t("metricSessions"); const mek=$("mEventsK"); if(mek) mek.textContent=t("metricEvents"); if(tabSessionsBtn) tabSessionsBtn.textContent=t("tabSessions"); if(tabSettingsBtn) tabSettingsBtn.textContent=t("tabSettings"); if(tabLlmBtn) tabLlmBtn.textContent=t("tabLlm"); if(tabTrashBtn) tabTrashBtn.textContent=t("tabTrash"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); const gf=$("globalPrefsFoldSummary"); if(gf) gf.textContent=t("globalPrefsFoldSummary"); const sh=$("settingsHelpFoldSummary"); if(sh) sh.textContent=t("settingsHelpFoldSummary"); if(!__activeProjectName) projectTitle.textContent=t("noProjectSelected"); const settingsTitle=$("settingsTitle"); if(settingsTitle) settingsTitle.textContent=t("settingsTitle"); const llmTitle=$("llmTitle"); if(llmTitle) llmTitle.textContent=t("llmTitle"); const llmHint=$("llmHint"); if(llmHint) llmHint.textContent=t("llmHint"); const settingsHint=$("settingsHint"); if(settingsHint) settingsHint.textContent=t("settingsHint"); const settingsSaveBtnEl=$("settingsSaveBtn"); if(settingsSaveBtnEl) settingsSaveBtnEl.textContent=t("settingsSave"); const llmSaveBtnEl=$("llmSaveBtn"); if(llmSaveBtnEl) llmSaveBtnEl.textContent=t("llmSave"); const sessionsTitle=$("sessionsTitle"); if(sessionsTitle) sessionsTitle.textContent=t("sessions"); const trashTitle=$("trashTitle"); if(trashTitle) trashTitle.textContent=t("trashTitle"); const retentionLabel=$("trashRetentionLabel"); if(retentionLabel) retentionLabel.textContent=t("trashRetentionLabel"); const c=$("trashCleanupBtn"); if(c) c.textContent=t("trashCleanup"); const pLabel=$("pretrimProfileLabel"); if(pLabel) pLabel.textContent=t("pretrimProfileLabel"); const llmQuickTitle=$("llmQuickTitle"); if(llmQuickTitle) llmQuickTitle.textContent=t("llmQuickTitle"); const llmQuickHint=$("llmQuickHint"); if(llmQuickHint) llmQuickHint.textContent=t("llmQuickHint"); const llmQuickModeLabel=$("llmQuickModeLabel"); if(llmQuickModeLabel) llmQuickModeLabel.textContent=t("llmQuickModeLabel"); const llmQuickProviderLabel=$("llmQuickProviderLabel"); if(llmQuickProviderLabel) llmQuickProviderLabel.textContent=t("llmQuickProviderLabel"); const llmQuickModelLabel=$("llmQuickModelLabel"); if(llmQuickModelLabel) llmQuickModelLabel.textContent=t("llmQuickModelLabel"); const llmQuickBaseLabel=$("llmQuickBaseLabel"); if(llmQuickBaseLabel) llmQuickBaseLabel.textContent=t("llmQuickBaseLabel"); const goLlmBtnEl=$("goLlmBtn"); if(goLlmBtnEl) goLlmBtnEl.textContent=t("llmQuickGo"); if(pretrimProfileSel&&pretrimProfileSel.options&&pretrimProfileSel.options.length>=3){ pretrimProfileSel.options[0].text=t("pretrimConservative"); pretrimProfileSel.options[1].text=t("pretrimBalanced"); pretrimProfileSel.options[2].text=t("pretrimAggressive"); } const pSave=$("savePretrimProfileBtn"); if(pSave) pSave.textContent=t("pretrimSave"); updateBatchDeleteBtn(); updateTrashDeleteBtn(); renderSettings(); renderLlmSettings(); renderLlmQuickSummary(); }',
       '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); updatePretrimProfileUi(); if(!entries.length){globalPrefs.textContent=t("noGlobalPrefs"); return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
-      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; const _title=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:(s.sessionID||""); sid.textContent=_title+"  id:"+(s.sessionID||""); sid.style.whiteSpace="normal"; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const sp=s.sendPretrim||{}; const lastTrace=(sp.traces&&sp.traces.length)?sp.traces[sp.traces.length-1]:null; const summaryMode=lastTrace?(lastTrace.distillUsed?(String(lastTrace.distillProvider||"").includes("session-inline")?"LLM总结(内联)":"LLM总结(独立)"):"机械裁剪"):"无"; const spLast=(sp.lastSavedTokens||0)>0?(" · "+t("sessionStatPretrimLast")+":"+(sp.lastBeforeTokens||0)+"→"+(sp.lastAfterTokens||0)+" (save~"+(sp.lastSavedTokens||0)+")"):""; const strictNow=(sp.traces&&sp.traces.length&&sp.traces[sp.traces.length-1].strictApplied)?(" · strict:ON("+((sp.traces[sp.traces.length-1].strictReplacedMessages)||0)+")"):""; const risk=(s.alerts&&s.alerts.contextStackRisk)?" · 风险:上下文叠加疑似":""; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · \"+t(\"sessionStatPrune\")+\":auto\"+(pa.autoRuns||0)+\"/manual\"+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · \"+t(\"sessionStatPretrim\")+\":auto\"+(sp.autoRuns||0)+\" \"+t(\"sessionStatSaved\")+\"~\"+(sp.savedTokensTotal||0)+\" · LLM总结:\"+summaryMode+spLast+strictNow+risk+\" · \"+t(\"sessionStatBlocks\")+\":\"+(((s.summaryBlocks&&s.summaryBlocks.count)||0))+\" · \"+t(\"sessionStatBody\")+bt+\" tokens\"; const metaWrap=document.createElement("div"); metaWrap.style.display="flex"; metaWrap.style.flexDirection="column"; metaWrap.style.alignItems="flex-start"; metaWrap.style.gap="4px"; metaWrap.appendChild(sid); metaWrap.appendChild(st); head.appendChild(sel); head.appendChild(metaWrap); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noEvents"); events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } if(s.summaryBlocks&&Array.isArray(s.summaryBlocks.recent)&&s.summaryBlocks.recent.length){ const blk=document.createElement("div"); blk.className="ev"; const bm=document.createElement("div"); bm.className="meta"; bm.textContent=t("compressedBlocks")+" (latest "+s.summaryBlocks.recent.length+")"; const bt=document.createElement("div"); bt.className="txt"; bt.textContent=s.summaryBlocks.recent.map((b)=>`b${b.blockId} | ${b.source||"pretrim"} | m:${b.consumedMessages||0} | ${b.summaryPreview||""}`).join("\\n"); blk.appendChild(bm); blk.appendChild(bt); events.appendChild(blk); } if(s.sendPretrim&&Array.isArray(s.sendPretrim.traces)&&s.sendPretrim.traces.length){ const tr=document.createElement("div"); tr.className="ev"; const m=document.createElement("div"); m.className="meta"; m.textContent=t("pretrimTraces"); const traceTxt=document.createElement("div"); traceTxt.className="txt"; const rows=s.sendPretrim.traces.slice(-8).map((x)=>{ const ts=x.ts?new Date(x.ts).toLocaleString():"-"; const strict=x.strictApplied?(` | strict:${x.strictReplacedMessages||0}`):\"\"; const llmMode=x.distillUsed?((String(x.distillProvider||\"\").includes(\"session-inline\"))?` | LLM总结(内联):${x.distillModel||\"current-session\"}`:` | LLM总结(独立):${x.distillProvider||\"\"}/${x.distillModel||\"\"}`):((x.distillStatus&&x.distillStatus.includes(\"fail\"))?` | LLM总结失败:${x.distillStatus}`:\" | 机械裁剪\"); const strat=((x.strategyDedup||0)||(x.strategySupersedeWrites||0)||(x.strategyPurgedErrors||0)||(x.strategyPhaseTrim||0))?(` | strat:d${x.strategyDedup||0}/s${x.strategySupersedeWrites||0}/p${x.strategyPurgedErrors||0}/ph${x.strategyPhaseTrim||0}`):\"\"; const block=(x.blockId?(` | block:b${x.blockId}`):\"\"); const anchor=x.anchorReplaceApplied?(` | anchor:${x.anchorReplaceMessages||0}/b${x.anchorReplaceBlocks||0}`):\"\"; const comp=(()=>{ const b=x.compositionBefore||{}; const a=x.compositionAfter||{}; const bt=(b.total||0), at=(a.total||0); if(!bt||!at) return \"\"; const pct=(v,t)=>Math.round((100*v)/Math.max(1,t)); return ` | comp S:${pct(b.system||0,bt)}→${pct(a.system||0,at)} U:${pct(b.user||0,bt)}→${pct(a.user||0,at)} T:${pct(b.tool||0,bt)}→${pct(a.tool||0,at)}`; })(); return `${ts} | ${x.beforeTokens||0}→${x.afterTokens||0} | save~${x.savedTokens||0} | rw:${x.rewrittenMessages||0}/${x.rewrittenParts||0} | ex:${x.extractedMessages||0}${strict}${llmMode}${strat}${block}${anchor}${comp} | ${x.reason||""}`; }); traceTxt.textContent=rows.join("\\n"); tr.appendChild(m); tr.appendChild(traceTxt); events.appendChild(tr); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
+      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; const _title=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:(s.sessionID||""); sid.textContent=_title+"  id:"+(s.sessionID||""); sid.style.whiteSpace="normal"; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const sp=s.sendPretrim||{}; const w=(sp&&sp.warmup)||{}; const lastTrace=(sp.traces&&sp.traces.length)?sp.traces[sp.traces.length-1]:null; const summaryMode=lastTrace?(lastTrace.distillUsed?((lastTrace.warmupCacheHit||String(lastTrace.distillSource||"").includes("warmup"))?"LLM总结(缓存)":(String(lastTrace.distillProvider||"").includes("session-inline")?"LLM总结(内联)":"LLM总结(独立)")):"机械裁剪"):"无"; const spLast=(sp.lastSavedTokens||0)>0?(" · "+t("sessionStatPretrimLast")+":"+(sp.lastBeforeTokens||0)+"→"+(sp.lastAfterTokens||0)+" (save~"+(sp.lastSavedTokens||0)+")"):""; const strictNow=(sp.traces&&sp.traces.length&&sp.traces[sp.traces.length-1].strictApplied)?(" · strict:ON("+((sp.traces[sp.traces.length-1].strictReplacedMessages)||0)+")"):""; const warmupStats=" · warmup:h"+(w.hitCount||0)+"/m"+(w.missCount||0)+"/s"+((w.skipBudgetCount||0)+(w.skipCooldownCount||0)+(w.skipPausedCount||0))+"/f"+(w.failCount||0); const warmupBind=" · 绑定:"+((w.lastUserMessageID&&String(w.lastUserMessageID).slice(-16))||"-")+" · warmup状态:"+((w.status&&String(w.status).slice(0,40))||"-"); const risk=(s.alerts&&s.alerts.contextStackRisk)?" · 风险:上下文叠加疑似":""; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":\"全局偏好注入\",\"current-session-refresh\":\"当前会话摘要注入\",\"trigger-recall\":\"跨会话召回注入\",\"memory-docs\":\"记忆文档注入\",\"memory-inject\":\"手动注入\"}; const reasonZh=reasonMap[reasonRaw]||\"无\"; const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():\"无\"; st.textContent=\"u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · 注入:g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · 最近注入:\"+reasonZh+\" @ \"+injectAt+\" · \"+t(\"sessionStatPrune\")+\":auto\"+(pa.autoRuns||0)+\"/manual\"+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · \"+t(\"sessionStatPretrim\")+\":auto\"+(sp.autoRuns||0)+\" \"+t(\"sessionStatSaved\")+\"~\"+(sp.savedTokensTotal||0)+\" · LLM总结:\"+summaryMode+spLast+strictNow+risk+\" · \"+t(\"sessionStatBlocks\")+\":\"+(((s.summaryBlocks&&s.summaryBlocks.count)||0))+\" · \"+t(\"sessionStatBody\")+bt+\" tokens\"+warmupStats+warmupBind; const metaWrap=document.createElement("div"); metaWrap.style.display="flex"; metaWrap.style.flexDirection="column"; metaWrap.style.alignItems="flex-start"; metaWrap.style.gap="4px"; metaWrap.appendChild(sid); metaWrap.appendChild(st); head.appendChild(sel); head.appendChild(metaWrap); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noEvents"); events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } if(s.summaryBlocks&&Array.isArray(s.summaryBlocks.recent)&&s.summaryBlocks.recent.length){ const blk=document.createElement("div"); blk.className="ev"; const bm=document.createElement("div"); bm.className="meta"; bm.textContent=t("compressedBlocks")+" (latest "+s.summaryBlocks.recent.length+")"; const bt=document.createElement("div"); bt.className="txt"; bt.textContent=s.summaryBlocks.recent.map((b)=>`b${b.blockId} | ${b.source||"pretrim"} | m:${b.consumedMessages||0} | ${b.summaryPreview||""}`).join("\\n"); blk.appendChild(bm); blk.appendChild(bt); events.appendChild(blk); } if(s.sendPretrim&&s.sendPretrim.warmup&&Array.isArray(s.sendPretrim.warmup.logs)&&s.sendPretrim.warmup.logs.length){ const wl=document.createElement("div"); wl.className="ev"; const wm=document.createElement("div"); wm.className="meta"; wm.textContent="warmup日志"; const wt=document.createElement("div"); wt.className="txt"; wt.textContent=s.sendPretrim.warmup.logs.slice(-8).map((x)=>`${x.ts?new Date(x.ts).toLocaleString():"-"} | ${x.level||"info"} | ${x.message||""}`).join("\n"); wl.appendChild(wm); wl.appendChild(wt); events.appendChild(wl); } if(s.sendPretrim&&Array.isArray(s.sendPretrim.traces)&&s.sendPretrim.traces.length){ const tr=document.createElement("div"); tr.className="ev"; const m=document.createElement("div"); m.className="meta"; m.textContent=t("pretrimTraces"); const traceTxt=document.createElement("div"); traceTxt.className="txt"; const rows=s.sendPretrim.traces.slice(-8).map((x)=>{ const ts=x.ts?new Date(x.ts).toLocaleString():"-"; const strict=x.strictApplied?(` | strict:${x.strictReplacedMessages||0}`):\"\"; const llmMode=x.distillUsed?((String(x.distillProvider||\"\").includes(\"session-inline\"))?` | LLM总结(内联):${x.distillModel||\"current-session\"}`:` | LLM总结(独立):${x.distillProvider||\"\"}/${x.distillModel||\"\"}`):((x.distillStatus&&x.distillStatus.includes(\"fail\"))?` | LLM总结失败:${x.distillStatus}`:\" | 机械裁剪\"); const strat=((x.strategyDedup||0)||(x.strategySupersedeWrites||0)||(x.strategyPurgedErrors||0)||(x.strategyPhaseTrim||0))?(` | strat:d${x.strategyDedup||0}/s${x.strategySupersedeWrites||0}/p${x.strategyPurgedErrors||0}/ph${x.strategyPhaseTrim||0}`):\"\"; const block=(x.blockId?(` | block:b${x.blockId}`):\"\"); const anchor=x.anchorReplaceApplied?(` | anchor:${x.anchorReplaceMessages||0}/b${x.anchorReplaceBlocks||0}`):\"\"; const comp=(()=>{ const b=x.compositionBefore||{}; const a=x.compositionAfter||{}; const bt=(b.total||0), at=(a.total||0); if(!bt||!at) return \"\"; const pct=(v,t)=>Math.round((100*v)/Math.max(1,t)); return ` | comp S:${pct(b.system||0,bt)}→${pct(a.system||0,at)} U:${pct(b.user||0,bt)}→${pct(a.user||0,at)} T:${pct(b.tool||0,bt)}→${pct(a.tool||0,at)}`; })(); return `${ts} | ${x.beforeTokens||0}→${x.afterTokens||0} | save~${x.savedTokens||0} | rw:${x.rewrittenMessages||0}/${x.rewrittenParts||0} | ex:${x.extractedMessages||0}${strict}${llmMode}${strat}${block}${anchor}${comp} | ${x.reason||""}`; }); traceTxt.textContent=rows.join("\\n"); tr.appendChild(m); tr.appendChild(traceTxt); events.appendChild(tr); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
       '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); __activeProjectName=project.name||""; __selectedSessionIDs.clear(); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent=t("projectMetaFmt").replace("{sessions}",String(project.sessionCount||0)).replace("{events}",String(project.totalEvents||0)).replace("{tech}",ts); const b=$("batchDeleteBtn"); if(b) b.onclick=()=>batchDeleteSessions(project.name); renderSessions(project); updateBatchDeleteBtn(); }',
       '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); projectTitle.textContent=t("noProjectSelected"); projectMeta.textContent=""; const b=$("batchDeleteBtn"); if(b) b.onclick=null; renderSessions(null); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent=t("projectListMetaFmt").replace("{sessions}",String(p.sessionCount||0)).replace("{events}",String(p.totalEvents||0)); item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
       '    let __autoRefreshTimer = null;',
@@ -5088,7 +5226,8 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                       Math.floor(getSendPretrimBudget() * getSendPretrimDistillTriggerRatio())
                     )
                   ),
-                  turnProtection: getSendPretrimTurnProtection()
+                  turnProtection: getSendPretrimTurnProtection(),
+                  warmupEnabled: getSendPretrimWarmupEnabled()
                 },
                 strategyConfig: {
                   deduplication: AUTO_STRATEGY_DEDUP_ENABLED,
@@ -5157,7 +5296,8 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                       Math.floor(getSendPretrimBudget() * getSendPretrimDistillTriggerRatio())
                     )
                   ),
-                  turnProtection: getSendPretrimTurnProtection()
+                  turnProtection: getSendPretrimTurnProtection(),
+                  warmupEnabled: getSendPretrimWarmupEnabled()
                 },
                 strategyConfig: {
                   deduplication: AUTO_STRATEGY_DEDUP_ENABLED,
@@ -5281,8 +5421,20 @@ Use /memory recall <query> to manually retrieve relevant memory from previous se
                     mode: String(sp?.warmup?.mode || ''),
                     provider: String(sp?.warmup?.provider || ''),
                     model: String(sp?.warmup?.model || ''),
+                    lastUserMessageID: String(sp?.warmup?.lastUserMessageID || ''),
+                    lastAttemptAt: sp?.warmup?.lastAttemptAt || null,
+                    consecutiveFails: Number(sp?.warmup?.consecutiveFails || 0),
+                    failCount: Number(sp?.warmup?.failCount || 0),
+                    hitCount: Number(sp?.warmup?.hitCount || 0),
+                    missCount: Number(sp?.warmup?.missCount || 0),
+                    skipBudgetCount: Number(sp?.warmup?.skipBudgetCount || 0),
+                    skipCooldownCount: Number(sp?.warmup?.skipCooldownCount || 0),
+                    skipPausedCount: Number(sp?.warmup?.skipPausedCount || 0),
                     preparedAt: sp?.warmup?.preparedAt || null,
-                    usedAt: sp?.warmup?.usedAt || null
+                    usedAt: sp?.warmup?.usedAt || null,
+                    logs: Array.isArray(sp?.warmup?.logs)
+                      ? sp.warmup.logs.slice(-AUTO_SEND_PRETRIM_WARMUP_LOG_LIMIT)
+                      : []
                   },
                   last: lastTrace ? {
                     at: lastTrace.ts || null,
