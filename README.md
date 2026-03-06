@@ -31,17 +31,20 @@
 
 ### 2. 安装教程
 
-#### 2.1 仅需两个文件
+#### 2.1 需要三个文件
 - `plugins/memory-system.js`
 - `plugins/scripts/opencode_memory_dashboard.mjs`
+- `plugins/dashboard/template.html`
 
 #### 2.2 放入 OpenCode 全局配置
 - macOS/Linux:
   - `~/.config/opencode/plugins/memory-system.js`
   - `~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs`
+  - `~/.config/opencode/plugins/dashboard/template.html`
 - Windows:
   - `C:\Users\<用户名>\.config\opencode\plugins\memory-system.js`
   - `C:\Users\<用户名>\.config\opencode\plugins\scripts\opencode_memory_dashboard.mjs`
+  - `C:\Users\<用户名>\.config\opencode\plugins\dashboard\template.html`
 
 #### 2.3 opencode.json 启用
 ```json
@@ -135,6 +138,11 @@ flowchart TD
   I -- 否 --> K[回退摘要后发送]
 ```
 
+### 7.1 模板外置与回退
+- 仪表盘页面模板已外置到 `plugins/dashboard/template.html`。
+- `memory-system.js` 渲染时优先读取该模板并注入数据。
+- 若模板缺失/损坏，自动回退到内嵌 legacy 渲染，不影响功能。
+
 ### 8. 数据文件路径
 - `~/.opencode/memory/global.json`
 - `~/.opencode/memory/config.json`
@@ -188,6 +196,7 @@ flowchart TD
 1. Copy files:
 - `plugins/memory-system.js`
 - `plugins/scripts/opencode_memory_dashboard.mjs`
+- `plugins/dashboard/template.html`
 2. Put into OpenCode config dir:
 - macOS/Linux: `~/.config/opencode/plugins/...`
 - Windows: `C:\Users\<User>\.config\opencode\plugins\...`

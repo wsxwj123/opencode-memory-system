@@ -4542,7 +4542,7 @@ export const MemorySystemPlugin = ({ client }) => {
     };
   }
 
-  function buildDashboardHtml(data) {
+  function buildDashboardHtmlLegacy(data) {
     const payload = JSON.stringify(data).replace(/</g, '\\u003c');
     const html = [
       '<!doctype html>',
@@ -4930,6 +4930,22 @@ export const MemorySystemPlugin = ({ client }) => {
       '</html>'
     ];
     return html.join('\n');
+  }
+
+  function buildDashboardHtml(data) {
+    const payload = JSON.stringify(data).replace(/</g, '\\u003c');
+    const templatePath = path.join(pluginDir, 'dashboard', 'template.html');
+    try {
+      if (fs.existsSync(templatePath)) {
+        const tpl = fs.readFileSync(templatePath, 'utf8');
+        if (tpl && tpl.includes('__MEMORY_DASHBOARD_DATA__')) {
+          return tpl.replace('__MEMORY_DASHBOARD_DATA__', payload);
+        }
+      }
+    } catch (err) {
+      console.error('memory-system template render fallback to legacy:', err?.message || String(err));
+    }
+    return buildDashboardHtmlLegacy(data);
   }
 
   function writeDashboardFiles() {

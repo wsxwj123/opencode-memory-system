@@ -90,10 +90,26 @@ function syncDashboardHtmlFromPlugin() {
   try {
     const pluginPath = pickPluginSourcePath();
     if (!pluginPath) return { ok: false, reason: 'plugin_source_not_found' };
+    const templatePath = path.join(path.dirname(pluginPath), 'dashboard', 'template.html');
+    const data = safeReadJson(dataPath) || getDashboardDataFallback();
+    const payload = JSON.stringify(data).replace(/</g, '\\u003c');
+    if (fs.existsSync(templatePath)) {
+      const tpl = fs.readFileSync(templatePath, 'utf8');
+      if (tpl && tpl.includes('__MEMORY_DASHBOARD_DATA__')) {
+        const html = tpl.replace('__MEMORY_DASHBOARD_DATA__', payload);
+        if (html.includes('<!doctype html>') && html.includes('/api/dashboard')) {
+          const oldHtml = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '';
+          if (oldHtml !== html) {
+            fs.writeFileSync(indexPath, html, 'utf8');
+            return { ok: true, reason: 'updated_from_template', source: templatePath };
+          }
+          return { ok: true, reason: 'already_latest_template', source: templatePath };
+        }
+      }
+    }
     const src = fs.readFileSync(pluginPath, 'utf8');
     const fnText = extractFunctionText(src, 'buildDashboardHtml');
     if (!fnText) return { ok: false, reason: 'buildDashboardHtml_not_found' };
-    const data = safeReadJson(dataPath) || getDashboardDataFallback();
     const context = { __data: data, __html: '' };
     vm.createContext(context);
     vm.runInContext(`${fnText}\n__html = buildDashboardHtml(__data);`, context, { timeout: 3000 });
