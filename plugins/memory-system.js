@@ -823,13 +823,30 @@ export const MemorySystemPlugin = ({ client }) => {
     return `preferences.${key}`;
   }
 
-  function resolveGlobalMutationSessionID(raw = null) {
-    const direct = normalizeText(String(resolveToolSessionID(raw || {}) || ''));
+  function pickFirstDefinedGlobal(obj, keys) {
+    for (const key of keys) {
+      if (obj && obj[key] !== undefined && obj[key] !== null && String(obj[key]).trim() !== '') {
+        return obj[key];
+      }
+    }
+    return undefined;
+  }
+
+  function resolveGlobalMutationSessionID(raw = null, action = 'set', rawKey = '', rawValue = '') {
+    const direct = normalizeText(
+      String(raw?.sessionID || raw?.sessionId || raw?.sid || '')
+    );
     if (direct) return direct;
-    const active = normalizeText(String(lastActiveSessionID || ''));
-    if (active) return active;
-    const recent = [...sessionRecentGlobalMutationState.keys()].slice(-1)[0] || '';
-    return normalizeText(String(recent || ''));
+    const textSeed = normalizeText(
+      String(
+        pickFirstDefinedGlobal(raw || {}, ['query', 'content', 'text', 'message'])
+        || ''
+      )
+    );
+    if (textSeed) return `mutation:${stableTextHash(`${action}|${normalizeGlobalMemoryKey(rawKey)}|${String(rawValue ?? '')}|${textSeed}`)}`;
+    const fallbackSeed = normalizeText(`${action}|${normalizeGlobalMemoryKey(rawKey)}|${String(rawValue ?? '')}`);
+    if (fallbackSeed) return `mutation:${stableTextHash(fallbackSeed)}`;
+    return '';
   }
 
   function getCurrentGlobalMemoryValue(rawKey = '') {
@@ -936,14 +953,38 @@ export const MemorySystemPlugin = ({ client }) => {
     let text = sanitizeUserTextForMemoryInference(raw);
     if (!text) return '';
     text = text
+      .replace(/[，,。.]?\s*写完后.*$/i, '')
+      .replace(/[，,。.]?\s*写好了.*$/i, '')
+      .replace(/^(?:可以|好的|行|嗯|好)[，,、\s]*/i, '')
       .replace(/^(?:请)?(?:帮我)?(?:把|将)?(?:这条|这个|这些)?(?:内容|信息|事情)?(?:写入|写到|存入|存到|记入|记到|保存到)?(?:到)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?[，,:：\s]*/i, '')
       .replace(/^(?:请)?(?:帮我)?(?:在|往)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?(?:写入|写到|存入|存到|记入|记到|保存)[，,:：\s]*/i, '')
+      .replace(/[，,]?\s*(?:你帮我|帮我)?(?:把|将)?(?:这条|这个|这些)?(?:内容|信息|事情)?(?:也)?(?:写入|写到|存入|存到|记入|记到|保存到)?(?:到)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?\s*$/i, '')
+      .replace(/^(?:你把|把)?这个/i, '')
       .replace(/\s*只回复.*$/i, '')
       .replace(/\s*删完后.*$/i, '')
       .trim();
     if (!text) return '';
     if (/[？?]$/.test(text)) return '';
     return normalizeText(text);
+  }
+
+  function normalizeGlobalNoteEntries(raw = '') {
+    let text = String(raw || '').replace(/\r\n/g, '\n').trim();
+    if (!text) return [];
+    text = text.replace(/\s+(?=\d+\.\s)/g, '\n');
+    return text
+      .split('\n')
+      .map((line) => String(line || '').trim())
+      .filter(Boolean);
+  }
+
+  function shouldAppendGlobalNoteFromContext(rawKey = '', rawText = '') {
+    const key = normalizeGlobalMemoryKey(rawKey);
+    if (key !== 'preferences.note') return false;
+    const text = sanitizeUserTextForMemoryInference(rawText);
+    if (!text) return false;
+    if (hasExplicitGlobalMemoryDeleteIntent(text)) return false;
+    return hasExplicitGlobalMemoryIntent(text);
   }
 
   function appendValueToGlobalNote(rawValue = '') {
@@ -955,25 +996,28 @@ export const MemorySystemPlugin = ({ client }) => {
       if (!globalMemory.preferences || typeof globalMemory.preferences !== 'object') {
         globalMemory.preferences = {};
       }
-      const existing = normalizeText(String(globalMemory.preferences.note || ''));
+      const existing = String(globalMemory.preferences.note || '').trim();
       let next = '';
-      if (!existing) {
+      const rawEntries = normalizeGlobalNoteEntries(existing);
+      const entries = [];
+      const existingValues = [];
+      for (const rawEntry of rawEntries) {
+        const base = String(rawEntry || '').replace(/^\d+\.\s*/, '').trim();
+        const cleaned = sanitizeFallbackGlobalNoteContent(base) || sanitizeGlobalNoteContent(base) || base;
+        if (!cleaned || existingValues.includes(cleaned)) continue;
+        entries.push(cleaned);
+        existingValues.push(cleaned);
+      }
+      if (existingValues.includes(value)) {
+        return { ok: true, key: 'preferences.note', value: value, message: `Global setting already present: preferences.note += ${value}` };
+      }
+      if (!entries.length) {
         next = `1. ${value}`;
       } else {
-        const numbered = existing
-          .split('\n')
-          .map((line) => normalizeText(line))
-          .filter(Boolean);
-        const lastMatch = numbered
-          .map((line) => line.match(/^(\d+)\.\s+/))
-          .filter(Boolean)
-          .slice(-1)[0];
-        if (lastMatch) {
-          const nextIndex = Number(lastMatch[1] || 0) + 1;
-          next = `${existing}\n${nextIndex}. ${value}`;
-        } else {
-          next = `1. ${existing}\n2. ${value}`;
-        }
+        next = entries
+          .map((line, index) => `${index + 1}. ${line}`)
+          .concat(`${entries.length + 1}. ${value}`)
+          .join('\n');
       }
       globalMemory.preferences.note = next;
       writeJson(globalMemoryPath, globalMemory);
@@ -1070,6 +1114,20 @@ export const MemorySystemPlugin = ({ client }) => {
         message: `Failed to persist global setting: ${e?.message || String(e)}`
       };
     }
+  }
+
+  function persistGlobalMemoryValue(raw = null, rawKey = '', rawValue = '') {
+    const key = normalizeGlobalMemoryKey(rawKey);
+    const value = typeof rawValue === 'string' ? rawValue : JSON.stringify(rawValue);
+    const rawText = String(
+      pickFirstDefinedGlobal(raw || {}, ['query', 'content', 'text', 'message'])
+      || value
+      || ''
+    );
+    if (shouldAppendGlobalNoteFromContext(key, rawText)) {
+      return appendValueToGlobalNote(rawText);
+    }
+    return writeGlobalMemoryValue(key, value);
   }
 
   function deleteGlobalMemoryValue(rawKey = '') {
@@ -1489,7 +1547,7 @@ export const MemorySystemPlugin = ({ client }) => {
     if (prev && String(prev.fp || '') === fp) {
       return { wrote: false, reason: 'duplicate_request', key: inferred.key, value: inferred.value };
     }
-    const res = writeGlobalMemoryValue(inferred.key, inferred.value);
+    const res = persistGlobalMemoryValue({ content: text, query: text }, inferred.key, inferred.value);
     if (res?.ok) {
       sessionAutoGlobalWriteState.set(sessionID, { fp, key: res.key, value: res.value, at: new Date().toISOString() });
       rememberRecentGlobalMutation(sessionID, 'set', res.key, res.value);
@@ -7490,7 +7548,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '        <div class="panel"><h1 id="templateTitle" style="font-size:16px;">摘要模板设置</h1><div class="sub" id="templateHint">用于机械裁剪/LLM总结的输出格式，不是页面模板。保存后立即生效并持久化。</div><div class="sub" id="templateFormatHint" style="margin-top:6px;">可用占位变量：{{window}} {{events}} {{status}} {{sessionCwd}} {{recommendedWorkdir}} {{relatedWorkdirs}} {{keyFacts}} {{taskGoal}} {{keyOutcomes}} {{toolsUsed}} {{skillsUsed}} {{keyFiles}} {{decisions}} {{blockers}} {{todoRisks}} {{nextActions}} {{workdirScoring}} {{handoffAnchor}}；示例(JSON)：{\"title\":\"{{status}}\",\"facts\":\"{{keyFacts}}\"}</div><div style=\"display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center;margin-top:8px;\"><label id=\"templateNameLabel\" for=\"templateNameInput\">模板名称</label><input id=\"templateNameInput\" type=\"text\" placeholder=\"default\" style=\"height:30px;border:1px solid #d9e2ea;border-radius:8px;padding:0 8px;\"/><label id=\"templateSelectLabel\" for=\"templateSelect\">已保存模板</label><select id=\"templateSelect\" style=\"height:30px;border:1px solid #d9e2ea;border-radius:8px;padding:0 6px;\"></select></div><textarea id="templateEditor" style="width:100%;height:260px;margin-top:10px;border:1px solid #d9e2ea;border-radius:8px;padding:10px;font-family:IBM Plex Mono,monospace;"></textarea><div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;"><button id="templateUseBtn" style="height:30px;">设为当前模板</button><button id="templateSaveBtn" style="height:30px;">按名称保存模板</button><button id="templatePreviewBtn" style="height:30px;">预览当前模板</button><button id="templateResetBtn" style="height:30px;">恢复默认模板</button><span id="templateStatus" class="sub" style="margin:0;"></span></div><pre id="templatePreview" style="margin-top:10px;white-space:pre-wrap;background:#f8fafc;border:1px solid #d9e2ea;border-radius:8px;padding:10px;max-height:260px;overflow:auto;"></pre></div>',
       '      </section>',
       '      <section id="paneSettings" class="tab-pane">',
-      '        <div class="panel"><details id="globalPrefsFold" class="fold" open><summary id="globalPrefsFoldSummary">全局偏好设置</summary><div style="margin-top:8px;"><h1 id="globalTitle" style="font-size:16px;">Global Preferences</h1><div class="sub" id="tokenHint">Token estimate is approximate (chars/4).</div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;"><label id="pretrimProfileLabel" for="pretrimProfileSel" style="font-size:12px;color:var(--muted);">Pretrim Profile</label><select id="pretrimProfileSel"><option value="conservative">Conservative (~20%, preserve detail)</option><option value="balanced" selected>Balanced (~40%, recommended)</option><option value="aggressive">Aggressive (~60%, strongest trim)</option></select><button id="savePretrimProfileBtn" style="height:30px;">Save</button><span id="pretrimProfileHint" class="sub" style="margin:0;"></span></div><div id="globalPrefs" class="empty">No global preferences.</div></div></details></div>',
+      '        <div class="panel"><details id="globalPrefsFold" class="fold" open><summary id="globalPrefsFoldSummary">全局偏好设置</summary><div style="margin-top:8px;"><h1 id="globalTitle" style="font-size:16px;">Global Preferences</h1><div class="sub" id="tokenHint">Token estimate is approximate (chars/4).</div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;"><label id="pretrimProfileLabel" for="pretrimProfileSel" style="font-size:12px;color:var(--muted);">Pretrim Profile</label><select id="pretrimProfileSel"><option value="conservative">Conservative (~20%, preserve detail)</option><option value="balanced" selected>Balanced (~40%, recommended)</option><option value="aggressive">Aggressive (~60%, strongest trim)</option></select><button id="savePretrimProfileBtn" style="height:30px;">Save</button><button id="cleanGlobalNoteBtn" style="height:30px;">清洗 note</button><span id="pretrimProfileHint" class="sub" style="margin:0;"></span></div><div id="globalPrefs" class="empty">No global preferences.</div></div></details></div>',
         '        <div class="panel"><h1 id="settingsTitle" style="font-size:16px;">Memory System Settings</h1><div class="sub" id="settingsHint">Adjust runtime behavior. Saved locally and persisted.</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;"><details id="toggleFold" class="fold" open><summary id="toggleFoldSummary">开关参数（默认展开）</summary><div id="settingsToggleForm" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center;margin-top:8px;"></div></details><details id="numericFold" class="fold" open><summary id="numericFoldSummary">数值参数（默认展开）</summary><div id="settingsNumericForm" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center;margin-top:8px;"></div></details></div><div style="margin-top:10px;display:flex;gap:8px;align-items:center;"><button id="settingsSaveBtn" style="height:30px;">Save Settings</button><span id="settingsStatus" class="sub" style="margin:0;"></span></div></div>',
         '        ',
       '      </section>',
@@ -7523,6 +7581,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    const langSel = $("langSel");',
       '    const pretrimProfileSel = $("pretrimProfileSel");',
       '    const savePretrimProfileBtn = $("savePretrimProfileBtn");',
+      '    const cleanGlobalNoteBtn = $("cleanGlobalNoteBtn");',
       '    const pretrimProfileHint = $("pretrimProfileHint");',
       '    const settingsForm = $("settingsForm");',
       '    const settingsToggleForm = $("settingsToggleForm");',
@@ -7668,7 +7727,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '      independentLlmMaxTokens:{zh:"独立LLM单次总结输出上限。",en:"Max output tokens for one summary call."},',
       '      independentLlmTemperature:{zh:"独立LLM温度。",en:"Temperature for independent LLM summary."}',
       '    };',
-      '    const I18N = { zh:{title:"记忆看板",lang:"语言",global:"全局偏好",token:"Token 估算为近似值（chars/4）",generatedLabel:"生成时间",noProjectSelected:"未选择项目",noGlobalPrefs:"暂无全局偏好",noEvents:"暂无事件",compressedSummary:"压缩摘要",compressedBlocks:"压缩块",pretrimTraces:"发送前裁剪轨迹（最近 8 条）",edit:"编辑摘要",del:"删除会话",nos:"暂无会话",noproj:"暂无项目记忆",save:"保存",cancel:"取消",sessions:"会话",tabSessions:"会话页",tabSettings:"参数页",tabLlm:"LLM设置",tabTrash:"回收站",trashTitle:"回收站",trashNone:"暂无回收站条目",trashDelete:"永久删除",trashCleanup:"立即清理过期",trashRetentionLabel:"保留天数",batchDelete:"批量删除",batchSelectFirst:"请先勾选要删除的会话",batchDeleteConfirm:"批量删除 {n} 个会话记忆？将写入审计日志。",pretrimProfileLabel:"裁剪档位",pretrimConservative:"保守（约20%，细节保留优先）",pretrimBalanced:"平衡（约40%，推荐）",pretrimAggressive:"激进（约60%，最强裁剪）",pretrimSave:"保存并立即生效",pretrimCurrent:"当前档位：",pretrimSaved:"已保存，下一次发送前裁剪立即按该档位生效。",settingsTitle:"记忆系统设置",settingsHint:"可视化调节关键机制，保存到本地并持久化。",settingsSave:"保存设置",settingsSaved:"设置已保存，后续请求自动生效。",globalPrefsFoldSummary:"全局偏好设置",metricProjects:"项目数",metricSessions:"会话数",metricEvents:"事件数",projectMetaFmt:"会话={sessions} · 事件={events} · 技术栈={tech}",projectListMetaFmt:"会话={sessions} · 事件={events}",sessionStatPrune:"修剪",sessionStatPretrim:"发送前裁剪",sessionStatSaved:"节省",sessionStatBlocks:"压缩块",sessionStatBody:"正文约",sessionStatSystem:"system约",sessionStatTotal:"总量约(正文+system)",sessionStatBudget:"预算",sessionStatTarget:"目标",sessionStatPretrimLast:"最近发送前裁剪",settingsSendPretrimEnabled:"发送前自动裁剪",settingsSendPretrimBudget:"发送前裁剪预算(token)",settingsSendPretrimTarget:"发送前裁剪目标(token)",settingsVisibleNoticesEnabled:"可见提示",settingsVisibleNoticeForDiscard:"显示裁剪提示",settingsNotificationMode:"通知模式",settingsDcpPrunableToolsEnabled:"注入可裁剪工具列表",settingsDcpMessageIdTagsEnabled:"注入消息ID标签",settingsInjectGlobalPrefsOnSessionStart:"会话开始注入全局偏好",settingsInjectMemoryDocsEnabled:"注入记忆文档",settingsRecallEnabled:"启用跨会话召回",settingsCurrentSummaryEvery:"当前会话摘要注入间隔(用户消息数)",settingsCurrentSummaryTokenBudget:"当前会话摘要预算(token)",settingsRecallTokenBudget:"跨会话召回预算(token)",settingsRecallTopSessions:"跨会话召回会话数",settingsRecallMaxEventsPerSession:"每会话召回事件数",settingsRecallCooldownMs:"跨会话召回冷却(ms)",settingsVisibleNoticeCooldownMs:"可见提示冷却(ms)",llmTitle:"LLM设置",llmHint:"内联与独立LLM总结参数。保存后立即生效。",llmSave:"保存LLM配置",llmSaved:"LLM配置已保存，后续请求立即生效。",llmFetchModels:"自动获取模型",llmValidate:"验证配置",llmModelsLoaded:"模型列表已更新",llmValidateOk:"验证成功，可用于LLM总结",llmQuickTitle:"独立LLM总结（快捷查看）",llmQuickHint:"当前配置摘要。可在此确认是否启用独立LLM，点击按钮进入完整配置。",llmQuickModeLabel:"模式",llmQuickProviderLabel:"Provider",llmQuickModelLabel:"Model",llmQuickBaseLabel:"BaseURL",llmQuickGo:"打开独立LLM配置页"}, en:{title:"Memory Dashboard",lang:"Language",global:"Global Preferences",token:"Token estimate is approximate (chars/4).",generatedLabel:"Generated",noProjectSelected:"No project selected",noGlobalPrefs:"No global preferences.",noEvents:"No events.",compressedSummary:"compressed summary",compressedBlocks:"compressed blocks",pretrimTraces:"pretrim traces (latest 8)",edit:"Edit summary",del:"Delete session",nos:"No sessions.",noproj:"No project memory yet.",save:"Save",cancel:"Cancel",sessions:"Sessions",tabSessions:"Sessions",tabSettings:"Settings",tabLlm:"LLM Settings",tabTrash:"Trash",trashTitle:"Trash",trashNone:"No trash entries",trashDelete:"Delete Permanently",trashCleanup:"Cleanup Expired",trashRetentionLabel:"Retention Days",batchDelete:"Batch Delete",batchSelectFirst:"Select sessions first",batchDeleteConfirm:"Batch delete {n} session memories? This writes audit logs.",pretrimProfileLabel:"Pretrim Profile",pretrimConservative:"Conservative (~20%, preserve detail)",pretrimBalanced:"Balanced (~40%, recommended)",pretrimAggressive:"Aggressive (~60%, strongest trim)",pretrimSave:"Save (effective next send)",pretrimCurrent:"Current profile: ",pretrimSaved:"Saved. Effective for next send pretrim.",settingsTitle:"Memory System Settings",settingsHint:"Tune runtime behaviors with persistent local config.",settingsSave:"Save Settings",settingsSaved:"Settings saved. Effective for next requests.",globalPrefsFoldSummary:"Global Preferences",metricProjects:"Projects",metricSessions:"Sessions",metricEvents:"Events",projectMetaFmt:"sessions={sessions} · events={events} · tech={tech}",projectListMetaFmt:"sessions={sessions} · events={events}",sessionStatPrune:"prune",sessionStatPretrim:"pretrim",sessionStatSaved:"saved",sessionStatBlocks:"blocks",sessionStatBody:"body~",sessionStatSystem:"system~",sessionStatTotal:"total~(body+system)",sessionStatBudget:"budget",sessionStatTarget:"target",sessionStatPretrimLast:"last pretrim",settingsSendPretrimEnabled:"Send-time auto pretrim",settingsSendPretrimBudget:"Send pretrim budget (tokens)",settingsSendPretrimTarget:"Send pretrim target (tokens)",settingsVisibleNoticesEnabled:"Visible notices",settingsVisibleNoticeForDiscard:"Show discard notices",settingsNotificationMode:"Notification mode",settingsDcpPrunableToolsEnabled:"Inject <prunable-tools>",settingsDcpMessageIdTagsEnabled:"Inject message-id tags",settingsInjectGlobalPrefsOnSessionStart:"Inject global prefs on session start",settingsInjectMemoryDocsEnabled:"Inject memory docs",settingsRecallEnabled:"Enable cross-session recall",settingsCurrentSummaryEvery:"Current summary interval (user messages)",settingsCurrentSummaryTokenBudget:"Current summary budget (tokens)",settingsRecallTokenBudget:"Recall budget (tokens)",settingsRecallTopSessions:"Recall top sessions",settingsRecallMaxEventsPerSession:"Recall events per session",settingsRecallCooldownMs:"Recall cooldown (ms)",settingsVisibleNoticeCooldownMs:"Visible notice cooldown (ms)",llmTitle:"LLM Settings",llmHint:"Inline and independent LLM summary settings. Effective immediately after save.",llmSave:"Save LLM Config",llmSaved:"LLM config saved and effective for next requests.",llmFetchModels:"Fetch Models",llmValidate:"Validate Config",llmModelsLoaded:"Model list updated",llmValidateOk:"Validation succeeded",llmQuickTitle:"Independent LLM Summary (Quick View)",llmQuickHint:"Snapshot of current config. Click to open full LLM settings.",llmQuickModeLabel:"Mode",llmQuickProviderLabel:"Provider",llmQuickModelLabel:"Model",llmQuickBaseLabel:"BaseURL",llmQuickGo:"Open Full LLM Settings"} };',
+      '    const I18N = { zh:{title:"记忆看板",lang:"语言",global:"全局偏好",token:"Token 估算为近似值（chars/4）",generatedLabel:"生成时间",noProjectSelected:"未选择项目",noGlobalPrefs:"暂无全局偏好",noEvents:"暂无事件",compressedSummary:"压缩摘要",compressedBlocks:"压缩块",pretrimTraces:"发送前裁剪轨迹（最近 8 条）",edit:"编辑摘要",del:"删除会话",nos:"暂无会话",noproj:"暂无项目记忆",save:"保存",cancel:"取消",sessions:"会话",tabSessions:"会话页",tabSettings:"参数页",tabLlm:"LLM设置",tabTrash:"回收站",trashTitle:"回收站",trashNone:"暂无回收站条目",trashDelete:"永久删除",trashCleanup:"立即清理过期",trashRetentionLabel:"保留天数",batchDelete:"批量删除",batchSelectFirst:"请先勾选要删除的会话",batchDeleteConfirm:"批量删除 {n} 个会话记忆？将写入审计日志。",pretrimProfileLabel:"裁剪档位",pretrimConservative:"保守（约20%，细节保留优先）",pretrimBalanced:"平衡（约40%，推荐）",pretrimAggressive:"激进（约60%，最强裁剪）",pretrimSave:"保存并立即生效",pretrimCurrent:"当前档位：",pretrimSaved:"已保存，下一次发送前裁剪立即按该档位生效。",cleanGlobalNote:"清洗 note",cleanGlobalNoteDone:"note 已清洗并重新编号。",settingsTitle:"记忆系统设置",settingsHint:"可视化调节关键机制，保存到本地并持久化。",settingsSave:"保存设置",settingsSaved:"设置已保存，后续请求自动生效。",globalPrefsFoldSummary:"全局偏好设置",metricProjects:"项目数",metricSessions:"会话数",metricEvents:"事件数",projectMetaFmt:"会话={sessions} · 事件={events} · 技术栈={tech}",projectListMetaFmt:"会话={sessions} · 事件={events}",sessionStatPrune:"修剪",sessionStatPretrim:"发送前裁剪",sessionStatSaved:"节省",sessionStatBlocks:"压缩块",sessionStatBody:"正文约",sessionStatSystem:"system约",sessionStatTotal:"总量约(正文+system)",sessionStatBudget:"预算",sessionStatTarget:"目标",sessionStatPretrimLast:"最近发送前裁剪",settingsSendPretrimEnabled:"发送前自动裁剪",settingsSendPretrimBudget:"发送前裁剪预算(token)",settingsSendPretrimTarget:"发送前裁剪目标(token)",settingsVisibleNoticesEnabled:"可见提示",settingsVisibleNoticeForDiscard:"显示裁剪提示",settingsNotificationMode:"通知模式",settingsDcpPrunableToolsEnabled:"注入可裁剪工具列表",settingsDcpMessageIdTagsEnabled:"注入消息ID标签",settingsInjectGlobalPrefsOnSessionStart:"会话开始注入全局偏好",settingsInjectMemoryDocsEnabled:"注入记忆文档",settingsRecallEnabled:"启用跨会话召回",settingsCurrentSummaryEvery:"当前会话摘要注入间隔(用户消息数)",settingsCurrentSummaryTokenBudget:"当前会话摘要预算(token)",settingsRecallTokenBudget:"跨会话召回预算(token)",settingsRecallTopSessions:"跨会话召回会话数",settingsRecallMaxEventsPerSession:"每会话召回事件数",settingsRecallCooldownMs:"跨会话召回冷却(ms)",settingsVisibleNoticeCooldownMs:"可见提示冷却(ms)",llmTitle:"LLM设置",llmHint:"内联与独立LLM总结参数。保存后立即生效。",llmSave:"保存LLM配置",llmSaved:"LLM配置已保存，后续请求立即生效。",llmFetchModels:"自动获取模型",llmValidate:"验证配置",llmModelsLoaded:"模型列表已更新",llmValidateOk:"验证成功，可用于LLM总结",llmQuickTitle:"独立LLM总结（快捷查看）",llmQuickHint:"当前配置摘要。可在此确认是否启用独立LLM，点击按钮进入完整配置。",llmQuickModeLabel:"模式",llmQuickProviderLabel:"Provider",llmQuickModelLabel:"Model",llmQuickBaseLabel:"BaseURL",llmQuickGo:"打开独立LLM配置页"}, en:{title:"Memory Dashboard",lang:"Language",global:"Global Preferences",token:"Token estimate is approximate (chars/4).",generatedLabel:"Generated",noProjectSelected:"No project selected",noGlobalPrefs:"No global preferences.",noEvents:"No events.",compressedSummary:"compressed summary",compressedBlocks:"compressed blocks",pretrimTraces:"pretrim traces (latest 8)",edit:"Edit summary",del:"Delete session",nos:"No sessions.",noproj:"No project memory yet.",save:"Save",cancel:"Cancel",sessions:"Sessions",tabSessions:"Sessions",tabSettings:"Settings",tabLlm:"LLM Settings",tabTrash:"Trash",trashTitle:"Trash",trashNone:"No trash entries",trashDelete:"Delete Permanently",trashCleanup:"Cleanup Expired",trashRetentionLabel:"Retention Days",batchDelete:"Batch Delete",batchSelectFirst:"Select sessions first",batchDeleteConfirm:"Batch delete {n} session memories? This writes audit logs.",pretrimProfileLabel:"Pretrim Profile",pretrimConservative:"Conservative (~20%, preserve detail)",pretrimBalanced:"Balanced (~40%, recommended)",pretrimAggressive:"Aggressive (~60%, strongest trim)",pretrimSave:"Save (effective next send)",pretrimCurrent:"Current profile: ",pretrimSaved:"Saved. Effective for next send pretrim.",cleanGlobalNote:"Clean note",cleanGlobalNoteDone:"Note cleaned and renumbered.",settingsTitle:"Memory System Settings",settingsHint:"Tune runtime behaviors with persistent local config.",settingsSave:"Save Settings",settingsSaved:"Settings saved. Effective for next requests.",globalPrefsFoldSummary:"Global Preferences",metricProjects:"Projects",metricSessions:"Sessions",metricEvents:"Events",projectMetaFmt:"sessions={sessions} · events={events} · tech={tech}",projectListMetaFmt:"sessions={sessions} · events={events}",sessionStatPrune:"prune",sessionStatPretrim:"pretrim",sessionStatSaved:"saved",sessionStatBlocks:"blocks",sessionStatBody:"body~",sessionStatSystem:"system~",sessionStatTotal:"total~(body+system)",sessionStatBudget:"budget",sessionStatTarget:"target",sessionStatPretrimLast:"last pretrim",settingsSendPretrimEnabled:"Send-time auto pretrim",settingsSendPretrimBudget:"Send pretrim budget (tokens)",settingsSendPretrimTarget:"Send pretrim target (tokens)",settingsVisibleNoticesEnabled:"Visible notices",settingsVisibleNoticeForDiscard:"Show discard notices",settingsNotificationMode:"Notification mode",settingsDcpPrunableToolsEnabled:"Inject <prunable-tools>",settingsDcpMessageIdTagsEnabled:"Inject message-id tags",settingsInjectGlobalPrefsOnSessionStart:"Inject global prefs on session start",settingsInjectMemoryDocsEnabled:"Inject memory docs",settingsRecallEnabled:"Enable cross-session recall",settingsCurrentSummaryEvery:"Current summary interval (user messages)",settingsCurrentSummaryTokenBudget:"Current summary budget (tokens)",settingsRecallTokenBudget:"Recall budget (tokens)",settingsRecallTopSessions:"Recall top sessions",settingsRecallMaxEventsPerSession:"Recall events per session",settingsRecallCooldownMs:"Recall cooldown (ms)",settingsVisibleNoticeCooldownMs:"Visible notice cooldown (ms)",llmTitle:"LLM Settings",llmHint:"Inline and independent LLM summary settings. Effective immediately after save.",llmSave:"Save LLM Config",llmSaved:"LLM config saved and effective for next requests.",llmFetchModels:"Fetch Models",llmValidate:"Validate Config",llmModelsLoaded:"Model list updated",llmValidateOk:"Validation succeeded",llmQuickTitle:"Independent LLM Summary (Quick View)",llmQuickHint:"Snapshot of current config. Click to open full LLM settings.",llmQuickModeLabel:"Mode",llmQuickProviderLabel:"Provider",llmQuickModelLabel:"Model",llmQuickBaseLabel:"BaseURL",llmQuickGo:"Open Full LLM Settings"} };',
       '    I18N.zh.tabTemplate = "摘要模板设置"; I18N.en.tabTemplate = "Template";',
       '    I18N.zh.templateTitle = "摘要模板设置"; I18N.en.templateTitle = "Template Settings";',
       '    I18N.zh.templateHint = "用于机械裁剪/LLM总结的输出格式，不是页面模板。保存后立即生效并持久化。"; I18N.en.templateHint = "Used for mechanical trim/LLM summary output format, not the dashboard page template.";',
@@ -7771,6 +7830,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    function normalizePretrimProfile(v){ const s=String(v||"").trim().toLowerCase(); if(["conservative","balanced","aggressive"].includes(s)) return s; return "balanced"; }',
       '    function updatePretrimProfileUi(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const v=normalizePretrimProfile(prefs.pretrimProfile||prefs.pretrim_profile||"balanced"); if(pretrimProfileSel) pretrimProfileSel.value=v; const label=(v==="conservative")?t("pretrimConservative"):(v==="aggressive")?t("pretrimAggressive"):t("pretrimBalanced"); if(pretrimProfileHint) pretrimProfileHint.textContent=t("pretrimCurrent")+label; }',
       '    async function savePretrimProfile(){ if(!pretrimProfileSel) return; const v=normalizePretrimProfile(pretrimProfileSel.value); try{ await apiPost("/api/memory/global/preferences",{key:"pretrimProfile",value:v,confirm:true,source:"dashboard"}); if(pretrimProfileHint) pretrimProfileHint.textContent=t("pretrimSaved"); await refreshDashboardData(); }catch(e){ alert("Save profile failed: "+e.message);} }',
+      '    async function cleanGlobalNote(){ try{ await apiPost("/api/memory/global/note/clean",{confirm:true,source:"dashboard"}); if(pretrimProfileHint) pretrimProfileHint.textContent=t("cleanGlobalNoteDone"); await refreshDashboardData(); }catch(e){ alert("Clean note failed: "+e.message);} }',
       '    function getSettingsMap(){ const s=(DATA&&DATA.settings&&DATA.settings.memorySystem)||{}; return (s&&typeof s==="object")?s:{}; }',
       '    function toBool(v, d){ if(typeof v==="boolean") return v; const s=String(v||"").trim().toLowerCase(); if(["1","true","yes","on"].includes(s)) return true; if(["0","false","no","off"].includes(s)) return false; return d; }',
       '    function __settingPriority(k){ const p={ sendPretrimEnabled:1,dcpCompatMode:2,sendPretrimWarmupEnabled:3,sendPretrimBudget:4,sendPretrimTarget:5,sendPretrimDistillTriggerRatio:6,sendPretrimHardRatio:7,sendPretrimTurnProtection:8,sendPretrimMaxRewriteMessages:9,distillSummaryMaxChars:10,distillInputMaxChars:11,distillRangeMinMessages:12,distillRangeMaxMessages:13,recallEnabled:14,recallTokenBudget:15,recallTopSessions:16,recallMaxEventsPerSession:17,recallMaxChars:18,recallCooldownMs:19,currentSummaryEvery:20,currentSummaryTokenBudget:21,currentSummaryMaxChars:22,currentSummaryMaxEvents:23,injectGlobalPrefsOnSessionStart:24,injectMemoryDocsEnabled:25,systemPromptAuditEnabled:26,dcpPrunableToolsEnabled:27,dcpMessageIdTagsEnabled:28,visibleNoticesEnabled:29,notificationMode:30,visibleNoticeForDiscard:31,visibleNoticeCurrentSummaryMirrorEnabled:32,visibleNoticeCooldownMs:33,visibleNoticeMirrorDeleteMs:34,systemPromptAuditMaxChars:35,strategyPurgeErrorTurns:36,maxEventsPerSession:37,summaryTriggerEvents:38,summaryKeepRecentEvents:39,summaryMaxChars:40,summaryMaxCharsBudgetMode:41,discardMaxRemovalsPerPass:42,extractEventsPerPass:43 }; return Number(p[k]||999); }',
@@ -7794,7 +7854,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    async function editSummary(projectName,sessionID,current){ const modal=$("editModal"); const ta=$("editTextarea"); const saveBtn=$("editSaveBtn"); const cancelBtn=$("editCancelBtn"); $("editTitle").textContent=t("edit")+" - "+sessionID; ta.value=current||""; $("editCancelBtn").textContent=t("cancel"); $("editSaveBtn").textContent=t("save"); modal.style.display="flex"; const close=()=>{ modal.style.display="none"; }; cancelBtn.onclick=close; saveBtn.onclick=async()=>{ if(!window.confirm("Apply summary update and write audit log?")) return; try{ await apiPost("/api/memory/session/summary",{projectName,sessionID,summaryText:ta.value,confirm:true,source:"dashboard"}); close(); window.location.reload(); }catch(e){ alert("Update failed: "+e.message);} }; }',
       '    async function deleteSession(projectName,sessionID){ if(!window.confirm("Delete this session memory file? This writes an audit log.")) return; try{ await apiPost("/api/memory/session/delete",{projectName,sessionID,confirm:true,source:"dashboard"}); window.location.reload(); }catch(e){ alert("Delete failed: "+e.message);} }',
       '    async function batchDeleteSessions(projectName){ const ids=[...__selectedSessionIDs].filter(Boolean); if(!ids.length){ alert(t("batchSelectFirst")); return; } if(!window.confirm(t("batchDeleteConfirm").replace("{n}", String(ids.length)))) return; try{ await apiPost("/api/memory/sessions/delete",{projectName,sessionIDs:ids,confirm:true,source:"dashboard"}); ids.forEach((id)=>__selectedSessionIDs.delete(id)); updateBatchDeleteBtn(); await refreshDashboardData(); }catch(e){ alert("Batch delete failed: "+e.message);} }',
-      '    function applyLang(){ $("titleMain").textContent=t("title"); setConnectionBadge(($("connBadge")&&$("connBadge").classList.contains("bad"))?"bad":(($("connBadge")&&$("connBadge").classList.contains("ok"))?"ok":"pending")); $("langLabel").textContent=t("lang"); const mpk=$("mProjectsK"); if(mpk) mpk.textContent=t("metricProjects"); const msk=$("mSessionsK"); if(msk) msk.textContent=t("metricSessions"); const mek=$("mEventsK"); if(mek) mek.textContent=t("metricEvents"); if(tabSessionsBtn) tabSessionsBtn.textContent=t("tabSessions"); if(tabTemplateBtn) tabTemplateBtn.textContent=t("tabTemplate"); if(tabLlmBtn) tabLlmBtn.textContent=t("tabLlm"); if(tabSettingsBtn) tabSettingsBtn.textContent=t("tabSettings"); if(tabTrashBtn) tabTrashBtn.textContent=t("tabTrash"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); const gf=$("globalPrefsFoldSummary"); if(gf) gf.textContent=t("globalPrefsFoldSummary"); if(!__activeProjectName) projectTitle.textContent=t("noProjectSelected"); const settingsTitle=$("settingsTitle"); if(settingsTitle) settingsTitle.textContent=t("settingsTitle"); const llmTitle=$("llmTitle"); if(llmTitle) llmTitle.textContent=t("llmTitle"); const llmHint=$("llmHint"); if(llmHint) llmHint.textContent=t("llmHint"); const settingsHint=$("settingsHint"); if(settingsHint) settingsHint.textContent=t("settingsHint"); const templateTitle=$("templateTitle"); if(templateTitle) templateTitle.textContent=t("templateTitle"); const templateHint=$("templateHint"); if(templateHint) templateHint.textContent=t("templateHint"); const templateFormatHint=$("templateFormatHint"); if(templateFormatHint) templateFormatHint.textContent=t("templateFormatHint"); const templateSaveBtnEl=$("templateSaveBtn"); if(templateSaveBtnEl) templateSaveBtnEl.textContent=t("templateSave"); const templateUseBtnEl=$("templateUseBtn"); if(templateUseBtnEl) templateUseBtnEl.textContent=t("templateUse"); const templateNameLabel=$("templateNameLabel"); if(templateNameLabel) templateNameLabel.textContent=t("templateNameLabel"); const templateSelectLabel=$("templateSelectLabel"); if(templateSelectLabel) templateSelectLabel.textContent=t("templateSelectLabel"); const templateResetBtnEl=$("templateResetBtn"); if(templateResetBtnEl) templateResetBtnEl.textContent=t("templateReset"); const templatePreviewBtnEl=$("templatePreviewBtn"); if(templatePreviewBtnEl) templatePreviewBtnEl.textContent=t("templatePreviewBtn"); const settingsSaveBtnEl=$("settingsSaveBtn"); if(settingsSaveBtnEl) settingsSaveBtnEl.textContent=t("settingsSave"); const llmSaveBtnEl=$("llmSaveBtn"); if(llmSaveBtnEl) llmSaveBtnEl.textContent=t("llmSave"); const llmFetchBtnEl=$("llmFetchModelsBtn"); if(llmFetchBtnEl) llmFetchBtnEl.textContent=t("llmFetchModels"); const llmValidateBtnEl=$("llmValidateBtn"); if(llmValidateBtnEl) llmValidateBtnEl.textContent=t("llmValidate"); const sessionsTitle=$("sessionsTitle"); if(sessionsTitle) sessionsTitle.textContent=t("sessions"); const selectAllBtn=$("batchSelectAllBtn"); if(selectAllBtn) selectAllBtn.textContent=t("selectAll"); const selectNoneBtn=$("batchSelectNoneBtn"); if(selectNoneBtn) selectNoneBtn.textContent=t("selectNone"); const auditHint=$("systemAuditHint"); if(auditHint) auditHint.textContent=t("systemAuditHint"); const trashTitle=$("trashTitle"); if(trashTitle) trashTitle.textContent=t("trashTitle"); const retentionLabel=$("trashRetentionLabel"); if(retentionLabel) retentionLabel.textContent=t("trashRetentionLabel"); const trashAllBtn=$("trashSelectAllBtn"); if(trashAllBtn) trashAllBtn.textContent=t("selectAll"); const trashNoneBtn=$("trashSelectNoneBtn"); if(trashNoneBtn) trashNoneBtn.textContent=t("selectNone"); const c=$("trashCleanupBtn"); if(c) c.textContent=t("trashCleanup"); const pLabel=$("pretrimProfileLabel"); if(pLabel) pLabel.textContent=t("pretrimProfileLabel"); if(pretrimProfileSel&&pretrimProfileSel.options&&pretrimProfileSel.options.length>=3){ pretrimProfileSel.options[0].text=t("pretrimConservative"); pretrimProfileSel.options[1].text=t("pretrimBalanced"); pretrimProfileSel.options[2].text=t("pretrimAggressive"); } const pSave=$("savePretrimProfileBtn"); if(pSave) pSave.textContent=t("pretrimSave"); updateBatchDeleteBtn(); updateTrashDeleteBtn(); renderSettings(); renderTemplateSettings(); renderLlmSettings(); }',
+      '    function applyLang(){ $("titleMain").textContent=t("title"); setConnectionBadge(($("connBadge")&&$("connBadge").classList.contains("bad"))?"bad":(($("connBadge")&&$("connBadge").classList.contains("ok"))?"ok":"pending")); $("langLabel").textContent=t("lang"); const mpk=$("mProjectsK"); if(mpk) mpk.textContent=t("metricProjects"); const msk=$("mSessionsK"); if(msk) msk.textContent=t("metricSessions"); const mek=$("mEventsK"); if(mek) mek.textContent=t("metricEvents"); if(tabSessionsBtn) tabSessionsBtn.textContent=t("tabSessions"); if(tabTemplateBtn) tabTemplateBtn.textContent=t("tabTemplate"); if(tabLlmBtn) tabLlmBtn.textContent=t("tabLlm"); if(tabSettingsBtn) tabSettingsBtn.textContent=t("tabSettings"); if(tabTrashBtn) tabTrashBtn.textContent=t("tabTrash"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); const gf=$("globalPrefsFoldSummary"); if(gf) gf.textContent=t("globalPrefsFoldSummary"); if(!__activeProjectName) projectTitle.textContent=t("noProjectSelected"); const settingsTitle=$("settingsTitle"); if(settingsTitle) settingsTitle.textContent=t("settingsTitle"); const llmTitle=$("llmTitle"); if(llmTitle) llmTitle.textContent=t("llmTitle"); const llmHint=$("llmHint"); if(llmHint) llmHint.textContent=t("llmHint"); const settingsHint=$("settingsHint"); if(settingsHint) settingsHint.textContent=t("settingsHint"); const templateTitle=$("templateTitle"); if(templateTitle) templateTitle.textContent=t("templateTitle"); const templateHint=$("templateHint"); if(templateHint) templateHint.textContent=t("templateHint"); const templateFormatHint=$("templateFormatHint"); if(templateFormatHint) templateFormatHint.textContent=t("templateFormatHint"); const templateSaveBtnEl=$("templateSaveBtn"); if(templateSaveBtnEl) templateSaveBtnEl.textContent=t("templateSave"); const templateUseBtnEl=$("templateUseBtn"); if(templateUseBtnEl) templateUseBtnEl.textContent=t("templateUse"); const templateNameLabel=$("templateNameLabel"); if(templateNameLabel) templateNameLabel.textContent=t("templateNameLabel"); const templateSelectLabel=$("templateSelectLabel"); if(templateSelectLabel) templateSelectLabel.textContent=t("templateSelectLabel"); const templateResetBtnEl=$("templateResetBtn"); if(templateResetBtnEl) templateResetBtnEl.textContent=t("templateReset"); const templatePreviewBtnEl=$("templatePreviewBtn"); if(templatePreviewBtnEl) templatePreviewBtnEl.textContent=t("templatePreviewBtn"); const settingsSaveBtnEl=$("settingsSaveBtn"); if(settingsSaveBtnEl) settingsSaveBtnEl.textContent=t("settingsSave"); const llmSaveBtnEl=$("llmSaveBtn"); if(llmSaveBtnEl) llmSaveBtnEl.textContent=t("llmSave"); const llmFetchBtnEl=$("llmFetchModelsBtn"); if(llmFetchBtnEl) llmFetchBtnEl.textContent=t("llmFetchModels"); const llmValidateBtnEl=$("llmValidateBtn"); if(llmValidateBtnEl) llmValidateBtnEl.textContent=t("llmValidate"); const sessionsTitle=$("sessionsTitle"); if(sessionsTitle) sessionsTitle.textContent=t("sessions"); const selectAllBtn=$("batchSelectAllBtn"); if(selectAllBtn) selectAllBtn.textContent=t("selectAll"); const selectNoneBtn=$("batchSelectNoneBtn"); if(selectNoneBtn) selectNoneBtn.textContent=t("selectNone"); const auditHint=$("systemAuditHint"); if(auditHint) auditHint.textContent=t("systemAuditHint"); const trashTitle=$("trashTitle"); if(trashTitle) trashTitle.textContent=t("trashTitle"); const retentionLabel=$("trashRetentionLabel"); if(retentionLabel) retentionLabel.textContent=t("trashRetentionLabel"); const trashAllBtn=$("trashSelectAllBtn"); if(trashAllBtn) trashAllBtn.textContent=t("selectAll"); const trashNoneBtn=$("trashSelectNoneBtn"); if(trashNoneBtn) trashNoneBtn.textContent=t("selectNone"); const c=$("trashCleanupBtn"); if(c) c.textContent=t("trashCleanup"); const pLabel=$("pretrimProfileLabel"); if(pLabel) pLabel.textContent=t("pretrimProfileLabel"); if(pretrimProfileSel&&pretrimProfileSel.options&&pretrimProfileSel.options.length>=3){ pretrimProfileSel.options[0].text=t("pretrimConservative"); pretrimProfileSel.options[1].text=t("pretrimBalanced"); pretrimProfileSel.options[2].text=t("pretrimAggressive"); } const pSave=$("savePretrimProfileBtn"); if(pSave) pSave.textContent=t("pretrimSave"); const cleanBtn=$("cleanGlobalNoteBtn"); if(cleanBtn) cleanBtn.textContent=t("cleanGlobalNote"); updateBatchDeleteBtn(); updateTrashDeleteBtn(); renderSettings(); renderTemplateSettings(); renderLlmSettings(); }',
       '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); updatePretrimProfileUi(); if(!entries.length){globalPrefs.textContent=t("noGlobalPrefs"); return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
       '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; const _title=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:(s.sessionID||""); sid.textContent=_title+"  id:"+(s.sessionID||""); sid.style.whiteSpace="normal"; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const stt=(s.budget&&s.budget.lastEstimatedSystemTokens)||0; const pht=(s.budget&&s.budget.lastEstimatedPluginHintTokens)||0; const tt=(s.budget&&s.budget.lastEstimatedTotalTokens)||((bt||0)+(stt||0)); const pb=(s.budget&&s.budget.sendPretrimBudget)||0; const pt=(s.budget&&s.budget.sendPretrimTarget)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const sp=s.sendPretrim||{}; const w=(sp&&sp.warmup)||{}; const lastTrace=(sp.traces&&sp.traces.length)?sp.traces[sp.traces.length-1]:null; const summaryMode=lastTrace?(lastTrace.distillUsed ?((lastTrace.warmupCacheHit||String(lastTrace.distillSource||"").includes("warmup"))?t("llmSummaryCache"):(String(lastTrace.distillProvider||"").includes("session-inline")?t("llmSummaryInline"):t("llmSummaryIndependent"))):t("llmSummaryMechanical")):"-"; const spLast=(sp.lastSavedTokens||0)>0?(" · "+t("sessionStatPretrimLast")+":"+(sp.lastBeforeTokens||0)+"→"+(sp.lastAfterTokens||0)+" (save~"+(sp.lastSavedTokens||0)+")"):""; const strictNow=(sp.traces&&sp.traces.length&&sp.traces[sp.traces.length-1].strictApplied)?(" · strict:ON("+((sp.traces[sp.traces.length-1].strictReplacedMessages)||0)+")"):""; const warmupStats=" · "+t("sessionStatWarmup")+":h"+(w.hitCount||0)+"/m"+(w.missCount||0)+"/s"+((w.skipBudgetCount||0)+(w.skipCooldownCount||0))+"/f"+(w.failCount||0); const warmupBind=" · "+t("sessionStatBound")+":"+((w.lastUserMessageID&&String(w.lastUserMessageID).slice(-16))||"-")+" · "+t("sessionStatWarmupStatus")+":"+((w.status&&String(w.status).slice(0,40))||"-"); const risk=(s.alerts&&s.alerts.contextStackRisk)?(" · "+t("sessionStatRiskStack")):""; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":t(\"injectReasonGlobal\"),\"current-session-refresh\":t(\"injectReasonCurrent\"),\"trigger-recall\":t(\"injectReasonRecall\"),\"memory-docs\":t(\"injectReasonDocs\"),\"memory-inject\":t(\"injectReasonManual\")}; const reasonLabel=reasonMap[reasonRaw]||t(\"none\"); const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():t(\"none\"); st.textContent=\"u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · \"+t(\"sessionStatInject\")+\":g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · \"+t(\"sessionStatLastInject\")+\":\"+reasonLabel+\" @ \"+injectAt+\" · \"+t(\"sessionStatPrune\")+\":\"+t(\"autoLabel\")+(pa.autoRuns||0)+\"/\"+t(\"manualLabel\")+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · \"+t(\"sessionStatPretrim\")+\":\"+t(\"autoLabel\")+(sp.autoRuns||0)+\" \"+t(\"sessionStatSaved\")+\"~\"+(sp.savedTokensTotal||0)+\" · \"+t(\"tabLlm\")+\":\"+summaryMode+spLast+strictNow+risk+\" · \"+t(\"sessionStatBlocks\")+\":\"+(((s.summaryBlocks&&s.summaryBlocks.count)||0))+\" · \"+t(\"sessionStatBudget\")+\":\"+pb+\" · \"+t(\"sessionStatTarget\")+\":\"+pt+\" · \"+t(\"sessionStatBody")+bt+" · "+t("sessionStatSystem")+stt+" · "+t("sessionStatPluginHint")+pht+" · "+t("sessionStatTotal")+tt+" "+t("tokensLabel")+warmupStats+warmupBind; const metaWrap=document.createElement("div"); metaWrap.style.display="flex"; metaWrap.style.flexDirection="column"; metaWrap.style.alignItems="flex-start"; metaWrap.style.gap="4px"; metaWrap.appendChild(sid); metaWrap.appendChild(st); head.appendChild(sel); head.appendChild(metaWrap); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noEvents"); events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } if(s.summaryBlocks&&Array.isArray(s.summaryBlocks.recent)&&s.summaryBlocks.recent.length){ const blk=document.createElement("div"); blk.className="ev"; const bm=document.createElement("div"); bm.className="meta"; bm.textContent=t("compressedBlocks")+" (latest "+s.summaryBlocks.recent.length+")"; const bt=document.createElement("div"); bt.className="txt"; bt.textContent=s.summaryBlocks.recent.map((b)=>`b${b.blockId} | ${b.source||"pretrim"} | m:${b.consumedMessages||0} | ${b.summaryPreview||""}`).join("\\n"); blk.appendChild(bm); blk.appendChild(bt); events.appendChild(blk); } if(s.sendPretrim&&s.sendPretrim.warmup&&Array.isArray(s.sendPretrim.warmup.logs)&&s.sendPretrim.warmup.logs.length){ const wl=document.createElement("div"); wl.className="ev"; const wm=document.createElement("div"); wm.className="meta"; wm.textContent=t("sessionWarmupLogs"); const wt=document.createElement("div"); wt.className="txt"; wt.textContent=s.sendPretrim.warmup.logs.slice(-8).map((x)=>`${x.ts?new Date(x.ts).toLocaleString():"-"} | ${x.level||"info"} | ${x.message||""}`).join("\\n"); wl.appendChild(wm); wl.appendChild(wt); events.appendChild(wl); } if(s.sendPretrim&&Array.isArray(s.sendPretrim.traces)&&s.sendPretrim.traces.length){ const tr=document.createElement("div"); tr.className="ev"; const m=document.createElement("div"); m.className="meta"; m.textContent=t("pretrimTraces"); const traceTxt=document.createElement("div"); traceTxt.className="txt"; const rows=s.sendPretrim.traces.slice(-8).map((x)=>{ const ts=x.ts?new Date(x.ts).toLocaleString():"-"; const strict=x.strictApplied?(` | strict:${x.strictReplacedMessages||0}`):\"\"; const llmMode=x.distillUsed?((String(x.distillProvider||\"\").includes(\"session-inline\"))?(` | ${t(\"llmSummaryInline\")}:${x.distillModel||\"current-session\"}`):(` | ${t(\"llmSummaryIndependent\")}:${x.distillProvider||\"\"}/${x.distillModel||\"\"}`)):((x.distillStatus&&x.distillStatus.includes(\"fail\"))?(` | ${t(\"llmSummaryFailed\")}:${x.distillStatus}`):(` | ${t(\"llmSummaryMechanical\")}`)); const strat=((x.strategyDedup||0)||(x.strategySupersedeWrites||0)||(x.strategyPurgedErrors||0)||(x.strategyPhaseTrim||0))?(` | strat:d${x.strategyDedup||0}/s${x.strategySupersedeWrites||0}/p${x.strategyPurgedErrors||0}/ph${x.strategyPhaseTrim||0}`):\"\"; const block=(x.blockId?(` | block:b${x.blockId}`):\"\"); const anchor=x.anchorReplaceApplied?(` | anchor:${x.anchorReplaceMessages||0}/b${x.anchorReplaceBlocks||0}`):\"\"; const comp=(()=>{ const b=x.compositionBefore||{}; const a=x.compositionAfter||{}; const bt=(b.total||0), at=(a.total||0); if(!bt||!at) return \"\"; const pct=(v,t)=>Math.round((100*v)/Math.max(1,t)); return ` | comp S:${pct(b.system||0,bt)}→${pct(a.system||0,at)} U:${pct(b.user||0,bt)}→${pct(a.user||0,at)} T:${pct(b.tool||0,bt)}→${pct(a.tool||0,at)}`; })(); return `${ts} | ${x.beforeTokens||0}→${x.afterTokens||0} | total:${x.totalBeforeTokens||((x.beforeTokens||0)+(x.systemTokensBefore||0))}→${x.totalAfterTokens||((x.afterTokens||0)+(x.systemTokensAfter||0))} | system~${x.systemTokensAfter||0} | plugin-hint~${x.pluginHintTokensAfter||0} | save~${x.savedTokens||0} | rw:${x.rewrittenMessages||0}/${x.rewrittenParts||0} | ex:${x.extractedMessages||0}${strict}${llmMode}${strat}${block}${anchor}${comp} | ${x.reason||""}`; }); traceTxt.textContent=rows.join("\\n"); tr.appendChild(m); tr.appendChild(traceTxt); events.appendChild(tr); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
       '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); __activeProjectName=project.name||""; __selectedSessionIDs.clear(); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent=t("projectMetaFmt").replace("{sessions}",String(project.sessionCount||0)).replace("{events}",String(project.totalEvents||0)).replace("{tech}",ts); const b=$("batchDeleteBtn"); if(b) b.onclick=()=>batchDeleteSessions(project.name); renderSessions(project); updateBatchDeleteBtn(); }',
@@ -7802,7 +7862,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    let __autoRefreshTimer = null;',
       '    function startAutoRefresh(){ if(__autoRefreshTimer) clearInterval(__autoRefreshTimer); __autoRefreshTimer = setInterval(()=>{ refreshDashboardData(); }, 60000); }',
       '    document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState!=="visible") return; const now=Date.now(); if(now-(__lastRefreshAt||0)>=60000) refreshDashboardData(); });',
-      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=normalizeLang(langSel.value); localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); renderTrash(); }; const cleanupBtn=$("trashCleanupBtn"); if(cleanupBtn) cleanupBtn.onclick=cleanupTrashNow; const delBtn=$("trashDeleteBtn"); if(delBtn) delBtn.onclick=deleteTrashSelected; const batchAllBtn=$("batchSelectAllBtn"); if(batchAllBtn) batchAllBtn.onclick=selectAllSessions; const batchNoneBtn=$("batchSelectNoneBtn"); if(batchNoneBtn) batchNoneBtn.onclick=clearSelectedSessions; const trashAllBtn=$("trashSelectAllBtn"); if(trashAllBtn) trashAllBtn.onclick=selectAllTrash; const trashNoneBtn=$("trashSelectNoneBtn"); if(trashNoneBtn) trashNoneBtn.onclick=clearSelectedTrash; const retentionSel=$("trashRetentionSel"); if(retentionSel) retentionSel.onchange=()=>{ __trashData.retentionDays=Number(retentionSel.value||30); renderTrash(); }; if(savePretrimProfileBtn) savePretrimProfileBtn.onclick=savePretrimProfile; if(settingsSaveBtn) settingsSaveBtn.onclick=saveSettings; if(templateSaveBtn) templateSaveBtn.onclick=saveTemplateSettings; if(templateUseBtn) templateUseBtn.onclick=useTemplateSettings; if(templateSelect) templateSelect.onchange=()=>{ const store=getTemplateStore(); const name=String(templateSelect.value||"default"); if(templateNameInput) templateNameInput.value=name; if(templateEditor){ templateEditor.value=String(store[name]||store.default||DEFAULT_SUMMARY_TEMPLATE); __templateEditorDirty=false; } if(templatePreview) templatePreview.textContent=applyTemplateText((templateEditor&&templateEditor.value)||getCurrentTemplateText(), getTemplateVarsSample()); }; if(templateResetBtn) templateResetBtn.onclick=resetTemplateSettings; if(templatePreviewBtn) templatePreviewBtn.onclick=()=>{ if(templatePreview) templatePreview.textContent=applyTemplateText((templateEditor&&templateEditor.value)||getCurrentTemplateText(), getTemplateVarsSample()); }; if(templateEditor) templateEditor.oninput=()=>{ __templateEditorDirty=true; if(templatePreview) templatePreview.textContent=applyTemplateText(templateEditor.value, getTemplateVarsSample()); }; if(llmSaveBtn) llmSaveBtn.onclick=saveLlmSettings; if(llmFetchModelsBtn) llmFetchModelsBtn.onclick=fetchLlmModels; if(llmValidateBtn) llmValidateBtn.onclick=validateLlmConfig; if(tabSessionsBtn) tabSessionsBtn.onclick=()=>setActiveTab("sessions"); if(tabTemplateBtn) tabTemplateBtn.onclick=()=>setActiveTab("template"); if(tabLlmBtn) tabLlmBtn.onclick=()=>setActiveTab("llm"); if(tabSettingsBtn) tabSettingsBtn.onclick=()=>setActiveTab("settings"); if(tabTrashBtn) tabTrashBtn.onclick=()=>setActiveTab("trash"); setActiveTab("sessions"); applyLang(); updateTrashDeleteBtn(); refreshDashboardData(); startAutoRefresh();',
+      '    langSel.value=LANG; langSel.onchange=()=>{ LANG=normalizeLang(langSel.value); localStorage.setItem("memory_dashboard_lang",LANG); applyLang(); renderGlobalPrefs(); renderProjects(); renderTrash(); }; const cleanupBtn=$("trashCleanupBtn"); if(cleanupBtn) cleanupBtn.onclick=cleanupTrashNow; const delBtn=$("trashDeleteBtn"); if(delBtn) delBtn.onclick=deleteTrashSelected; const batchAllBtn=$("batchSelectAllBtn"); if(batchAllBtn) batchAllBtn.onclick=selectAllSessions; const batchNoneBtn=$("batchSelectNoneBtn"); if(batchNoneBtn) batchNoneBtn.onclick=clearSelectedSessions; const trashAllBtn=$("trashSelectAllBtn"); if(trashAllBtn) trashAllBtn.onclick=selectAllTrash; const trashNoneBtn=$("trashSelectNoneBtn"); if(trashNoneBtn) trashNoneBtn.onclick=clearSelectedTrash; const retentionSel=$("trashRetentionSel"); if(retentionSel) retentionSel.onchange=()=>{ __trashData.retentionDays=Number(retentionSel.value||30); renderTrash(); }; if(savePretrimProfileBtn) savePretrimProfileBtn.onclick=savePretrimProfile; if(cleanGlobalNoteBtn) cleanGlobalNoteBtn.onclick=cleanGlobalNote; if(settingsSaveBtn) settingsSaveBtn.onclick=saveSettings; if(templateSaveBtn) templateSaveBtn.onclick=saveTemplateSettings; if(templateUseBtn) templateUseBtn.onclick=useTemplateSettings; if(templateSelect) templateSelect.onchange=()=>{ const store=getTemplateStore(); const name=String(templateSelect.value||"default"); if(templateNameInput) templateNameInput.value=name; if(templateEditor){ templateEditor.value=String(store[name]||store.default||DEFAULT_SUMMARY_TEMPLATE); __templateEditorDirty=false; } if(templatePreview) templatePreview.textContent=applyTemplateText((templateEditor&&templateEditor.value)||getCurrentTemplateText(), getTemplateVarsSample()); }; if(templateResetBtn) templateResetBtn.onclick=resetTemplateSettings; if(templatePreviewBtn) templatePreviewBtn.onclick=()=>{ if(templatePreview) templatePreview.textContent=applyTemplateText((templateEditor&&templateEditor.value)||getCurrentTemplateText(), getTemplateVarsSample()); }; if(templateEditor) templateEditor.oninput=()=>{ __templateEditorDirty=true; if(templatePreview) templatePreview.textContent=applyTemplateText(templateEditor.value, getTemplateVarsSample()); }; if(llmSaveBtn) llmSaveBtn.onclick=saveLlmSettings; if(llmFetchModelsBtn) llmFetchModelsBtn.onclick=fetchLlmModels; if(llmValidateBtn) llmValidateBtn.onclick=validateLlmConfig; if(tabSessionsBtn) tabSessionsBtn.onclick=()=>setActiveTab("sessions"); if(tabTemplateBtn) tabTemplateBtn.onclick=()=>setActiveTab("template"); if(tabLlmBtn) tabLlmBtn.onclick=()=>setActiveTab("llm"); if(tabSettingsBtn) tabSettingsBtn.onclick=()=>setActiveTab("settings"); if(tabTrashBtn) tabTrashBtn.onclick=()=>setActiveTab("trash"); setActiveTab("sessions"); applyLang(); updateTrashDeleteBtn(); refreshDashboardData(); startAutoRefresh();',
       '  </script>',
       '</body>',
       '</html>'
@@ -8189,7 +8249,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
           }
 
           if (!command || command === 'undefined' || typeof command !== 'string') {
-            const sid = resolveGlobalMutationSessionID(raw);
+            const sid = resolveGlobalMutationSessionID(raw, 'set');
             const latestUserText = getLatestUserTextForSession(sid) || getLatestUserSummaryForSession();
             const latestUserClean = sanitizeUserTextForMemoryInference(latestUserText);
             const explicitSlashCommand = parseExplicitMemorySlashCommandFromText(latestUserClean);
@@ -8246,17 +8306,30 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
                 value: String(inferredWrite.value || ''),
                 content: latestUserClean
               });
-              const duplicateWrite = getRecentGlobalMutationDuplicate(sid, 'set', inferredWrite.key, inferredWrite.value);
+              const inferredScope = resolveGlobalMutationSessionID({
+                ...(raw || {}),
+                content: latestUserClean,
+                query: latestUserClean,
+                text: latestUserClean,
+                message: latestUserClean
+              }, 'set', inferredWrite.key, inferredWrite.value);
+              const duplicateWrite = getRecentGlobalMutationDuplicate(inferredScope, 'set', inferredWrite.key, inferredWrite.value);
               if (duplicateWrite) {
                 return `Global setting already persisted: ${duplicateWrite.key} = ${duplicateWrite.value}`;
               }
               const currentValue = getCurrentGlobalMemoryValue(inferredWrite.key);
               if (currentValue !== undefined && String(currentValue) === String(inferredWrite.value)) {
-                rememberRecentGlobalMutation(sid, 'set', inferredWrite.key, inferredWrite.value);
+                rememberRecentGlobalMutation(inferredScope, 'set', inferredWrite.key, inferredWrite.value);
                 return `Global setting already present: ${normalizeGlobalMemoryKey(inferredWrite.key)} = ${String(currentValue)}`;
               }
-              const res = writeGlobalMemoryValue(inferredWrite.key, inferredWrite.value);
-              if (res?.ok) rememberRecentGlobalMutation(sid, 'set', res.key, res.value);
+              const res = persistGlobalMemoryValue({
+                ...(raw || {}),
+                content: latestUserClean,
+                query: latestUserClean,
+                text: latestUserClean,
+                message: latestUserClean
+              }, inferredWrite.key, inferredWrite.value);
+              if (res?.ok) rememberRecentGlobalMutation(inferredScope, 'set', res.key, res.value);
               return res.message;
             }
             if (
@@ -8375,7 +8448,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               if (args.length < 2) return 'Usage: /memory set <key> <value>';
               const key = args[0];
               const value = args.slice(1).join(' ');
-              const sid = resolveGlobalMutationSessionID(raw);
+              const sid = resolveGlobalMutationSessionID(raw, 'set', key, value);
               const duplicateWrite = getRecentGlobalMutationDuplicate(sid, 'set', key, value);
               if (duplicateWrite) return `Global setting already persisted: ${duplicateWrite.key} = ${duplicateWrite.value}`;
               const currentValue = getCurrentGlobalMemoryValue(key);
@@ -8383,7 +8456,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
                 rememberRecentGlobalMutation(sid, 'set', key, value);
                 return `Global setting already present: ${normalizeGlobalMemoryKey(key)} = ${String(currentValue)}`;
               }
-              const res = writeGlobalMemoryValue(key, value);
+              const res = persistGlobalMemoryValue(raw, key, value);
               if (res?.ok) rememberRecentGlobalMutation(sid, 'set', res.key, res.value);
               return res.message;
             }
@@ -8393,7 +8466,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               const key = normalizeGlobalMemoryKey(args[0]);
               const value = args.slice(1).join(' ');
               if (!key) return 'Usage: /memory prefer <key> <value>';
-              const sid = resolveGlobalMutationSessionID(raw);
+              const sid = resolveGlobalMutationSessionID(raw, 'set', key, value);
               const duplicateWrite = getRecentGlobalMutationDuplicate(sid, 'set', key, value);
               if (duplicateWrite) return `Global preference already persisted: ${duplicateWrite.key} = ${duplicateWrite.value}`;
               const currentValue = getCurrentGlobalMemoryValue(key);
@@ -8401,7 +8474,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
                 rememberRecentGlobalMutation(sid, 'set', key, value);
                 return `Global preference already present: ${normalizeGlobalMemoryKey(key)} = ${String(currentValue)}`;
               }
-              const res = writeGlobalMemoryValue(key, value);
+              const res = persistGlobalMemoryValue(raw, key, value);
               if (res?.ok) rememberRecentGlobalMutation(sid, 'set', res.key, res.value);
               return res.message.replace('Global setting', 'Global preference');
             }
@@ -8409,16 +8482,17 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             case 'delete':
             case 'unset': {
               if (!args.length) return 'Usage: /memory delete <key> [key2 ...]';
-              const sid = resolveGlobalMutationSessionID(raw);
+              const sid = resolveGlobalMutationSessionID(raw, 'delete');
               const messages = [];
               for (const rawKey of args) {
-                const duplicateDelete = getRecentGlobalMutationDuplicate(sid, 'delete', rawKey, '');
+                const deleteScope = resolveGlobalMutationSessionID(raw, 'delete', rawKey, '');
+                const duplicateDelete = getRecentGlobalMutationDuplicate(deleteScope, 'delete', rawKey, '');
                 if (duplicateDelete) {
                   messages.push(`Global setting already deleted: ${duplicateDelete.key}`);
                   continue;
                 }
                 const res = deleteGlobalMemoryValue(rawKey);
-                if (res?.ok) rememberRecentGlobalMutation(sid, 'delete', res.key, '');
+                if (res?.ok) rememberRecentGlobalMutation(deleteScope, 'delete', res.key, '');
                 messages.push(String(res?.message || `Failed to delete global setting: ${rawKey}`));
               }
               return messages.join('\n');
@@ -9058,7 +9132,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
           }
         },
         execute: async (input = {}) => {
-          const sid = resolveToolSessionID(input);
+          const sid = resolveGlobalMutationSessionID(input, 'set');
           const now = Date.now();
           const emptyCall = !input || (typeof input === 'object' && !Object.keys(input).length);
           if (sid) {
@@ -9103,17 +9177,18 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
           if (!inferred?.key) {
             return 'Skipped remember_global: empty/ambiguous input. Use explicit key/value or content.';
           }
-          const duplicateWrite = getRecentGlobalMutationDuplicate(sid, 'set', inferred.key, inferred.value);
+          const writeScope = resolveGlobalMutationSessionID(input, 'set', inferred.key, inferred.value);
+          const duplicateWrite = getRecentGlobalMutationDuplicate(writeScope, 'set', inferred.key, inferred.value);
           if (duplicateWrite) {
             return `Global setting already persisted: ${duplicateWrite.key} = ${duplicateWrite.value}`;
           }
           const currentValue = getCurrentGlobalMemoryValue(inferred.key);
           if (currentValue !== undefined && String(currentValue) === String(inferred.value)) {
-            rememberRecentGlobalMutation(sid, 'set', inferred.key, inferred.value);
+            rememberRecentGlobalMutation(writeScope, 'set', inferred.key, inferred.value);
             return `Global setting already present: ${normalizeGlobalMemoryKey(inferred.key)} = ${String(currentValue)}`;
           }
-          const res = writeGlobalMemoryValue(inferred.key, inferred.value);
-          if (res?.ok) rememberRecentGlobalMutation(sid, 'set', res.key, res.value);
+          const res = persistGlobalMemoryValue(input, inferred.key, inferred.value);
+          if (res?.ok) rememberRecentGlobalMutation(writeScope, 'set', res.key, res.value);
           return res.message;
         }
       },

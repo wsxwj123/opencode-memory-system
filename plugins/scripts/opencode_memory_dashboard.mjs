@@ -281,6 +281,38 @@ function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function sanitizeDashboardNoteLine(value) {
+  let text = normalizeText(value);
+  if (!text) return '';
+  text = text
+    .replace(/^\d+\.\s*/, '')
+    .replace(/[，,。.]?\s*写完后.*$/i, '')
+    .replace(/[，,。.]?\s*写好了.*$/i, '')
+    .replace(/^(?:可以|好的|行|嗯|好)[，,、\s]*/i, '')
+    .replace(/^(?:请)?(?:帮我)?(?:把|将)?(?:这条|这个|这些)?(?:内容|信息|事情)?(?:写入|写到|存入|存到|记入|记到|保存到)?(?:到)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?[，,:：\s]*/i, '')
+    .replace(/^(?:请)?(?:帮我)?(?:在|往)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?(?:写入|写到|存入|存到|记入|记到|保存)[，,:：\s]*/i, '')
+    .replace(/[，,]?\s*(?:你帮我|帮我)?(?:把|将)?(?:这条|这个|这些)?(?:内容|信息|事情)?(?:也)?(?:写入|写到|存入|存到|记入|记到|保存到)?(?:到)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?\s*$/i, '')
+    .replace(/^(?:你把|把)?这个/i, '')
+    .trim();
+  return normalizeText(text);
+}
+
+function normalizeDashboardNote(raw = '') {
+  const seen = new Set();
+  const out = [];
+  const lines = String(raw || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\s+(?=\d+\.\s)/g, '\n')
+    .split('\n');
+  for (const line of lines) {
+    const cleaned = sanitizeDashboardNoteLine(line);
+    if (!cleaned || seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    out.push(cleaned);
+  }
+  return out.map((line, index) => `${index + 1}. ${line}`).join('\n');
+}
+
 function truncateText(value, max = 240) {
   const s = String(value || '');
   if (s.length <= max) return s;
@@ -682,7 +714,10 @@ function readProjectSessions(projectName) {
       lastObservedAt: obj?.systemPrompt?.lastObservedAt || null,
       lastObservedHash: obj?.systemPrompt?.lastObservedHash || '',
       lastObservedPreview: obj?.systemPrompt?.lastObservedPreview || '',
-      lastObservedModel: obj?.systemPrompt?.lastObservedModel || ''
+      lastObservedModel: obj?.systemPrompt?.lastObservedModel || '',
+      lastObservedChars: Number(obj?.systemPrompt?.lastObservedChars || 0),
+      lastObservedText: String(obj?.systemPrompt?.lastObservedText || ''),
+      enabled: obj?.systemPrompt?.enabled !== false
     };
     sessions.push({
       projectName,
@@ -1478,6 +1513,31 @@ function serve() {
         });
         const live = buildLiveDashboardData();
         sendJson(res, 200, { ok: true, key, value, global: live.global });
+      } catch (err) {
+        sendJson(res, 500, { error: err?.message || String(err) });
+      }
+      return;
+    }
+
+    if (method === 'POST' && rawPath === '/api/memory/global/note/clean') {
+      try {
+        const body = await readJsonBody(req);
+        if (!body?.confirm) {
+          sendJson(res, 400, { error: 'confirm=true required' });
+          return;
+        }
+        const gm = readGlobalMemory();
+        const current = String((gm.preferences && gm.preferences.note) || '');
+        const next = normalizeDashboardNote(current);
+        gm.preferences.note = next;
+        writeJson(globalMemoryPath, gm);
+        appendAudit({
+          action: 'clean_global_note',
+          source: body.source || 'dashboard',
+          noteChars: next.length
+        });
+        const live = buildLiveDashboardData();
+        sendJson(res, 200, { ok: true, note: next, global: live.global });
       } catch (err) {
         sendJson(res, 500, { error: err?.message || String(err) });
       }
