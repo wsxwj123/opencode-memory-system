@@ -31,6 +31,16 @@
 
 ### 2. 安装教程
 
+#### 2.0 推荐安装方式（GitHub）
+先把仓库拉到本地，例如：
+
+```bash
+git clone https://github.com/wsxwj123/opencode-memory-system.git
+cd opencode-memory-system
+```
+
+如果你只是想安装插件，不需要把整个仓库都塞进 OpenCode 配置目录。真正必须复制进去的，只有下面这 3 个文件。
+
 #### 2.1 需要三个文件
 - `plugins/memory-system.js`
 - `plugins/scripts/opencode_memory_dashboard.mjs`
@@ -47,6 +57,43 @@
   - `C:\Users\<用户名>\.config\opencode\plugins\dashboard\template.html`
 
 #### 2.3 opencode.json 启用
+不要直接用 README 里的示例去覆盖你原来的 `~/.config/opencode/opencode.json`。  
+正确做法是：
+- 打开你自己现有的 `opencode.json`
+- 找到里面的 `"plugin"` 数组
+- 只往数组里增加一行：
+  - `"./plugins/memory-system.js"`
+- 保留你原来已有的其他插件、模型、MCP、权限配置，不要改乱原有结构
+
+例如你原来可能是：
+
+```json
+{
+  "model": "xxx",
+  "plugin": [
+    "./plugins/oh-my-opencode-slim.js",
+    "./plugins/superpowers.js"
+  ]
+}
+```
+
+安装后应该改成：
+
+```json
+{
+  "model": "xxx",
+  "plugin": [
+    "./plugins/memory-system.js",
+    "./plugins/oh-my-opencode-slim.js",
+    "./plugins/superpowers.js"
+  ]
+}
+```
+
+如果你原来没有 `"plugin"` 这一段，再补上即可。
+
+下面这个最小示例只是演示格式，不代表你应该拿去整段覆盖自己的配置：
+
 ```json
 {
   "plugin": [
@@ -57,6 +104,13 @@
 
 #### 2.4 重启 OpenCode
 重启后自动生效。`37777` 当前实现是 watchdog 跟随模式，通常会随 OpenCode 启动；如果本地未拉起，可手动执行 restart/start 恢复。
+
+#### 2.5 安装后如何确认装对了
+- 终端执行 `opencode web`
+- 打开：
+  - `http://127.0.0.1:4096`
+  - `http://127.0.0.1:37777`
+- 如果 `37777` 能打开，并且会话页里能看到记忆统计、参数页、LLM设置、回收站，就说明插件已经被加载
 
 ### 3. 启动与使用
 - 正常聊天即可，默认自动记录记忆与发送前裁剪。
