@@ -608,6 +608,7 @@ export const MemorySystemPlugin = ({ client }) => {
   let lastObservedUserText = '';
   let lastObservedUserAt = 0;
   const sessionAutoGlobalWriteState = new Map();
+  const sessionRecentGlobalMutationState = new Map();
   const rememberGlobalEmptyCallState = new Map();
   const memoryEmptyCallState = new Map();
   const contextEmptyCallState = new Map();
@@ -822,6 +823,53 @@ export const MemorySystemPlugin = ({ client }) => {
     return `preferences.${key}`;
   }
 
+  function resolveGlobalMutationSessionID(raw = null) {
+    const direct = normalizeText(String(resolveToolSessionID(raw || {}) || ''));
+    if (direct) return direct;
+    const active = normalizeText(String(lastActiveSessionID || ''));
+    if (active) return active;
+    const recent = [...sessionRecentGlobalMutationState.keys()].slice(-1)[0] || '';
+    return normalizeText(String(recent || ''));
+  }
+
+  function getCurrentGlobalMemoryValue(rawKey = '') {
+    const key = normalizeGlobalMemoryKey(rawKey);
+    if (!key) return undefined;
+    const globalMemory = readJson(globalMemoryPath) || {};
+    const parts = key.split('.').filter(Boolean);
+    let current = globalMemory;
+    for (const part of parts) {
+      if (!current || typeof current !== 'object' || !(part in current)) return undefined;
+      current = current[part];
+    }
+    return current;
+  }
+
+  function rememberRecentGlobalMutation(sessionID = '', action = 'set', rawKey = '', rawValue = '') {
+    const sid = normalizeText(String(sessionID || ''));
+    const key = normalizeGlobalMemoryKey(rawKey);
+    if (!sid || !key) return;
+    sessionRecentGlobalMutationState.set(sid, {
+      fp: `${String(action || 'set')}|${key}|${String(rawValue ?? '')}`,
+      at: Date.now(),
+      action: String(action || 'set'),
+      key,
+      value: String(rawValue ?? '')
+    });
+  }
+
+  function getRecentGlobalMutationDuplicate(sessionID = '', action = 'set', rawKey = '', rawValue = '', windowMs = 20000) {
+    const sid = normalizeText(String(sessionID || ''));
+    const key = normalizeGlobalMemoryKey(rawKey);
+    if (!sid || !key) return null;
+    const prev = sessionRecentGlobalMutationState.get(sid);
+    const fp = `${String(action || 'set')}|${key}|${String(rawValue ?? '')}`;
+    if (prev && String(prev.fp || '') === fp && (Date.now() - Number(prev.at || 0)) < windowMs) {
+      return { key, value: String(rawValue ?? ''), action: String(action || 'set') };
+    }
+    return null;
+  }
+
   function inferPreferenceFromContent(rawContent = '') {
     const text = normalizeText(String(rawContent || ''));
     if (!text) return null;
@@ -842,6 +890,13 @@ export const MemorySystemPlugin = ({ client }) => {
       return { key: 'preferences.note', value: truncateText(note, 200) };
     }
     return null;
+  }
+
+  function hasExplicitGlobalMemoryDeleteIntent(rawText = '') {
+    const text = sanitizeUserTextForMemoryInference(rawText);
+    if (!text) return false;
+    if (/^\/memory\b/i.test(text)) return false;
+    return /(?:删除|移除|清除|删掉|去掉|取消).*(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)|(?:从|在).*(?:全局记忆|全局偏好).*(?:删除|移除|清除|删掉|去掉|取消)/i.test(text);
   }
 
   function isExplicitNoteIntent(text = '') {
@@ -877,6 +932,63 @@ export const MemorySystemPlugin = ({ client }) => {
     return normalizeText(text);
   }
 
+  function sanitizeFallbackGlobalNoteContent(raw = '') {
+    let text = sanitizeUserTextForMemoryInference(raw);
+    if (!text) return '';
+    text = text
+      .replace(/^(?:请)?(?:帮我)?(?:把|将)?(?:这条|这个|这些)?(?:内容|信息|事情)?(?:写入|写到|存入|存到|记入|记到|保存到)?(?:到)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?[，,:：\s]*/i, '')
+      .replace(/^(?:请)?(?:帮我)?(?:在|往)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?(?:写入|写到|存入|存到|记入|记到|保存)[，,:：\s]*/i, '')
+      .replace(/\s*只回复.*$/i, '')
+      .replace(/\s*删完后.*$/i, '')
+      .trim();
+    if (!text) return '';
+    if (/[？?]$/.test(text)) return '';
+    return normalizeText(text);
+  }
+
+  function appendValueToGlobalNote(rawValue = '') {
+    const value = sanitizeFallbackGlobalNoteContent(rawValue) || sanitizeGlobalNoteContent(rawValue);
+    if (!value) return { ok: false, key: 'preferences.note', value: '', message: 'Rejected empty global note content' };
+
+    try {
+      const globalMemory = readJson(globalMemoryPath) || {};
+      if (!globalMemory.preferences || typeof globalMemory.preferences !== 'object') {
+        globalMemory.preferences = {};
+      }
+      const existing = normalizeText(String(globalMemory.preferences.note || ''));
+      let next = '';
+      if (!existing) {
+        next = `1. ${value}`;
+      } else {
+        const numbered = existing
+          .split('\n')
+          .map((line) => normalizeText(line))
+          .filter(Boolean);
+        const lastMatch = numbered
+          .map((line) => line.match(/^(\d+)\.\s+/))
+          .filter(Boolean)
+          .slice(-1)[0];
+        if (lastMatch) {
+          const nextIndex = Number(lastMatch[1] || 0) + 1;
+          next = `${existing}\n${nextIndex}. ${value}`;
+        } else {
+          next = `1. ${existing}\n2. ${value}`;
+        }
+      }
+      globalMemory.preferences.note = next;
+      writeJson(globalMemoryPath, globalMemory);
+      writeDashboardFiles();
+      return { ok: true, key: 'preferences.note', value: value, message: `Global setting updated: preferences.note += ${value}` };
+    } catch (e) {
+      return {
+        ok: false,
+        key: 'preferences.note',
+        value,
+        message: `Failed to persist global note content: ${e?.message || String(e)}`
+      };
+    }
+  }
+
   function inferGlobalPreferenceWrite(payload = {}) {
     const raw = payload && typeof payload === 'object' ? payload : {};
     const key = raw.key ?? raw.path ?? raw.field;
@@ -892,6 +1004,33 @@ export const MemorySystemPlugin = ({ client }) => {
       return inferPreferenceFromContent(String(content));
     }
     return null;
+  }
+
+  function inferGlobalPreferenceDeleteFromText(rawText = '') {
+    const text = sanitizeUserTextForMemoryInference(rawText);
+    if (!text || !hasExplicitGlobalMemoryDeleteIntent(text)) return null;
+    const keys = new Set();
+    for (const m of text.matchAll(/\bpreferences\.[A-Za-z0-9_]+\b/gi)) {
+      const key = normalizeGlobalMemoryKey(m[0]);
+      if (key) keys.add(key);
+    }
+    for (const m of text.matchAll(/["“”']([A-Za-z0-9_.-]+)["“”']\s*:/g)) {
+      const key = normalizeGlobalMemoryKey(m[1]);
+      if (key) keys.add(key);
+    }
+    for (const m of text.matchAll(/["“”']([A-Za-z0-9_.-]+)["“”']/g)) {
+      const key = normalizeGlobalMemoryKey(m[1]);
+      if (key) keys.add(key);
+    }
+    const inferredReadKey = inferPreferenceReadKeyFromText(text);
+    if (inferredReadKey) keys.add(inferredReadKey);
+    if (/\bnote\b|备注|笔记/i.test(text)) keys.add('preferences.note');
+    if (/\bpretrimprofile\b/i.test(text)) keys.add('preferences.pretrimProfile');
+    if (/\blanguage\b|中文|英文/i.test(text)) keys.add('preferences.language');
+    if (/\bnickname\b|昵称|叫我|称呼/i.test(text)) keys.add('preferences.nickname');
+    if (/\bcommunication_style\b|风格|语气/i.test(text)) keys.add('preferences.communication_style');
+    const list = [...keys].filter(Boolean);
+    return list.length ? { keys: list } : null;
   }
 
   function writeGlobalMemoryValue(rawKey = '', rawValue = '') {
@@ -929,6 +1068,37 @@ export const MemorySystemPlugin = ({ client }) => {
         key,
         value,
         message: `Failed to persist global setting: ${e?.message || String(e)}`
+      };
+    }
+  }
+
+  function deleteGlobalMemoryValue(rawKey = '') {
+    const key = normalizeGlobalMemoryKey(rawKey);
+    if (!key) return { ok: false, message: 'Missing global memory key' };
+    try {
+      const globalMemory = readJson(globalMemoryPath) || { preferences: {}, snippets: {} };
+      const parts = key.split('.').filter(Boolean);
+      if (!parts.length) return { ok: false, message: 'Invalid global memory key' };
+      let current = globalMemory;
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        if (!current[parts[i]] || typeof current[parts[i]] !== 'object') {
+          return { ok: true, key, existed: false, message: `Global setting already absent: ${key}` };
+        }
+        current = current[parts[i]];
+      }
+      const leaf = parts[parts.length - 1];
+      if (!(leaf in current)) {
+        return { ok: true, key, existed: false, message: `Global setting already absent: ${key}` };
+      }
+      delete current[leaf];
+      writeJson(globalMemoryPath, globalMemory);
+      writeDashboardFiles();
+      return { ok: true, key, existed: true, message: `Global setting deleted: ${key}` };
+    } catch (e) {
+      return {
+        ok: false,
+        key,
+        message: `Failed to delete global setting: ${e?.message || String(e)}`
       };
     }
   }
@@ -1036,6 +1206,7 @@ export const MemorySystemPlugin = ({ client }) => {
     const text = sanitizeUserTextForMemoryInference(rawText);
     if (!text) return null;
     if (/^\/memory\b/i.test(text)) return null;
+    if (hasExplicitGlobalMemoryDeleteIntent(text)) return null;
     if (isAutoGlobalWriteUnsafeText(text)) return null;
     const explicitGlobalIntent = hasExplicitGlobalMemoryIntent(text);
 
@@ -1250,6 +1421,7 @@ export const MemorySystemPlugin = ({ client }) => {
     const text = sanitizeUserTextForMemoryInference(rawText);
     if (!text) return false;
     if (/^\/memory\b/i.test(text)) return false;
+    if (hasExplicitGlobalMemoryDeleteIntent(text)) return false;
     if (isAutoGlobalWriteUnsafeText(text) || isSummaryNoiseText(text)) return false;
     if (hasExplicitGlobalMemoryIntent(text)) return true;
     return /写入全局记忆|保存到全局记忆|全局偏好|全局记住|全局保存|全局写入|永远记住|持续记忆|永久记忆|记住这个路径|路径锚点|以后默认|默认使用|默认用|设置为|设为|改为|set\s+[A-Za-z0-9._-]+\s+to/i.test(text);
@@ -1269,13 +1441,16 @@ export const MemorySystemPlugin = ({ client }) => {
       write: 'set',
       preference: 'set',
       preferences: 'set',
-      prefer: 'prefer'
+      prefer: 'prefer',
+      remove: 'delete',
+      unset: 'delete'
     };
     let command = normalizeText(String(parts[0] || '')).toLowerCase();
     if (commandAlias[command]) command = commandAlias[command];
     const validCommands = new Set([
       'learn', 'project', 'global', 'set', 'prefer', 'save', 'export', 'import', 'clear', 'edit',
       'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'distill',
+      'delete', 'unset',
       'compress', 'context', 'stats', 'doctor'
     ]);
     if (!validCommands.has(command)) return null;
@@ -1294,7 +1469,20 @@ export const MemorySystemPlugin = ({ client }) => {
     }
     const inferred = inferGlobalPreferenceWriteFromText(text);
     if (!inferred?.key) {
-      return { wrote: false, reason: 'unable_to_infer' };
+      const fallbackNote = sanitizeFallbackGlobalNoteContent(text);
+      if (!fallbackNote) return { wrote: false, reason: 'unable_to_infer' };
+      const fp = stableTextHash(`${sessionID}|preferences.note|${fallbackNote}|${text}`);
+      const prev = sessionAutoGlobalWriteState.get(sessionID);
+      if (prev && String(prev.fp || '') === fp) {
+        return { wrote: false, reason: 'duplicate_request', key: 'preferences.note', value: fallbackNote };
+      }
+      const res = appendValueToGlobalNote(fallbackNote);
+      if (res?.ok) {
+        sessionAutoGlobalWriteState.set(sessionID, { fp, key: res.key, value: res.value, at: new Date().toISOString() });
+        rememberRecentGlobalMutation(sessionID, 'set', res.key, res.value);
+        return { wrote: true, key: res.key, value: res.value, message: res.message };
+      }
+      return { wrote: false, reason: 'write_failed', key: 'preferences.note', value: fallbackNote };
     }
     const fp = stableTextHash(`${sessionID}|${inferred.key}|${String(inferred.value || '')}|${text}`);
     const prev = sessionAutoGlobalWriteState.get(sessionID);
@@ -1304,6 +1492,7 @@ export const MemorySystemPlugin = ({ client }) => {
     const res = writeGlobalMemoryValue(inferred.key, inferred.value);
     if (res?.ok) {
       sessionAutoGlobalWriteState.set(sessionID, { fp, key: res.key, value: res.value, at: new Date().toISOString() });
+      rememberRecentGlobalMutation(sessionID, 'set', res.key, res.value);
       return { wrote: true, key: res.key, value: res.value, message: res.message };
     }
     return { wrote: false, reason: 'write_failed', key: inferred.key, value: inferred.value };
@@ -7686,13 +7875,13 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
     name: 'memory-system',
     tool: {
       memory: {
-        description: 'Manage OpenCode memory system. Prefer this single tool for all memory operations. Do not call compatibility tools. Empty input is no-op and should not be retried. Use direct memory calls (no task/subagent) for /memory commands, including doctor. For global memory writes, prefer {"command":"set","key":"preferences.some_key","value":"..."} or direct {"key":"preferences.some_key","value":"..."}. For natural-language preference writes, {"content":"请记住以后默认使用中文回复"} is supported. For recall, use {"command":"recall","args":["query"]}.',
+        description: 'Manage OpenCode memory system. Prefer this single tool for all memory operations. Do not call compatibility tools. Empty input is no-op and should not be retried. Use direct memory calls (no task/subagent) for /memory commands, including doctor. For global memory writes, prefer {"command":"set","key":"preferences.some_key","value":"..."} or direct {"key":"preferences.some_key","value":"..."}. For deleting a global preference, use {"command":"delete","args":["preferences.some_key"]}. For natural-language preference writes, {"content":"请记住以后默认使用中文回复"} is supported. For recall, use {"command":"recall","args":["query"]}.',
         parameters: {
           type: 'object',
           properties: {
             command: {
               type: 'string',
-              enum: ['learn', 'project', 'global', 'set', 'prefer', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'distill', 'compress', 'context', 'stats', 'doctor', 'noop'],
+              enum: ['learn', 'project', 'global', 'set', 'prefer', 'delete', 'unset', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'distill', 'compress', 'context', 'stats', 'doctor', 'noop'],
               description: 'The memory command to execute'
             },
             args: {
@@ -7747,6 +7936,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             '- global',
             '- set <key> <value>',
             '- prefer <key> <value>',
+            '- delete <key> [key2 ...]',
             '- save snippet <name>',
             '- export project',
             '- import <filepath>',
@@ -7863,7 +8053,9 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             write: 'set',
             preference: 'set',
             preferences: 'set',
-            prefer: 'prefer'
+            prefer: 'prefer',
+            remove: 'delete',
+            unset: 'delete'
           };
           if (commandAlias[command]) command = commandAlias[command];
 
@@ -7878,6 +8070,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             const validCommands = new Set([
               'learn', 'project', 'global', 'set', 'prefer', 'save', 'export', 'import', 'clear', 'edit',
               'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'distill',
+              'delete', 'unset',
               'compress', 'context', 'stats', 'doctor'
             ]);
             if (validCommands.has(maybeCommand)) {
@@ -7975,8 +8168,28 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             }
           }
 
+          const deleteIntentText = sanitizeUserTextForMemoryInference(
+            String(
+              pickFirstDefined(merged, ['query', 'content', 'text', 'message'])
+              || slashSourceText
+              || getLatestUserTextForSession(toolSessionID)
+              || ''
+            )
+          );
+          const inferredDeleteFromIntent = inferGlobalPreferenceDeleteFromText(deleteIntentText);
+          if (inferredDeleteFromIntent?.keys?.length) {
+            const currentCommandText = normalizeText(String(command || '')).toLowerCase();
+            const currentKeys = new Set((Array.isArray(args) ? args : []).map((x) => normalizeGlobalMemoryKey(String(x || ''))));
+            const missingKeys = inferredDeleteFromIntent.keys.some((key) => !currentKeys.has(key));
+            if (!currentCommandText || ['set', 'prefer', 'delete', 'unset', 'memory', 'memory-system'].includes(currentCommandText) || missingKeys) {
+              command = 'delete';
+              args = inferredDeleteFromIntent.keys.slice();
+              applySyntheticCommand('delete', args, { query: deleteIntentText, reason: 'coerced_from_delete_intent' });
+            }
+          }
+
           if (!command || command === 'undefined' || typeof command !== 'string') {
-            const sid = resolveToolSessionID(raw);
+            const sid = resolveGlobalMutationSessionID(raw);
             const latestUserText = getLatestUserTextForSession(sid) || getLatestUserSummaryForSession();
             const latestUserClean = sanitizeUserTextForMemoryInference(latestUserText);
             const explicitSlashCommand = parseExplicitMemorySlashCommandFromText(latestUserClean);
@@ -7988,6 +8201,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             if (command) {
               // Hand off explicit slash-derived command to the normal switch below.
             } else {
+            const inferredDelete = inferGlobalPreferenceDeleteFromText(latestUserClean);
             const inferredWrite = inferGlobalPreferenceWriteFromText(latestUserClean);
             const readKey = inferPreferenceReadKeyFromText(latestUserClean);
             const shouldDoRecall = Boolean(
@@ -8011,13 +8225,39 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               });
               return `Global setting already persisted: ${autoWrite.key} = ${autoWrite.value}`;
             }
+            if (inferredDelete?.keys?.length) {
+              applySyntheticCommand('delete', inferredDelete.keys, { query: latestUserClean });
+              const messages = [];
+              for (const key of inferredDelete.keys) {
+                const duplicateDelete = getRecentGlobalMutationDuplicate(sid, 'delete', key, '');
+                if (duplicateDelete) {
+                  messages.push(`Global setting already deleted: ${duplicateDelete.key}`);
+                  continue;
+                }
+                const res = deleteGlobalMemoryValue(key);
+                if (res?.ok) rememberRecentGlobalMutation(sid, 'delete', res.key, '');
+                messages.push(String(res?.message || `Failed to delete global setting: ${key}`));
+              }
+              return messages.join('\n');
+            }
             if (inferredWrite?.key) {
               applySyntheticCommand('set', [inferredWrite.key, String(inferredWrite.value || '')], {
                 key: inferredWrite.key,
                 value: String(inferredWrite.value || ''),
                 content: latestUserClean
               });
-              return writeGlobalMemoryValue(inferredWrite.key, inferredWrite.value).message;
+              const duplicateWrite = getRecentGlobalMutationDuplicate(sid, 'set', inferredWrite.key, inferredWrite.value);
+              if (duplicateWrite) {
+                return `Global setting already persisted: ${duplicateWrite.key} = ${duplicateWrite.value}`;
+              }
+              const currentValue = getCurrentGlobalMemoryValue(inferredWrite.key);
+              if (currentValue !== undefined && String(currentValue) === String(inferredWrite.value)) {
+                rememberRecentGlobalMutation(sid, 'set', inferredWrite.key, inferredWrite.value);
+                return `Global setting already present: ${normalizeGlobalMemoryKey(inferredWrite.key)} = ${String(currentValue)}`;
+              }
+              const res = writeGlobalMemoryValue(inferredWrite.key, inferredWrite.value);
+              if (res?.ok) rememberRecentGlobalMutation(sid, 'set', res.key, res.value);
+              return res.message;
             }
             if (
               autoWrite?.reason === 'unable_to_infer'
@@ -8135,7 +8375,17 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               if (args.length < 2) return 'Usage: /memory set <key> <value>';
               const key = args[0];
               const value = args.slice(1).join(' ');
-              return writeGlobalMemoryValue(key, value).message;
+              const sid = resolveGlobalMutationSessionID(raw);
+              const duplicateWrite = getRecentGlobalMutationDuplicate(sid, 'set', key, value);
+              if (duplicateWrite) return `Global setting already persisted: ${duplicateWrite.key} = ${duplicateWrite.value}`;
+              const currentValue = getCurrentGlobalMemoryValue(key);
+              if (currentValue !== undefined && String(currentValue) === String(value)) {
+                rememberRecentGlobalMutation(sid, 'set', key, value);
+                return `Global setting already present: ${normalizeGlobalMemoryKey(key)} = ${String(currentValue)}`;
+              }
+              const res = writeGlobalMemoryValue(key, value);
+              if (res?.ok) rememberRecentGlobalMutation(sid, 'set', res.key, res.value);
+              return res.message;
             }
 
             case 'prefer': {
@@ -8143,7 +8393,35 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               const key = normalizeGlobalMemoryKey(args[0]);
               const value = args.slice(1).join(' ');
               if (!key) return 'Usage: /memory prefer <key> <value>';
-              return writeGlobalMemoryValue(key, value).message.replace('Global setting', 'Global preference');
+              const sid = resolveGlobalMutationSessionID(raw);
+              const duplicateWrite = getRecentGlobalMutationDuplicate(sid, 'set', key, value);
+              if (duplicateWrite) return `Global preference already persisted: ${duplicateWrite.key} = ${duplicateWrite.value}`;
+              const currentValue = getCurrentGlobalMemoryValue(key);
+              if (currentValue !== undefined && String(currentValue) === String(value)) {
+                rememberRecentGlobalMutation(sid, 'set', key, value);
+                return `Global preference already present: ${normalizeGlobalMemoryKey(key)} = ${String(currentValue)}`;
+              }
+              const res = writeGlobalMemoryValue(key, value);
+              if (res?.ok) rememberRecentGlobalMutation(sid, 'set', res.key, res.value);
+              return res.message.replace('Global setting', 'Global preference');
+            }
+
+            case 'delete':
+            case 'unset': {
+              if (!args.length) return 'Usage: /memory delete <key> [key2 ...]';
+              const sid = resolveGlobalMutationSessionID(raw);
+              const messages = [];
+              for (const rawKey of args) {
+                const duplicateDelete = getRecentGlobalMutationDuplicate(sid, 'delete', rawKey, '');
+                if (duplicateDelete) {
+                  messages.push(`Global setting already deleted: ${duplicateDelete.key}`);
+                  continue;
+                }
+                const res = deleteGlobalMemoryValue(rawKey);
+                if (res?.ok) rememberRecentGlobalMutation(sid, 'delete', res.key, '');
+                messages.push(String(res?.message || `Failed to delete global setting: ${rawKey}`));
+              }
+              return messages.join('\n');
             }
 
             case 'save': {
@@ -8825,7 +9103,18 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
           if (!inferred?.key) {
             return 'Skipped remember_global: empty/ambiguous input. Use explicit key/value or content.';
           }
-          return writeGlobalMemoryValue(inferred.key, inferred.value).message;
+          const duplicateWrite = getRecentGlobalMutationDuplicate(sid, 'set', inferred.key, inferred.value);
+          if (duplicateWrite) {
+            return `Global setting already persisted: ${duplicateWrite.key} = ${duplicateWrite.value}`;
+          }
+          const currentValue = getCurrentGlobalMemoryValue(inferred.key);
+          if (currentValue !== undefined && String(currentValue) === String(inferred.value)) {
+            rememberRecentGlobalMutation(sid, 'set', inferred.key, inferred.value);
+            return `Global setting already present: ${normalizeGlobalMemoryKey(inferred.key)} = ${String(currentValue)}`;
+          }
+          const res = writeGlobalMemoryValue(inferred.key, inferred.value);
+          if (res?.ok) rememberRecentGlobalMutation(sid, 'set', res.key, res.value);
+          return res.message;
         }
       },
       recall_memory: {
@@ -8914,7 +9203,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
           if (typeof raw.args === 'string' && !args.length) {
             args = raw.args.trim() ? raw.args.trim().split(/\s+/).map((x) => String(x)) : [];
           }
-          const sid = resolveToolSessionID(raw);
+          const sid = resolveGlobalMutationSessionID(raw);
           const latestUserText = sanitizeUserTextForMemoryInference(
             getLatestUserTextForSession(sid)
             || getLatestUserSummaryForSession(sid, getProjectName())
