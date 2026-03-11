@@ -291,6 +291,10 @@
     I18N.en.systemAuditStatusEmpty = "system audit: empty";
     I18N.zh.systemAuditCard = "发送前系统层审计";
     I18N.en.systemAuditCard = "send-time system audit";
+    I18N.zh.systemAuditEmpty = "本会话还没抓到 system 原文，先再发一条消息试试";
+    I18N.en.systemAuditEmpty = "no system prompt text captured for this session yet; send one more message to capture it";
+    I18N.zh.systemAuditDisabled = "系统层审计当前是关闭的，请到参数页打开";
+    I18N.en.systemAuditDisabled = "system-layer audit is disabled; enable it in settings";
     I18N.zh.sessionStatInject = "注入"; I18N.en.sessionStatInject = "inject";
     I18N.zh.sessionStatLastInject = "最近注入"; I18N.en.sessionStatLastInject = "last inject";
     I18N.zh.sessionStatWarmup = "预热"; I18N.en.sessionStatWarmup = "warmup";
@@ -353,7 +357,7 @@
       renderProjects();
       await refreshTrashData();
     }
-    async function apiPost(url,payload){ const r=await apiFetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+    async function apiPost(url,payload){ try{ const r=await apiFetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); if(!r.ok) throw new Error(await r.text()); return r.json(); }catch(e){ const msg=String(e&&e.message?e.message:e||""); if(/Failed to fetch/i.test(msg)) throw new Error("37777 面板连接已断开，请刷新页面；如果还不行，重启 opencode web"); throw e; } }
     async function refreshTrashData(){ try{ const r=await apiFetch("/api/memory/trash",{cache:"no-store"}); if(r.ok){ __trashData=await r.json(); } }catch(_){ } renderTrash(); }
     function renderTrash(){ const list=$("trashList"); const meta=$("trashMeta"); const sel=$("trashRetentionSel"); if(!list||!meta||!sel) return; const entries=Array.isArray(__trashData.entries)?__trashData.entries:[]; const keep=Number(__trashData.retentionDays||30); sel.value=String(keep); meta.textContent=(LANG==="en"?("Retention "+keep+" days · entries="+entries.length):("保留 "+keep+" 天 · 条目="+entries.length)); if(!entries.length){ list.className="empty"; list.textContent=t("trashNone"); __trashSelectedPaths.clear(); updateTrashDeleteBtn(); return; } list.className=""; list.innerHTML=""; entries.forEach((e)=>{ const row=document.createElement("div"); row.className="trash-row"; const cb=document.createElement("input"); cb.type="checkbox"; cb.checked=__trashSelectedPaths.has(e.path||""); cb.addEventListener("change",(ev)=>{ if(ev.target.checked) __trashSelectedPaths.add(e.path||""); else __trashSelectedPaths.delete(e.path||""); updateTrashDeleteBtn(); }); const box=document.createElement("div"); box.style.display="flex"; box.style.flexDirection="column"; box.style.gap="4px"; const m1=document.createElement("div"); m1.className="meta"; m1.textContent=(e.projectName||"-")+" · "+(e.fileName||"-")+" · "+new Date(e.mtime||Date.now()).toLocaleString()+" · "+(e.size||0)+" bytes"; const m2=document.createElement("div"); m2.className="path"; m2.textContent=e.path||""; box.appendChild(m1); box.appendChild(m2); row.appendChild(cb); row.appendChild(box); list.appendChild(row); }); updateTrashDeleteBtn(); }
     async function cleanupTrashNow(){ const sel=$("trashRetentionSel"); const days=Number(sel&&sel.value||30); if(!window.confirm((LANG==="en"?"Cleanup expired trash with retention ":"按保留期清理过期回收站条目：")+days+(LANG==="en"?" days?":" 天？"))) return; try{ await apiPost("/api/memory/trash/cleanup",{days,confirm:true,source:"dashboard"}); __trashSelectedPaths.clear(); await refreshTrashData(); }catch(e){ alert("Trash cleanup failed: "+e.message);} }

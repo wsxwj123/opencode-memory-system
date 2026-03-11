@@ -32,6 +32,10 @@ const statePath = path.join(dashboardDir, '.dashboard-server.json');
 const dockerContainer = `opencode-memory-dashboard-${port}`;
 const RETENTION_OPTIONS = new Set([1, 3, 7, 10, 30]);
 const DEFAULT_RETENTION_DAYS = 30;
+const OPENCODE_DB_CANDIDATES = [
+  path.join(home, '.local', 'share', 'opencode', 'opencode.db'),
+  path.join(home, 'AppData', 'Roaming', 'opencode', 'opencode.db')
+];
 
 function pickPluginSourcePath() {
   const candidates = [
@@ -90,29 +94,13 @@ function syncDashboardHtmlFromPlugin() {
   try {
     const pluginPath = pickPluginSourcePath();
     if (!pluginPath) return { ok: false, reason: 'plugin_source_not_found' };
-    const templatePath = path.join(path.dirname(pluginPath), 'dashboard', 'template.html');
     const data = safeReadJson(dataPath) || getDashboardDataFallback();
-    const payload = JSON.stringify(data).replace(/</g, '\\u003c');
-    if (fs.existsSync(templatePath)) {
-      const tpl = fs.readFileSync(templatePath, 'utf8');
-      if (tpl && tpl.includes('__MEMORY_DASHBOARD_DATA__')) {
-        const html = tpl.replace('__MEMORY_DASHBOARD_DATA__', payload);
-        if (html.includes('<!doctype html>') && html.includes('/api/dashboard')) {
-          const oldHtml = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '';
-          if (oldHtml !== html) {
-            fs.writeFileSync(indexPath, html, 'utf8');
-            return { ok: true, reason: 'updated_from_template', source: templatePath };
-          }
-          return { ok: true, reason: 'already_latest_template', source: templatePath };
-        }
-      }
-    }
     const src = fs.readFileSync(pluginPath, 'utf8');
-    const fnText = extractFunctionText(src, 'buildDashboardHtml');
-    if (!fnText) return { ok: false, reason: 'buildDashboardHtml_not_found' };
+    const fnText = extractFunctionText(src, 'buildDashboardHtmlLegacy');
+    if (!fnText) return { ok: false, reason: 'buildDashboardHtmlLegacy_not_found' };
     const context = { __data: data, __html: '' };
     vm.createContext(context);
-    vm.runInContext(`${fnText}\n__html = buildDashboardHtml(__data);`, context, { timeout: 3000 });
+    vm.runInContext(`${fnText}\n__html = buildDashboardHtmlLegacy(__data);`, context, { timeout: 3000 });
     const html = String(context.__html || '');
     if (!html.includes('<!doctype html>') || !html.includes('/api/dashboard')) {
       return { ok: false, reason: 'generated_html_invalid' };
@@ -120,9 +108,9 @@ function syncDashboardHtmlFromPlugin() {
     const oldHtml = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '';
     if (oldHtml !== html) {
       fs.writeFileSync(indexPath, html, 'utf8');
-      return { ok: true, reason: 'updated', source: pluginPath };
+      return { ok: true, reason: 'updated_from_legacy', source: pluginPath };
     }
-    return { ok: true, reason: 'already_latest', source: pluginPath };
+    return { ok: true, reason: 'already_latest_legacy', source: pluginPath };
   } catch (err) {
     return { ok: false, reason: String(err?.message || err) };
   }
@@ -299,6 +287,27 @@ function truncateText(value, max = 240) {
   return `${s.slice(0, max)}...`;
 }
 
+function buildBudgetTokenView(data = {}) {
+  const bodyTokens = Number(data?.lastEstimatedBodyTokens || 0);
+  const systemTokens = Number(data?.lastEstimatedSystemTokens || 0);
+  const pluginHintTokens = Number(data?.lastEstimatedPluginHintTokens || 0);
+  const totalTokens = Number(bodyTokens + systemTokens);
+  return {
+    bodyTokens,
+    systemTokens,
+    pluginHintTokens,
+    totalTokens,
+    totalWithPluginHintTokens: Number(totalTokens + pluginHintTokens),
+    pluginHintIncludedInTotal: false,
+    estimateMethod: 'heuristic_chars_div_4',
+    estimateBase: 'ceil(chars/4)',
+    exactBillingEquivalent: false,
+    bodyIncludesCompressedSummary: true,
+    displayFormula: 'body+system',
+    displayNote: 'Estimated tokens use ceil(chars/4). total=body+system; plugin-hint is displayed separately and not included in total.'
+  };
+}
+
 function normalizeProvider(value) {
   const p = normalizeText(String(value || '')).toLowerCase();
   if (p === 'anthropic' || p === 'gemini') return p;
@@ -313,6 +322,87 @@ function normalizeBaseURL(value, provider = 'openai_compatible') {
     return /\/v1beta$/i.test(base) ? base : `${base}/v1beta`;
   }
   return base;
+}
+
+function parseBoolQuery(value) {
+  const s = normalizeText(String(value || '')).toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(s)) return true;
+  if (['0', 'false', 'no', 'off'].includes(s)) return false;
+  return null;
+}
+
+function findOpencodeDbPath() {
+  for (const p of OPENCODE_DB_CANDIDATES) {
+    try {
+      const st = fs.statSync(p);
+      if (st.isFile()) return p;
+    } catch {
+      // ignore
+    }
+  }
+  return '';
+}
+
+function runSqliteQuery(dbPath, sql) {
+  const ret = spawnSync('sqlite3', [dbPath, '-separator', '\t', sql], {
+    encoding: 'utf8',
+    maxBuffer: 8 * 1024 * 1024
+  });
+  if ((ret.status ?? 1) !== 0) {
+    return { ok: false, error: String(ret.stderr || ret.stdout || 'sqlite query failed') };
+  }
+  return { ok: true, stdout: String(ret.stdout || '') };
+}
+
+function listOpencodeSessionsFromDb({ archived = null, limit = 200 } = {}) {
+  const dbPath = findOpencodeDbPath();
+  if (!dbPath) {
+    return { ok: false, source: '', error: 'opencode.db not found', items: [] };
+  }
+  const safeLimit = Math.max(1, Math.min(1000, Number(limit || 200)));
+  let where = '';
+  if (archived === true) where = 'where time_archived is not null';
+  if (archived === false) where = 'where time_archived is null';
+  const sql = [
+    'select',
+    'id,',
+    "coalesce(time_created,''),",
+    "coalesce(time_updated,''),",
+    "coalesce(time_archived,'')",
+    'from session',
+    where,
+    'order by',
+    'coalesce(time_updated,time_created) desc',
+    `limit ${safeLimit};`
+  ].join(' ');
+  const q = runSqliteQuery(dbPath, sql);
+  if (!q.ok) return { ok: false, source: dbPath, error: q.error, items: [] };
+  const lines = String(q.stdout || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  const items = lines.map((line) => {
+    const [id, createdAt, updatedAt, archivedAt] = line.split('\t');
+    return {
+      id: String(id || ''),
+      createdAt: String(createdAt || ''),
+      updatedAt: String(updatedAt || ''),
+      archived: Boolean(archivedAt),
+      archivedAt: String(archivedAt || '')
+    };
+  }).filter((x) => x.id);
+  return { ok: true, source: dbPath, items };
+}
+
+function detectArchiveFilterGap() {
+  const active = listOpencodeSessionsFromDb({ archived: false, limit: 400 });
+  const archived = listOpencodeSessionsFromDb({ archived: true, limit: 400 });
+  if (!active.ok || !archived.ok) {
+    return { ok: false, reason: active.error || archived.error || 'query_failed' };
+  }
+  return {
+    ok: true,
+    reason: 'sqlite_filter_available',
+    activeCount: active.items.length,
+    archivedCount: archived.items.length
+  };
 }
 
 async function fetchIndependentModels({ provider, baseURL, apiKey, timeoutMs = 30000 }) {
@@ -554,9 +644,51 @@ function readProjectSessions(projectName) {
     const obj = safeReadJson(path.join(dir, f));
     if (!obj || !obj.sessionID) continue;
     const stats = obj.stats || {};
+    const traces = Array.isArray(obj?.sendPretrim?.traces) ? obj.sendPretrim.traces : [];
+    const latestTrace = traces.length ? traces[traces.length - 1] : null;
+    const budgetSystemFallback = Number(
+      obj?.budget?.lastEstimatedSystemTokens ||
+      latestTrace?.systemTokensAfter ||
+      latestTrace?.systemTokensBefore ||
+      0
+    );
+    const budgetBodyFallback = Number(
+      obj?.budget?.lastEstimatedBodyTokens ||
+      latestTrace?.afterTokens ||
+      latestTrace?.beforeTokens ||
+      0
+    );
+    const budgetTotalFallback = Number(
+      obj?.budget?.lastEstimatedTotalTokens ||
+      latestTrace?.totalAfterTokens ||
+      latestTrace?.totalBeforeTokens ||
+      (budgetBodyFallback + budgetSystemFallback)
+    );
+    const budgetPluginHintFallback = Number(
+      obj?.budget?.lastEstimatedPluginHintTokens ||
+      latestTrace?.pluginHintTokensAfter ||
+      latestTrace?.pluginHintTokensBefore ||
+      0
+    );
+    const systemPromptFallback = {
+      lastObservedTokens: Number(
+        obj?.systemPrompt?.lastObservedTokens ||
+        obj?.budget?.lastEstimatedSystemTokens ||
+        latestTrace?.systemTokensAfter ||
+        latestTrace?.systemTokensBefore ||
+        0
+      ),
+      lastObservedLines: Number(obj?.systemPrompt?.lastObservedLines || 0),
+      lastObservedAt: obj?.systemPrompt?.lastObservedAt || null,
+      lastObservedHash: obj?.systemPrompt?.lastObservedHash || '',
+      lastObservedPreview: obj?.systemPrompt?.lastObservedPreview || '',
+      lastObservedModel: obj?.systemPrompt?.lastObservedModel || ''
+    };
     sessions.push({
+      projectName,
       sessionID: obj.sessionID,
       sessionTitle: normalizeText(obj.sessionTitle || ''),
+      sessionCwd: normalizeText(obj.sessionCwd || ''),
       createdAt: obj.createdAt || null,
       updatedAt: obj.updatedAt || null,
       stats: {
@@ -616,10 +748,19 @@ function readProjectSessions(projectName) {
       },
       budget: {
         bodyTokenBudget: Number(obj?.budget?.bodyTokenBudget || 50000),
-        lastEstimatedBodyTokens: Number(obj?.budget?.lastEstimatedBodyTokens || 0),
+        lastEstimatedBodyTokens: budgetBodyFallback,
+        lastEstimatedSystemTokens: budgetSystemFallback,
+        lastEstimatedPluginHintTokens: budgetPluginHintFallback,
+        lastEstimatedTotalTokens: budgetTotalFallback,
+        tokenView: buildBudgetTokenView({
+          lastEstimatedBodyTokens: budgetBodyFallback,
+          lastEstimatedSystemTokens: budgetSystemFallback,
+          lastEstimatedPluginHintTokens: budgetPluginHintFallback
+        }),
         lastCompactedAt: obj?.budget?.lastCompactedAt || null,
         lastCompactionReason: obj?.budget?.lastCompactionReason || ''
       },
+      systemPrompt: systemPromptFallback,
       pruneAudit: {
         autoRuns: Number(obj?.pruneAudit?.autoRuns || 0),
         manualRuns: Number(obj?.pruneAudit?.manualRuns || 0),
@@ -641,7 +782,7 @@ function readProjectSessions(projectName) {
         lastAt: obj?.sendPretrim?.lastAt || null,
         lastReason: obj?.sendPretrim?.lastReason || '',
         lastStatus: obj?.sendPretrim?.lastStatus || '',
-        traces: Array.isArray(obj?.sendPretrim?.traces) ? obj.sendPretrim.traces.slice(-8) : []
+        traces: traces.slice(-8)
       }
       ,
       alerts: obj?.alerts && typeof obj.alerts === 'object' ? obj.alerts : {}
@@ -677,10 +818,14 @@ function buildLiveDashboardData() {
   });
 
   const global = (safeReadJson(path.join(memoryDir, 'global.json')) || {});
+  const memorySystem = getMemorySystemSettings();
   const data = {
     generatedAt: new Date().toISOString(),
     settings: {
-      memorySystem: getMemorySystemSettings()
+      memorySystem
+    },
+    config: {
+      memorySystem
     },
     global: {
       preferences: global?.preferences && typeof global.preferences === 'object' ? global.preferences : {},
@@ -828,6 +973,14 @@ function clearState() {
   if (fs.existsSync(statePath)) fs.unlinkSync(statePath);
 }
 
+function clearOwnNodeState() {
+  const state = readState();
+  if (!state || state.mode !== 'node') return;
+  if (Number(state.port) !== Number(port)) return;
+  if (Number(state.pid) !== Number(process.pid)) return;
+  clearState();
+}
+
 function cmdExists(name) {
   const probe = isWindows ? ['where', [name]] : ['which', [name]];
   return spawnSync(probe[0], probe[1], { stdio: 'ignore' }).status === 0;
@@ -848,7 +1001,7 @@ function isOpencodeRunning() {
     return out.status === 0 && /opencode\.exe/i.test(out.stdout || '');
   }
   // macOS/Unix: accept both CLI and desktop app process names, case-insensitive.
-  const out = spawnSync('pgrep', ['-if', '(^|/| )opencode( |$)|opencode web|OpenCode'], { encoding: 'utf8' });
+  const out = spawnSync('pgrep', ['-if', '(^|/|\\.)opencode( |$)|opencode web|\\.opencode|OpenCode'], { encoding: 'utf8' });
   if (out.status !== 0) return false;
   return String(out.stdout || '').trim().length > 0;
 }
@@ -985,15 +1138,27 @@ function serve() {
   }, 6 * 60 * 60 * 1000);
   const parentPid = parentPidArg > 0 ? parentPidArg : 0;
   const opencodePort = opencodePortArg > 0 ? opencodePortArg : 4096;
+  const explicitParentBinding = parentPid > 0;
   let miss = 0;
   const watchdog = setInterval(async () => {
-    // Prefer process-based liveness over raw port check:
-    // raw port check can be false-positive when another app reuses the port.
-    // Keep port as weak fallback only.
+    const byParent = explicitParentBinding ? isPidAlive(parentPid) : false;
     const byProcess = isOpencodeRunning();
-    const byParent = parentPid > 0 ? isPidAlive(parentPid) : false;
     const byPort = await isTcpPortListening(opencodePort);
-    const alive = byParent || byProcess || (byPort && byProcess);
+    const alive = byParent || byProcess || byPort;
+    if (explicitParentBinding) {
+      if (alive) {
+        miss = 0;
+        return;
+      }
+      miss += 1;
+      if (miss >= Math.min(watchdogMaxMiss, 3)) {
+        clearInterval(trashGcTimer);
+        clearInterval(watchdog);
+        process.exit(0);
+      }
+      return;
+    }
+    // No explicit parent PID was provided. Fall back to global OpenCode / port probing.
     if (alive) {
       miss = 0;
       return;
@@ -1008,10 +1173,40 @@ function serve() {
 
   const server = http.createServer(async (req, res) => {
     const method = (req.method || 'GET').toUpperCase();
-    const rawPath = decodeURIComponent((req.url || '/').split('?')[0]);
+    const parsedUrl = new URL(req.url || '/', 'http://127.0.0.1');
+    const rawPath = decodeURIComponent(parsedUrl.pathname || '/');
+
+    if (method === 'GET' && rawPath === '/api/memory/opencode/sessions') {
+      const archived = parseBoolQuery(parsedUrl.searchParams.get('archived'));
+      const limit = Number(parsedUrl.searchParams.get('limit') || 200);
+      const result = listOpencodeSessionsFromDb({ archived, limit });
+      if (!result.ok) {
+        sendJson(res, 500, {
+          ok: false,
+          error: result.error || 'query_failed',
+          source: result.source || ''
+        });
+        return;
+      }
+      const gap = detectArchiveFilterGap();
+      sendJson(res, 200, {
+        ok: true,
+        archived,
+        count: result.items.length,
+        source: result.source,
+        archiveFilterPolicy: {
+          strategy: 'sqlite_direct_filter',
+          upstreamSessionListFilterTrusted: false
+        },
+        filterHealth: gap,
+        items: result.items
+      });
+      return;
+    }
 
     if (method === 'GET' && rawPath === '/api/dashboard') {
       const live = buildLiveDashboardData();
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       sendJson(res, 200, live);
       return;
     }
@@ -1290,7 +1485,23 @@ function serve() {
     }
 
     const reqPath = decodeURIComponent((req.url || '/').split('?')[0]);
-    const target = reqPath === '/' ? indexPath : path.join(dashboardDir, reqPath);
+    if ((method === 'GET' || method === 'HEAD') && (reqPath === '/' || reqPath === '/index.html' || reqPath === '/dashboard')) {
+      ensureDashboardDir();
+      buildLiveDashboardData();
+      syncDashboardHtmlFromPlugin();
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate'
+      });
+      if (method === 'HEAD') {
+        res.end();
+        return;
+      }
+      const html = fs.readFileSync(indexPath, 'utf8');
+      res.end(html);
+      return;
+    }
+    const target = path.join(dashboardDir, reqPath);
     if (!target.startsWith(dashboardDir)) {
       res.writeHead(403);
       res.end('Forbidden');
@@ -1311,10 +1522,12 @@ function serve() {
     res.writeHead(200, { 'Content-Type': mime });
     fs.createReadStream(target).pipe(res);
   });
+  process.once('exit', clearOwnNodeState);
   server.listen(port, '127.0.0.1');
   server.on('close', () => {
     clearInterval(watchdog);
     clearInterval(trashGcTimer);
+    clearOwnNodeState();
   });
 }
 
