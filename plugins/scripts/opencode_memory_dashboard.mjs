@@ -293,8 +293,19 @@ function sanitizeDashboardNoteLine(value) {
     .replace(/^(?:请)?(?:帮我)?(?:在|往)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?(?:写入|写到|存入|存到|记入|记到|保存)[，,:：\s]*/i, '')
     .replace(/[，,]?\s*(?:你帮我|帮我)?(?:把|将)?(?:这条|这个|这些)?(?:内容|信息|事情)?(?:也)?(?:写入|写到|存入|存到|记入|记到|保存到)?(?:到)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?\s*$/i, '')
     .replace(/^(?:你把|把)?这个/i, '')
+    .replace(/(?:请你|帮我|你帮我|请)?(?:把|将)?(?:这条|这个|这些)?(?:内容|信息|事情)?(?:写入|写到|存入|存到|记入|记到|保存到)?(?:到)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?/gi, ' ')
     .trim();
-  return normalizeText(text);
+  const clauses = text
+    .split(/[，,。；;！!\n]+/)
+    .map((part) => normalizeText(part))
+    .filter(Boolean)
+    .filter((part) => !/(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆|只回复|写完后|删完后)/i.test(part));
+  const unique = [];
+  for (const part of clauses) {
+    if (!part || unique.includes(part)) continue;
+    unique.push(part);
+  }
+  return normalizeText(unique.length ? unique.join('；') : text);
 }
 
 function normalizeDashboardNote(raw = '') {
@@ -732,7 +743,8 @@ function readProjectSessions(projectName) {
         toolResults: Number(stats.toolResults || 0),
         systemEvents: Number(stats.systemEvents || 0)
       },
-      recentEvents: Array.isArray(obj.recentEvents) ? obj.recentEvents.slice(-12) : [],
+      totalEventsCount: Array.isArray(obj.recentEvents) ? obj.recentEvents.length : 0,
+      recentEvents: Array.isArray(obj.recentEvents) ? obj.recentEvents.slice(-80) : [],
       summary: {
         compressedEvents: Number(obj?.summary?.compressedEvents || 0),
         lastCompressedAt: obj?.summary?.lastCompressedAt || null,
@@ -747,7 +759,7 @@ function readProjectSessions(projectName) {
           const bid = Number(tr?.blockId || 0);
           if (bid > 0 && !traceByBlockId.has(bid)) traceByBlockId.set(bid, tr);
         }
-        const recent = arr.slice(-5).map((b) => {
+        const recent = arr.slice(-10).map((b) => {
           const blockId = Number(b?.blockId || 0);
           const tr = traceByBlockId.get(blockId);
           const range = (b?.startMessageID && b?.endMessageID)
@@ -874,16 +886,19 @@ function buildLiveDashboardData() {
       eventCount: projects.reduce((acc, p) => acc + Number(p.totalEvents || 0), 0)
     }
   };
-  writeJson(dataPath, data);
+  try { writeJson(dataPath, data); } catch (_) { /* best-effort disk cache */ }
   return data;
 }
 
 async function readJsonBody(req) {
   return await new Promise((resolve, reject) => {
+    let rejected = false;
     let data = '';
     req.on('data', (chunk) => {
       data += chunk.toString();
-      if (data.length > 2 * 1024 * 1024) {
+      if (!rejected && data.length > 2 * 1024 * 1024) {
+        rejected = true;
+        req.destroy();
         reject(new Error('payload too large'));
       }
     });

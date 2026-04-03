@@ -7,15 +7,16 @@ import { tool as defineTool } from '@opencode-ai/plugin';
 
 export const MemorySystemPlugin = ({ client }) => {
   const AUTO_MEMORY_VERSION = '2.0.0';
+  const RUNTIME_BOOT_AT = Date.now();
 
   // Storage and retention controls
   const AUTO_MAX_EVENTS_PER_SESSION = 120;
   const AUTO_MAX_EVENT_TEXT = 800;
   const AUTO_MAX_SESSIONS_PER_PROJECT = 60;
-  const AUTO_SUMMARY_TRIGGER_EVENTS = 40;
-  const AUTO_SUMMARY_KEEP_RECENT_EVENTS = 18;
-  const AUTO_SUMMARY_MAX_CHARS = 2400;
-  const AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE = 2600;
+  const AUTO_SUMMARY_TRIGGER_EVENTS = 60;
+  const AUTO_SUMMARY_KEEP_RECENT_EVENTS = 36;
+  const AUTO_SUMMARY_MAX_CHARS = 8000;
+  const AUTO_SUMMARY_MAX_CHARS_BUDGET_MODE = 10000;
   const AUTO_BODY_TOKEN_BUDGET = 50_000;
   const AUTO_BODY_BUDGET_SOFT_RATIO = 0.7;
   const AUTO_BODY_BUDGET_HARD_RATIO = 0.9;
@@ -558,12 +559,13 @@ export const MemorySystemPlugin = ({ client }) => {
   const AUTO_CURRENT_SESSION_SUMMARY_TOKEN_BUDGET = 500;
   const AUTO_CURRENT_SESSION_SUMMARY_MAX_CHARS = 2200;
   const AUTO_CURRENT_SESSION_SUMMARY_MAX_EVENTS = 6;
+  const AUTO_CURRENT_SESSION_RESUME_GAP_MS = 5 * 60 * 1000;
   const AUTO_INJECT_DEDUPE_WINDOW_MS = 120000;
   const AUTO_INJECT_DEDUPE_WINDOW_RECALL_MS = 15000;
   const AUTO_INJECT_RISK_GUARD_WINDOW_MS = 5 * 60 * 1000;
 
   // Dashboard controls
-  const DASHBOARD_MAX_EVENTS_PER_SESSION_VIEW = 30;
+  const DASHBOARD_MAX_EVENTS_PER_SESSION_VIEW = 80;
   const AUTO_DASHBOARD_AUTOSTART = true;
   const AUTO_DASHBOARD_PORT = (() => {
     const raw = Number(process.env.OPENCODE_MEMORY_DASHBOARD_PORT || 37777);
@@ -618,6 +620,7 @@ export const MemorySystemPlugin = ({ client }) => {
   const processedUserEventKeys = new Map();
   const sessionUserDedupeState = new Map();
   const sessionUserEventTasks = new Map();
+  const sessionWriteLocks = new Map();
   const sessionStrictHitAt = new Map();
   const sessionNoticeState = new Map();
   const sessionNoticeCleanupTimers = new Map();
@@ -755,7 +758,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
   function resolveSessionLocation(sessionID = '', preferredProjectName = getProjectName()) {
     const sid = normalizeText(String(sessionID || ''))
-      || [...sessionUserMessageCounters.keys()].slice(-1)[0]
+      || lastActiveSessionID
       || '';
     if (!sid || !isLikelySessionID(sid)) return { sessionID: '', projectName: preferredProjectName };
     const projectName = resolveSessionProjectName(sid, preferredProjectName);
@@ -766,7 +769,8 @@ export const MemorySystemPlugin = ({ client }) => {
     if (!fs.existsSync(filePath)) return {};
     try {
       return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    } catch {
+    } catch (err) {
+      console.warn(`memory-system: failed to parse JSON at ${filePath}: ${err?.message || err}`);
       return {};
     }
   }
@@ -813,7 +817,11 @@ export const MemorySystemPlugin = ({ client }) => {
   }
 
   function writeJson(filePath, data) {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    } catch (err) {
+      console.warn(`memory-system: failed to write JSON at ${filePath}: ${err?.message || err}`);
+    }
   }
 
   function normalizeGlobalMemoryKey(rawKey = '') {
@@ -960,12 +968,32 @@ export const MemorySystemPlugin = ({ client }) => {
       .replace(/^(?:请)?(?:帮我)?(?:在|往)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?(?:写入|写到|存入|存到|记入|记到|保存)[，,:：\s]*/i, '')
       .replace(/[，,]?\s*(?:你帮我|帮我)?(?:把|将)?(?:这条|这个|这些)?(?:内容|信息|事情)?(?:也)?(?:写入|写到|存入|存到|记入|记到|保存到)?(?:到)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?\s*$/i, '')
       .replace(/^(?:你把|把)?这个/i, '')
+      .replace(/(?:请你|帮我|你帮我|请)?(?:把|将)?(?:这条|这个|这些)?(?:内容|信息|事情)?(?:写入|写到|存入|存到|记入|记到|保存到)?(?:到)?(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆)(?:里|中)?/gi, ' ')
       .replace(/\s*只回复.*$/i, '')
       .replace(/\s*删完后.*$/i, '')
       .trim();
     if (!text) return '';
     if (/[？?]$/.test(text)) return '';
-    return normalizeText(text);
+    const clauses = text
+      .split(/[，,。；;！!\n]+/)
+      .map((part) => normalizeText(part))
+      .filter(Boolean)
+      .filter((part) => !/(?:全局记忆|全局偏好|长期记忆|永久记忆|memory插件全局记忆|只回复|写完后|删完后)/i.test(part));
+    const unique = [];
+    for (const part of clauses) {
+      if (!part || unique.includes(part)) continue;
+      unique.push(part);
+    }
+    const normalized = unique.length ? unique.join('；') : normalizeText(text);
+    const result = normalizeText(normalized);
+    if (!result) return '';
+    // Only accept path anchors, URLs, or content that looks like a structured value.
+    // Reject generic prose that stripped down to a short non-path fragment.
+    const looksLikePath = /[/\\]/.test(result) || /^https?:\/\//i.test(result);
+    const looksLikeAnchor = /锚点|anchor|路径|path|dir|folder|目录|文件/i.test(result);
+    const looksLikeKeyValue = /[:=]/.test(result) || /^\S+\s*[:=]\s*\S+/.test(result);
+    if (!looksLikePath && !looksLikeAnchor && !looksLikeKeyValue && result.length < 60) return '';
+    return result;
   }
 
   function normalizeGlobalNoteEntries(raw = '') {
@@ -991,6 +1019,11 @@ export const MemorySystemPlugin = ({ client }) => {
     const value = sanitizeFallbackGlobalNoteContent(rawValue) || sanitizeGlobalNoteContent(rawValue);
     if (!value) return { ok: false, key: 'preferences.note', value: '', message: 'Rejected empty global note content' };
 
+    // Path anchors → project-level storage instead of global preferences.note
+    if (isPathAnchorContent(value)) {
+      return appendProjectPathAnchor(value);
+    }
+
     try {
       const globalMemory = readJson(globalMemoryPath) || {};
       if (!globalMemory.preferences || typeof globalMemory.preferences !== 'object') {
@@ -1008,21 +1041,23 @@ export const MemorySystemPlugin = ({ client }) => {
         entries.push(cleaned);
         existingValues.push(cleaned);
       }
-      if (existingValues.includes(value)) {
+      const incomingValues = normalizeGlobalNoteEntries(String(value).replace(/；/g, '\n'))
+        .map((rawEntry) => {
+          const base = String(rawEntry || '').replace(/^\d+\.\s*/, '').trim();
+          return sanitizeFallbackGlobalNoteContent(base) || sanitizeGlobalNoteContent(base) || base;
+        })
+        .filter(Boolean)
+        .filter((item, index, arr) => arr.indexOf(item) === index);
+      const newValues = incomingValues.filter((item) => !existingValues.includes(item));
+      if (!newValues.length) {
         return { ok: true, key: 'preferences.note', value: value, message: `Global setting already present: preferences.note += ${value}` };
       }
-      if (!entries.length) {
-        next = `1. ${value}`;
-      } else {
-        next = entries
-          .map((line, index) => `${index + 1}. ${line}`)
-          .concat(`${entries.length + 1}. ${value}`)
-          .join('\n');
-      }
+      const merged = entries.concat(newValues);
+      next = merged.map((line, index) => `${index + 1}. ${line}`).join('\n');
       globalMemory.preferences.note = next;
       writeJson(globalMemoryPath, globalMemory);
       writeDashboardFiles();
-      return { ok: true, key: 'preferences.note', value: value, message: `Global setting updated: preferences.note += ${value}` };
+      return { ok: true, key: 'preferences.note', value: newValues.join('；'), message: `Global setting updated: preferences.note += ${newValues.join('；')}` };
     } catch (e) {
       return {
         ok: false,
@@ -1032,6 +1067,82 @@ export const MemorySystemPlugin = ({ client }) => {
       };
     }
   }
+
+  // --------------- Project-level path anchor helpers ---------------
+
+  function isPathAnchorContent(text = '') {
+    const s = normalizeText(String(text || ''));
+    if (!s) return false;
+    // Contains a filesystem path (/ or \) or explicit anchor keyword
+    const hasPath = /[/\\]/.test(s) || /^https?:\/\//i.test(s);
+    const hasAnchorKeyword = /锚点|anchor|路径|path|dir|folder|目录|文件|根目录|root|workspace|工作区/i.test(s);
+    return hasPath || hasAnchorKeyword;
+  }
+
+  function readProjectPathAnchors(projectName = getProjectName()) {
+    const meta = readProjectMeta(projectName);
+    return Array.isArray(meta?.pathAnchors) ? meta.pathAnchors : [];
+  }
+
+  function appendProjectPathAnchor(rawValue = '', projectName = getProjectName()) {
+    const value = normalizeText(String(rawValue || ''));
+    if (!value) return { ok: false, key: 'pathAnchors', value: '', message: 'Empty path anchor content' };
+    try {
+      const meta = readProjectMeta(projectName);
+      if (!Array.isArray(meta.pathAnchors)) meta.pathAnchors = [];
+      // Dedup: don't add if already present (normalized comparison)
+      const existing = meta.pathAnchors.map((a) => normalizeText(String(a || '')).toLowerCase());
+      if (existing.includes(value.toLowerCase())) {
+        return { ok: true, key: 'pathAnchors', value, message: `Path anchor already present in project ${projectName}: ${value}` };
+      }
+      // Limit to 20 anchors per project
+      if (meta.pathAnchors.length >= 20) {
+        meta.pathAnchors.shift(); // remove oldest
+      }
+      meta.pathAnchors.push(value);
+      writeProjectMeta(meta, projectName);
+      writeDashboardFiles();
+      return { ok: true, key: 'pathAnchors', value, message: `Path anchor saved to project ${projectName}: ${value}` };
+    } catch (e) {
+      return { ok: false, key: 'pathAnchors', value, message: `Failed to save path anchor: ${e?.message || String(e)}` };
+    }
+  }
+
+  function deleteProjectPathAnchor(rawValue = '', projectName = getProjectName()) {
+    const value = normalizeText(String(rawValue || '')).toLowerCase();
+    if (!value) return { ok: false, message: 'Empty path anchor value' };
+    try {
+      const meta = readProjectMeta(projectName);
+      if (!Array.isArray(meta.pathAnchors) || !meta.pathAnchors.length) {
+        return { ok: true, existed: false, message: 'No path anchors to delete' };
+      }
+      const before = meta.pathAnchors.length;
+      meta.pathAnchors = meta.pathAnchors.filter(
+        (a) => !normalizeText(String(a || '')).toLowerCase().includes(value)
+      );
+      const removed = before - meta.pathAnchors.length;
+      if (removed > 0) {
+        writeProjectMeta(meta, projectName);
+        writeDashboardFiles();
+      }
+      return { ok: true, existed: removed > 0, removed, message: `Removed ${removed} path anchor(s) from project ${projectName}` };
+    } catch (e) {
+      return { ok: false, message: `Failed to delete path anchor: ${e?.message || String(e)}` };
+    }
+  }
+
+  function buildProjectPathAnchorsText(projectName = getProjectName()) {
+    const anchors = readProjectPathAnchors(projectName);
+    if (!anchors.length) return '';
+    const lines = ['<OPENCODE_PROJECT_PATH_ANCHORS>'];
+    for (const anchor of anchors) {
+      lines.push(`- ${truncateText(normalizeText(String(anchor)), 200)}`);
+    }
+    lines.push('</OPENCODE_PROJECT_PATH_ANCHORS>');
+    return lines.join('\n');
+  }
+
+  // --------------- End project-level path anchor helpers ---------------
 
   function inferGlobalPreferenceWrite(payload = {}) {
     const raw = payload && typeof payload === 'object' ? payload : {};
@@ -1077,10 +1188,31 @@ export const MemorySystemPlugin = ({ client }) => {
     return list.length ? { keys: list } : null;
   }
 
+  function isAllowedGlobalPreferenceKey(key = '') {
+    const k = normalizeText(String(key || '')).toLowerCase();
+    if (!k) return false;
+    const allowed = new Set([
+      'preferences.language', 'preferences.nickname', 'preferences.communication_style',
+      'preferences.note', 'preferences.language_preference', 'preferences.response_style',
+      'preferences.theme', 'preferences.timezone', 'preferences.locale'
+    ]);
+    if (allowed.has(k)) return true;
+    // Allow any key under preferences.* or snippets.* but reject project-specific data patterns
+    if (/^(preferences|snippets)\./.test(k)) {
+      // Reject keys that look like project-specific data
+      if (/project.?code|task.?id|session.?data|代号|项目|任务/i.test(k)) return false;
+      return true;
+    }
+    return false;
+  }
+
   function writeGlobalMemoryValue(rawKey = '', rawValue = '') {
     const key = normalizeGlobalMemoryKey(rawKey);
     let value = typeof rawValue === 'string' ? rawValue : JSON.stringify(rawValue);
     if (!key) return { ok: false, message: 'Missing global memory key' };
+    if (!isAllowedGlobalPreferenceKey(key)) {
+      return { ok: false, message: `Rejected non-preference global write: ${key}. Global memory is only for persistent user preferences (language, nickname, style, path anchors). Project codes and task data belong in session memory.` };
+    }
     if (key === 'preferences.note') {
       value = sanitizeGlobalNoteContent(value);
       if (!value) return { ok: false, message: 'Rejected unsafe/empty global note content' };
@@ -1125,7 +1257,12 @@ export const MemorySystemPlugin = ({ client }) => {
       || ''
     );
     if (shouldAppendGlobalNoteFromContext(key, rawText)) {
-      return appendValueToGlobalNote(rawText);
+      const noteSource = sanitizeFallbackGlobalNoteContent(value)
+        || sanitizeGlobalNoteContent(value)
+        || sanitizeFallbackGlobalNoteContent(rawText)
+        || sanitizeGlobalNoteContent(rawText)
+        || rawText;
+      return appendValueToGlobalNote(noteSource);
     }
     return writeGlobalMemoryValue(key, value);
   }
@@ -1170,7 +1307,7 @@ export const MemorySystemPlugin = ({ client }) => {
     const argvHasPriorityIntent = Boolean(argvText) && (hasExplicitGlobalMemoryIntent(argvText) || shouldTriggerRecall(argvText) || shouldTriggerWeakFollowupRecall(argvText));
     const sid = normalizeText(String(sessionID || ''))
       || normalizeText(String(lastActiveSessionID || ''))
-      || [...sessionUserMessageCounters.keys()].slice(-1)[0]
+      || lastActiveSessionID
       || '';
     if (sid) {
       const runtimeText = normalizeText(String(sessionLatestUserTextByID.get(sid) || ''));
@@ -1385,7 +1522,7 @@ export const MemorySystemPlugin = ({ client }) => {
     if (/(语言|language|中文|english|英文)/i.test(text)) return 'preferences.language';
     if (/(昵称|nickname|怎么称呼|称呼|名字|name|叫什么|叫啥|叫我)/i.test(text)) return 'preferences.nickname';
     if (/(风格|style|语气)/i.test(text)) return 'preferences.communication_style';
-    if (/(路径锚点|路径|path anchor|path)/i.test(text)) return 'preferences.note';
+    if (/(路径锚点|路径|path anchor|path)/i.test(text)) return 'project.pathAnchors';
     return '';
   }
 
@@ -1407,6 +1544,12 @@ export const MemorySystemPlugin = ({ client }) => {
     if (!looksLikePreferenceReadRequest(text)) return null;
     const key = inferPreferenceReadKeyFromText(text);
     if (!key) return null;
+    // Path anchors are now stored per-project, not in global prefs
+    if (key === 'project.pathAnchors') {
+      const anchors = readProjectPathAnchors();
+      if (!anchors.length) return null;
+      return { key: 'project.pathAnchors', value: anchors.join('；'), query: text };
+    }
     const g = readJson(globalMemoryPath) || {};
     const prefs = getNormalizedGlobalPreferences(g);
     const value = lookupGlobalPreferenceValue(prefs, key);
@@ -1481,8 +1624,16 @@ export const MemorySystemPlugin = ({ client }) => {
     if (/^\/memory\b/i.test(text)) return false;
     if (hasExplicitGlobalMemoryDeleteIntent(text)) return false;
     if (isAutoGlobalWriteUnsafeText(text) || isSummaryNoiseText(text)) return false;
+    // Questions are reads, not writes.
+    // "我写入的路径锚点是什么" is a read (past-tense "写入的"), not a write command.
+    // Only treat as write if text has imperative write intent: "请写入", "帮我写入", "写入全局记忆"
+    if (/是什么|是多少|在哪|哪里|what is|where|how much|告诉我|查一下|看一下|读取|读一下/i.test(text)) {
+      if (!/(?:请|帮我?)?(?:写入|保存|记住|存入|存到)(?:全局|长期|永久)/i.test(text)) return false;
+    }
     if (hasExplicitGlobalMemoryIntent(text)) return true;
-    return /写入全局记忆|保存到全局记忆|全局偏好|全局记住|全局保存|全局写入|永远记住|持续记忆|永久记忆|记住这个路径|路径锚点|以后默认|默认使用|默认用|设置为|设为|改为|set\s+[A-Za-z0-9._-]+\s+to/i.test(text);
+    // Require explicit memory/remember intent keywords. Avoid matching casual phrases
+    // like "默认使用", "设为", "set X to Y" which appear in normal code discussions.
+    return /写入全局记忆|保存到全局记忆|全局偏好|全局记住|全局保存|全局写入|永远记住|持续记忆|永久记忆|记住这个路径|路径锚点/i.test(text);
   }
 
   function parseExplicitMemorySlashCommandFromText(rawText = '') {
@@ -1509,7 +1660,7 @@ export const MemorySystemPlugin = ({ client }) => {
       'learn', 'project', 'global', 'set', 'prefer', 'save', 'export', 'import', 'clear', 'edit',
       'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'distill',
       'delete', 'unset',
-      'compress', 'context', 'stats', 'doctor'
+      'compress', 'compact', 'context', 'stats', 'doctor', 'anchors'
     ]);
     if (!validCommands.has(command)) return null;
     const args = parts.slice(1);
@@ -1588,6 +1739,9 @@ export const MemorySystemPlugin = ({ client }) => {
       const bySession = getLatestUserSummaryForSession(sid, getProjectName());
       if (bySession) return bySession;
       if (argvText) return argvText;
+      // Fall back to global observed text when per-session text is unavailable
+      const globalFallback = normalizeText(String(lastObservedUserText || ''));
+      if (globalFallback && !isLowSignalUserText(globalFallback)) return globalFallback;
       return '';
     }
     const bySession = getLatestUserSummaryForSession(sid, getProjectName());
@@ -1854,7 +2008,17 @@ export const MemorySystemPlugin = ({ client }) => {
 
   function isMemoryInjectionText(value) {
     const s = String(value || '');
-    return /<OPENCODE_[A-Z_]+/i.test(s) || /<\/OPENCODE_[A-Z_]+>/i.test(s);
+    return /<OPENCODE_[A-Z_]+/i.test(s)
+      || /<\/OPENCODE_[A-Z_]+>/i.test(s)
+      || /<prunable-tools>/i.test(s)
+      || /<\/prunable-tools>/i.test(s)
+      || /<message-id>/i.test(s)
+      || /<\/message-id>/i.test(s)
+      || /<message-id-map\b/i.test(s)
+      || /<dcp-message-id>/i.test(s)
+      || /<\/dcp-message-id>/i.test(s)
+      || /<memory-global-(?:read|write)\b/i.test(s)
+      || /<\/memory-global-(?:read|write)>/i.test(s);
   }
 
   function stripMemoryInjectionMarkers(value) {
@@ -2207,9 +2371,9 @@ export const MemorySystemPlugin = ({ client }) => {
     if (!hasSessionMemoryFile(sessionID)) return false;
 
     const observedText = preferObservedUserText(
-      String(sessionObservedUserTextByID.get(sessionID) || lastObservedUserText || '')
+      String(sessionObservedUserTextByID.get(sessionID) || '')
     );
-    const observedAt = Number(sessionObservedUserAtByID.get(sessionID) || lastObservedUserAt || 0);
+    const observedAt = Number(sessionObservedUserAtByID.get(sessionID) || 0);
     if (!observedText || !observedAt) return false;
     if ((Date.now() - observedAt) > OBSERVED_USER_FALLBACK_MAX_AGE_MS) return false;
     if (isVisibleNoticeText(observedText)) return false;
@@ -2720,6 +2884,7 @@ export const MemorySystemPlugin = ({ client }) => {
       const chunks = [];
       if (Array.isArray(msg?.parts)) {
         for (const part of msg.parts) {
+          if (part?.synthetic) continue;
           const text = partTextForPretrim(part);
           if (!text || isMemoryInjectionText(text)) continue;
           chunks.push(text);
@@ -2760,7 +2925,7 @@ export const MemorySystemPlugin = ({ client }) => {
               ? msg.text
               : safeJsonPreview(msg, 1600))
         );
-        if (!text || isLowSignalUserText(text)) continue;
+        if (!text || isMemoryInjectionText(text) || isLowSignalUserText(text)) continue;
         return text;
       }
     }
@@ -4414,8 +4579,10 @@ export const MemorySystemPlugin = ({ client }) => {
   function extractSessionTitle(event) {
     return normalizeText(
       event?.properties?.info?.title ||
+      event?.properties?.session?.title ||
       event?.session?.title ||
       event?.data?.title ||
+      event?.data?.session?.title ||
       event?.title ||
       ''
     );
@@ -5293,8 +5460,11 @@ export const MemorySystemPlugin = ({ client }) => {
       const current = sanitizeCompressedSummaryText(String(sessionData?.summary?.compressedText || ''));
     const merged = [current, chunk].filter(Boolean).join('\n\n');
 
+    // Use truncateText (keep beginning = earliest history) instead of truncateFromEnd
+    // (which kept end = overlapped with recentEvents). The compressed summary should
+    // preserve the earliest conversation context; recent events are in recentEvents.
     sessionData.summary = {
-      compressedText: truncateFromEnd(merged, getSummaryMaxChars()),
+      compressedText: truncateText(merged, getSummaryMaxChars()),
       compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + toCompress.length,
       lastCompressedAt: new Date().toISOString()
     };
@@ -5318,7 +5488,7 @@ export const MemorySystemPlugin = ({ client }) => {
     const current = sanitizeCompressedSummaryText(String(sessionData?.summary?.compressedText || ''));
     const merged = [current, chunk].filter(Boolean).join('\n\n');
     sessionData.summary = {
-      compressedText: truncateFromEnd(merged, getSummaryMaxCharsBudgetMode()),
+      compressedText: truncateText(merged, getSummaryMaxCharsBudgetMode()),
       compressedEvents: Number(sessionData?.summary?.compressedEvents || 0) + eventsToCompress.length,
       lastCompressedAt: new Date().toISOString()
     };
@@ -5466,7 +5636,12 @@ export const MemorySystemPlugin = ({ client }) => {
 
   function enforceSessionFileBudget(sessionData, sessionPath) {
     let guard = 0;
+    let prevSize = Infinity;
     while (fs.existsSync(sessionPath) && fs.statSync(sessionPath).size > AUTO_SESSION_FILE_MAX_BYTES && guard < 8) {
+      const currentSize = fs.statSync(sessionPath).size;
+      // Break if no meaningful progress (< 5% reduction) to avoid spinning
+      if (currentSize >= prevSize * 0.95 && guard > 0) break;
+      prevSize = currentSize;
       guard += 1;
       ensureSummaryBlocks(sessionData);
 
@@ -5577,7 +5752,6 @@ export const MemorySystemPlugin = ({ client }) => {
   function appendAutoEvent({ sessionID, kind, summary, rawEvent = null, toolName = '' }) {
     try {
       if (!sessionID || !kind || !isLikelySessionID(sessionID)) return;
-
       const projectName = getProjectName();
       const sessionData = loadSessionMemory(sessionID, projectName);
       const cwdFromEvent = extractSessionCwd(rawEvent);
@@ -5774,12 +5948,30 @@ export const MemorySystemPlugin = ({ client }) => {
     return (Date.now() - ts) < AUTO_STRICT_SUPPRESS_CURRENT_SUMMARY_MS;
   }
 
+  function shouldInjectResumeCurrentSummary(sessionID, previousSessionData, now = Date.now()) {
+    if (!sessionID || !previousSessionData) return false;
+    const stats = previousSessionData?.stats || emptyStats();
+    const recentEvents = Array.isArray(previousSessionData?.recentEvents) ? previousSessionData.recentEvents : [];
+    if (Number(stats.userMessages || 0) <= 0) return false;
+    if (!recentEvents.length && !normalizeText(String(previousSessionData?.summary?.compressedText || ''))) return false;
+
+    const inject = previousSessionData?.inject || {};
+    const lastResumeAt = Date.parse(String(inject.lastResumeSummaryAt || 0)) || 0;
+    if (lastResumeAt > 0 && (now - lastResumeAt) < AUTO_CURRENT_SESSION_RESUME_GAP_MS) return false;
+
+    const updatedAtTs = Date.parse(String(previousSessionData?.updatedAt || 0)) || 0;
+    const idleLongEnough = updatedAtTs > 0 && (now - updatedAtTs) >= AUTO_CURRENT_SESSION_RESUME_GAP_MS;
+    const resumedAfterRuntimeRestart = updatedAtTs > 0 && updatedAtTs < RUNTIME_BOOT_AT && lastResumeAt < RUNTIME_BOOT_AT;
+    return resumedAfterRuntimeRestart || idleLongEnough;
+  }
+
   async function processUserMessageEventSerial(sessionID, text, rawEvent) {
     const rawNormalized = normalizeText(String(text || ''));
     const sanitized = sanitizeUserTextForMemoryInference(rawNormalized);
     const clean = stripObservedWrapperNoise(rawNormalized) || rawNormalized;
     if (isSkillBoilerplateUserText(rawNormalized) || isSkillBoilerplateUserText(sanitized) || isSkillBoilerplateUserText(clean)) return;
     if (isVisibleNoticeText(rawNormalized) || isVisibleNoticeText(sanitized) || isVisibleNoticeText(clean)) return;
+    if (isMemoryInjectionText(rawNormalized) || isMemoryInjectionText(sanitized) || isMemoryInjectionText(clean)) return;
     if (
       (
         /<system-reminder>[\s\S]*?<\/system-reminder>/i.test(rawNormalized)
@@ -5790,36 +5982,26 @@ export const MemorySystemPlugin = ({ client }) => {
     ) {
       return;
     }
-    let hasPersistedUserEvent = false;
-    if (isLikelySessionID(sessionID) && hasSessionMemoryFile(sessionID)) {
-      try {
-        const existingSession = loadSessionMemory(sessionID, getProjectName());
-        hasPersistedUserEvent = Array.isArray(existingSession?.recentEvents)
-          && existingSession.recentEvents.some((ev) => String(ev?.kind || '') === 'user-message');
-      } catch {
-        hasPersistedUserEvent = false;
-      }
-    }
     const observedSessionFallback = sanitizeUserTextForMemoryInference(
       String(sessionObservedUserTextByID.get(sessionID) || '')
     );
-    const observedGlobalFallback = !clean && !hasPersistedUserEvent
-      ? sanitizeUserTextForMemoryInference(String(lastObservedUserText || ''))
-      : '';
     const sessionScopedFallback = sanitizeUserTextForMemoryInference(getLatestUserTextForSession(sessionID));
-    const observedTransformFallback = normalizeText(String(rawEvent?.type || '')) === 'messages.transform.user-fallback'
-      ? sanitizeUserTextForMemoryInference(String(lastObservedUserText || ''))
-      : '';
+    const globalObservedFallback = sanitizeUserTextForMemoryInference(
+      String(lastObservedUserText || '')
+    );
     const inferredClean =
       clean
       || observedSessionFallback
-      || observedGlobalFallback
+      || globalObservedFallback
       || sessionScopedFallback
-      || observedTransformFallback;
+      || '';
     const persistedUserText = inferredClean;
     if (isSkillBoilerplateUserText(persistedUserText)) return;
+    if (isMemoryInjectionText(persistedUserText)) return;
     if (!persistedUserText || isVisibleNoticeText(persistedUserText)) return;
     if (!isLikelySessionID(sessionID)) return;
+    const hadSessionMemoryBeforeUser = hasSessionMemoryFile(sessionID);
+    const previousSessionData = hadSessionMemoryBeforeUser ? loadSessionMemory(sessionID) : null;
     rememberGlobalEmptyCallState.delete(sessionID);
     memoryEmptyCallState.delete(sessionID);
     if (sessionID) lastActiveSessionID = sessionID;
@@ -5834,7 +6016,7 @@ export const MemorySystemPlugin = ({ client }) => {
       return;
     }
     if (shouldSkipDuplicateUserEvent(sessionID, persistedUserText, rawEvent)) return;
-    const isFirstUserMessageForSession = !hasSessionMemoryFile(sessionID);
+    const isFirstUserMessageForSession = !hadSessionMemoryBeforeUser;
 
     if (isFirstUserMessageForSession) {
       appendAutoEvent({
@@ -5852,6 +6034,10 @@ export const MemorySystemPlugin = ({ client }) => {
         const globalText = buildGlobalPrefsContextText();
         if (globalText) await injectMemoryText(sessionID, globalText, 'global-prefs');
       }
+
+      // Inject project-level path anchors (separate from global prefs)
+      const projectAnchorsText = buildProjectPathAnchorsText();
+      if (projectAnchorsText) await injectMemoryText(sessionID, projectAnchorsText, 'project-path-anchors');
     }
 
     const currentReadHint = resolveGlobalReadHintPayload(persistedUserText);
@@ -5882,15 +6068,34 @@ export const MemorySystemPlugin = ({ client }) => {
     else sessionUserMessageCounters.delete(sessionID);
 
     const refreshEvery = getCurrentSessionRefreshEvery();
+    const suppressCurrentSummaryNow = shouldSuppressCurrentSummaryInjection(sessionID);
+    const shouldInjectPeriodicCurrentSummary =
+      AUTO_CURRENT_SESSION_SUMMARY_ENABLED
+      && currentCount >= refreshEvery
+      && currentCount % refreshEvery === 0
+      && !suppressCurrentSummaryNow;
+    const shouldInjectResumedCurrentSummary =
+      AUTO_CURRENT_SESSION_SUMMARY_ENABLED
+      && !isFirstUserMessageForSession
+      && !shouldInjectPeriodicCurrentSummary
+      && !suppressCurrentSummaryNow
+      && shouldInjectResumeCurrentSummary(sessionID, previousSessionData);
     if (
-      AUTO_CURRENT_SESSION_SUMMARY_ENABLED &&
-      currentCount >= refreshEvery &&
-      currentCount % refreshEvery === 0 &&
-      !shouldSuppressCurrentSummaryInjection(sessionID)
+      shouldInjectPeriodicCurrentSummary
+      || shouldInjectResumedCurrentSummary
     ) {
       const currentSummary = buildCurrentSessionSummaryText(sessionID);
       if (currentSummary) {
-        await injectMemoryText(sessionID, currentSummary, 'current-session-refresh');
+        const injectReason = shouldInjectResumedCurrentSummary ? 'current-session-resume' : 'current-session-refresh';
+        const injected = await injectMemoryText(sessionID, currentSummary, injectReason);
+        if (injected && shouldInjectResumedCurrentSummary) {
+          const mem = loadSessionMemory(sessionID);
+          mem.inject = mem.inject || {};
+          mem.inject.lastResumeSummaryAt = new Date().toISOString();
+          mem.inject.lastResumeSummaryUserCount = Number(mem?.stats?.userMessages || currentCount || 0);
+          persistSessionMemory(mem);
+          writeDashboardFiles();
+        }
       }
     }
 
@@ -5899,22 +6104,48 @@ export const MemorySystemPlugin = ({ client }) => {
     }
   }
 
+  function cleanupSessionRuntimeState(sessionID) {
+    sessionUserMessageCounters.delete(sessionID);
+    sessionLatestUserTextByID.delete(sessionID);
+    sessionObservedUserTextByID.delete(sessionID);
+    sessionObservedUserAtByID.delete(sessionID);
+    sessionAutoGlobalWriteState.delete(sessionID);
+    rememberGlobalEmptyCallState.delete(sessionID);
+    memoryEmptyCallState.delete(sessionID);
+    contextEmptyCallState.delete(`${sessionID}:context-empty`);
+    if (lastActiveSessionID === sessionID) lastActiveSessionID = '';
+    lastObservedUserText = '';
+    lastObservedUserAt = 0;
+    sessionRecallState.delete(sessionID);
+    sessionTitleByID.delete(sessionID);
+    sessionUserDedupeState.delete(sessionID);
+    sessionStrictHitAt.delete(sessionID);
+    sessionPendingVisibleNoticeMirrors.delete(sessionID);
+    pretrimWarmupTasks.delete(sessionID);
+    sessionWriteLocks.delete(sessionID);
+  }
+
+  /**
+   * Per-session write lock. All session file mutations should go through this
+   * to prevent concurrent read-modify-write races.
+   */
+  function withSessionLock(sessionID, fn) {
+    const sid = normalizeText(String(sessionID || ''));
+    if (!sid) return Promise.resolve();
+    const prev = sessionWriteLocks.get(sid) || Promise.resolve();
+    const task = prev.catch(() => {}).then(() => fn());
+    sessionWriteLocks.set(sid, task);
+    return task.finally(() => {
+      if (sessionWriteLocks.get(sid) === task) {
+        sessionWriteLocks.delete(sid);
+      }
+    });
+  }
+
   async function processUserMessageEvent(sessionID, text, rawEvent) {
     const sid = normalizeText(String(sessionID || ''));
     if (!sid) return;
-    const previousTask = sessionUserEventTasks.get(sid) || Promise.resolve();
-    let currentTask = null;
-    currentTask = previousTask
-      .catch(() => {})
-      .then(() => processUserMessageEventSerial(sid, text, rawEvent));
-    sessionUserEventTasks.set(sid, currentTask);
-    try {
-      await currentTask;
-    } finally {
-      if (sessionUserEventTasks.get(sid) === currentTask) {
-        sessionUserEventTasks.delete(sid);
-      }
-    }
+    return withSessionLock(sid, () => processUserMessageEventSerial(sid, text, rawEvent));
   }
 
   function scoreSessionForQuery(sessionData, queryTokens) {
@@ -6277,7 +6508,7 @@ export const MemorySystemPlugin = ({ client }) => {
   function shouldMirrorVisibleNoticeInSession(key = '') {
     return getVisibleNoticeCurrentSummaryMirrorEnabled()
       && isWebServerProcess()
-      && normalizeText(String(key || '')) === 'inject:current-session-refresh';
+      && ['inject:current-session-refresh', 'inject:current-session-resume'].includes(normalizeText(String(key || '')));
   }
 
   function queuePendingVisibleNoticeMirror(sessionID = '', text = '', key = '', baseChannel = 'toast') {
@@ -6840,7 +7071,7 @@ export const MemorySystemPlugin = ({ client }) => {
       if (!delivered && client?.session && typeof client.session.update === 'function') {
         try {
           await client.session.update(sessionID, {
-            noReply: false,
+            noReply: true,
             parts: [makeVisibleNoticeTextPart(text)]
           });
           recordVisibleNoticeDelivery(sessionID, key, 'update', text);
@@ -6850,7 +7081,7 @@ export const MemorySystemPlugin = ({ client }) => {
             await client.session.update({
               path: { id: sessionID },
               body: {
-                noReply: false,
+                noReply: true,
                 parts: [makeVisibleNoticeTextPart(text)]
               }
             });
@@ -6898,7 +7129,7 @@ export const MemorySystemPlugin = ({ client }) => {
         stackRiskAt > 0 &&
         (now - stackRiskAt) < AUTO_INJECT_RISK_GUARD_WINDOW_MS
       );
-      if (riskActive && reason === 'current-session-refresh') {
+      if (riskActive && (reason === 'current-session-refresh' || reason === 'current-session-resume')) {
         mem.inject.lastSkippedAt = new Date().toISOString();
         mem.inject.lastSkipReason = 'context_stack_risk_guard';
         mem.inject.lastStatus = 'skipped';
@@ -6912,6 +7143,7 @@ export const MemorySystemPlugin = ({ client }) => {
           'global-prefs': '已注入全局偏好记忆',
           'current-global-read': '已注入当前请求读取答案',
           'current-session-refresh': '已注入当前会话摘要记忆',
+          'current-session-resume': '已恢复当前会话摘要记忆',
           'trigger-recall': '已注入跨会话召回记忆',
           'memory-docs': '已注入记忆系统文档',
           'memory-inject': '已注入记忆'
@@ -6920,7 +7152,7 @@ export const MemorySystemPlugin = ({ client }) => {
       })();
       const noteInject = () => {
         if (reason === 'global-prefs') mem.inject.globalPrefsCount = Number(mem.inject.globalPrefsCount || 0) + 1;
-        if (reason === 'current-session-refresh') mem.inject.currentSummaryCount = Number(mem.inject.currentSummaryCount || 0) + 1;
+        if (reason === 'current-session-refresh' || reason === 'current-session-resume') mem.inject.currentSummaryCount = Number(mem.inject.currentSummaryCount || 0) + 1;
         if (reason === 'trigger-recall') mem.inject.triggerRecallCount = Number(mem.inject.triggerRecallCount || 0) + 1;
         if (reason === 'memory-docs') mem.inject.memoryDocsCount = Number(mem.inject.memoryDocsCount || 0) + 1;
         mem.inject.lastAt = new Date().toISOString();
@@ -7021,6 +7253,15 @@ export const MemorySystemPlugin = ({ client }) => {
       const cleanKey = normalizeText(String(key || ''));
       const cleanValue = normalizeText(String(value ?? ''));
       if (!cleanKey || !cleanValue || seen.has(cleanKey)) return;
+      // Skip 'note' entries that are purely path anchors (now stored per-project)
+      if (cleanKey === 'note') {
+        const noteLines = normalizeGlobalNoteEntries(cleanValue);
+        const nonPathLines = noteLines.filter((line) => !isPathAnchorContent(line));
+        if (!nonPathLines.length) return; // all entries were path anchors
+        seen.add(cleanKey);
+        orderedEntries.push([cleanKey, nonPathLines.map((l, i) => `${i + 1}. ${l}`).join('\n')]);
+        return;
+      }
       seen.add(cleanKey);
       orderedEntries.push([cleanKey, value]);
     };
@@ -7279,6 +7520,7 @@ export const MemorySystemPlugin = ({ client }) => {
         createdAt: sess.createdAt || null,
         updatedAt: sess.updatedAt || null,
         stats: sess.stats || emptyStats(),
+        totalEventsCount: Array.isArray(sess.recentEvents) ? sess.recentEvents.length : 0,
         recentEvents: Array.isArray(sess.recentEvents)
           ? sess.recentEvents.slice(-DASHBOARD_MAX_EVENTS_PER_SESSION_VIEW)
           : [],
@@ -7296,7 +7538,7 @@ export const MemorySystemPlugin = ({ client }) => {
             const bid = Number(tr?.blockId || 0);
             if (bid > 0 && !traceByBlockId.has(bid)) traceByBlockId.set(bid, tr);
           }
-          const recent = arr.slice(-5).map((b) => ({
+          const recent = arr.slice(-10).map((b) => ({
             blockId: Number(b?.blockId || 0),
             createdAt: b?.createdAt || null,
             source: b?.source || '',
@@ -7856,7 +8098,7 @@ export const MemorySystemPlugin = ({ client }) => {
       '    async function batchDeleteSessions(projectName){ const ids=[...__selectedSessionIDs].filter(Boolean); if(!ids.length){ alert(t("batchSelectFirst")); return; } if(!window.confirm(t("batchDeleteConfirm").replace("{n}", String(ids.length)))) return; try{ await apiPost("/api/memory/sessions/delete",{projectName,sessionIDs:ids,confirm:true,source:"dashboard"}); ids.forEach((id)=>__selectedSessionIDs.delete(id)); updateBatchDeleteBtn(); await refreshDashboardData(); }catch(e){ alert("Batch delete failed: "+e.message);} }',
       '    function applyLang(){ $("titleMain").textContent=t("title"); setConnectionBadge(($("connBadge")&&$("connBadge").classList.contains("bad"))?"bad":(($("connBadge")&&$("connBadge").classList.contains("ok"))?"ok":"pending")); $("langLabel").textContent=t("lang"); const mpk=$("mProjectsK"); if(mpk) mpk.textContent=t("metricProjects"); const msk=$("mSessionsK"); if(msk) msk.textContent=t("metricSessions"); const mek=$("mEventsK"); if(mek) mek.textContent=t("metricEvents"); if(tabSessionsBtn) tabSessionsBtn.textContent=t("tabSessions"); if(tabTemplateBtn) tabTemplateBtn.textContent=t("tabTemplate"); if(tabLlmBtn) tabLlmBtn.textContent=t("tabLlm"); if(tabSettingsBtn) tabSettingsBtn.textContent=t("tabSettings"); if(tabTrashBtn) tabTrashBtn.textContent=t("tabTrash"); $("globalTitle").textContent=t("global"); $("tokenHint").textContent=t("token"); const gf=$("globalPrefsFoldSummary"); if(gf) gf.textContent=t("globalPrefsFoldSummary"); if(!__activeProjectName) projectTitle.textContent=t("noProjectSelected"); const settingsTitle=$("settingsTitle"); if(settingsTitle) settingsTitle.textContent=t("settingsTitle"); const llmTitle=$("llmTitle"); if(llmTitle) llmTitle.textContent=t("llmTitle"); const llmHint=$("llmHint"); if(llmHint) llmHint.textContent=t("llmHint"); const settingsHint=$("settingsHint"); if(settingsHint) settingsHint.textContent=t("settingsHint"); const templateTitle=$("templateTitle"); if(templateTitle) templateTitle.textContent=t("templateTitle"); const templateHint=$("templateHint"); if(templateHint) templateHint.textContent=t("templateHint"); const templateFormatHint=$("templateFormatHint"); if(templateFormatHint) templateFormatHint.textContent=t("templateFormatHint"); const templateSaveBtnEl=$("templateSaveBtn"); if(templateSaveBtnEl) templateSaveBtnEl.textContent=t("templateSave"); const templateUseBtnEl=$("templateUseBtn"); if(templateUseBtnEl) templateUseBtnEl.textContent=t("templateUse"); const templateNameLabel=$("templateNameLabel"); if(templateNameLabel) templateNameLabel.textContent=t("templateNameLabel"); const templateSelectLabel=$("templateSelectLabel"); if(templateSelectLabel) templateSelectLabel.textContent=t("templateSelectLabel"); const templateResetBtnEl=$("templateResetBtn"); if(templateResetBtnEl) templateResetBtnEl.textContent=t("templateReset"); const templatePreviewBtnEl=$("templatePreviewBtn"); if(templatePreviewBtnEl) templatePreviewBtnEl.textContent=t("templatePreviewBtn"); const settingsSaveBtnEl=$("settingsSaveBtn"); if(settingsSaveBtnEl) settingsSaveBtnEl.textContent=t("settingsSave"); const llmSaveBtnEl=$("llmSaveBtn"); if(llmSaveBtnEl) llmSaveBtnEl.textContent=t("llmSave"); const llmFetchBtnEl=$("llmFetchModelsBtn"); if(llmFetchBtnEl) llmFetchBtnEl.textContent=t("llmFetchModels"); const llmValidateBtnEl=$("llmValidateBtn"); if(llmValidateBtnEl) llmValidateBtnEl.textContent=t("llmValidate"); const sessionsTitle=$("sessionsTitle"); if(sessionsTitle) sessionsTitle.textContent=t("sessions"); const selectAllBtn=$("batchSelectAllBtn"); if(selectAllBtn) selectAllBtn.textContent=t("selectAll"); const selectNoneBtn=$("batchSelectNoneBtn"); if(selectNoneBtn) selectNoneBtn.textContent=t("selectNone"); const auditHint=$("systemAuditHint"); if(auditHint) auditHint.textContent=t("systemAuditHint"); const trashTitle=$("trashTitle"); if(trashTitle) trashTitle.textContent=t("trashTitle"); const retentionLabel=$("trashRetentionLabel"); if(retentionLabel) retentionLabel.textContent=t("trashRetentionLabel"); const trashAllBtn=$("trashSelectAllBtn"); if(trashAllBtn) trashAllBtn.textContent=t("selectAll"); const trashNoneBtn=$("trashSelectNoneBtn"); if(trashNoneBtn) trashNoneBtn.textContent=t("selectNone"); const c=$("trashCleanupBtn"); if(c) c.textContent=t("trashCleanup"); const pLabel=$("pretrimProfileLabel"); if(pLabel) pLabel.textContent=t("pretrimProfileLabel"); if(pretrimProfileSel&&pretrimProfileSel.options&&pretrimProfileSel.options.length>=3){ pretrimProfileSel.options[0].text=t("pretrimConservative"); pretrimProfileSel.options[1].text=t("pretrimBalanced"); pretrimProfileSel.options[2].text=t("pretrimAggressive"); } const pSave=$("savePretrimProfileBtn"); if(pSave) pSave.textContent=t("pretrimSave"); const cleanBtn=$("cleanGlobalNoteBtn"); if(cleanBtn) cleanBtn.textContent=t("cleanGlobalNote"); updateBatchDeleteBtn(); updateTrashDeleteBtn(); renderSettings(); renderTemplateSettings(); renderLlmSettings(); }',
       '    function renderGlobalPrefs(){ const prefs=(DATA&&DATA.global&&DATA.global.preferences)||{}; const entries=Object.entries(prefs); updatePretrimProfileUi(); if(!entries.length){globalPrefs.textContent=t("noGlobalPrefs"); return;} globalPrefs.innerHTML=""; entries.forEach(([k,v])=>{ const div=document.createElement("div"); div.className="pref"; div.textContent=k+": "+String(v); globalPrefs.appendChild(div); }); }',
-      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; const _title=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:(s.sessionID||""); sid.textContent=_title+"  id:"+(s.sessionID||""); sid.style.whiteSpace="normal"; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const stt=(s.budget&&s.budget.lastEstimatedSystemTokens)||0; const pht=(s.budget&&s.budget.lastEstimatedPluginHintTokens)||0; const tt=(s.budget&&s.budget.lastEstimatedTotalTokens)||((bt||0)+(stt||0)); const pb=(s.budget&&s.budget.sendPretrimBudget)||0; const pt=(s.budget&&s.budget.sendPretrimTarget)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const sp=s.sendPretrim||{}; const w=(sp&&sp.warmup)||{}; const lastTrace=(sp.traces&&sp.traces.length)?sp.traces[sp.traces.length-1]:null; const summaryMode=lastTrace?(lastTrace.distillUsed ?((lastTrace.warmupCacheHit||String(lastTrace.distillSource||"").includes("warmup"))?t("llmSummaryCache"):(String(lastTrace.distillProvider||"").includes("session-inline")?t("llmSummaryInline"):t("llmSummaryIndependent"))):t("llmSummaryMechanical")):"-"; const spLast=(sp.lastSavedTokens||0)>0?(" · "+t("sessionStatPretrimLast")+":"+(sp.lastBeforeTokens||0)+"→"+(sp.lastAfterTokens||0)+" (save~"+(sp.lastSavedTokens||0)+")"):""; const strictNow=(sp.traces&&sp.traces.length&&sp.traces[sp.traces.length-1].strictApplied)?(" · strict:ON("+((sp.traces[sp.traces.length-1].strictReplacedMessages)||0)+")"):""; const warmupStats=" · "+t("sessionStatWarmup")+":h"+(w.hitCount||0)+"/m"+(w.missCount||0)+"/s"+((w.skipBudgetCount||0)+(w.skipCooldownCount||0))+"/f"+(w.failCount||0); const warmupBind=" · "+t("sessionStatBound")+":"+((w.lastUserMessageID&&String(w.lastUserMessageID).slice(-16))||"-")+" · "+t("sessionStatWarmupStatus")+":"+((w.status&&String(w.status).slice(0,40))||"-"); const risk=(s.alerts&&s.alerts.contextStackRisk)?(" · "+t("sessionStatRiskStack")):""; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":t(\"injectReasonGlobal\"),\"current-session-refresh\":t(\"injectReasonCurrent\"),\"trigger-recall\":t(\"injectReasonRecall\"),\"memory-docs\":t(\"injectReasonDocs\"),\"memory-inject\":t(\"injectReasonManual\")}; const reasonLabel=reasonMap[reasonRaw]||t(\"none\"); const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():t(\"none\"); st.textContent=\"u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · \"+t(\"sessionStatInject\")+\":g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · \"+t(\"sessionStatLastInject\")+\":\"+reasonLabel+\" @ \"+injectAt+\" · \"+t(\"sessionStatPrune\")+\":\"+t(\"autoLabel\")+(pa.autoRuns||0)+\"/\"+t(\"manualLabel\")+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · \"+t(\"sessionStatPretrim\")+\":\"+t(\"autoLabel\")+(sp.autoRuns||0)+\" \"+t(\"sessionStatSaved\")+\"~\"+(sp.savedTokensTotal||0)+\" · \"+t(\"tabLlm\")+\":\"+summaryMode+spLast+strictNow+risk+\" · \"+t(\"sessionStatBlocks\")+\":\"+(((s.summaryBlocks&&s.summaryBlocks.count)||0))+\" · \"+t(\"sessionStatBudget\")+\":\"+pb+\" · \"+t(\"sessionStatTarget\")+\":\"+pt+\" · \"+t(\"sessionStatBody")+bt+" · "+t("sessionStatSystem")+stt+" · "+t("sessionStatPluginHint")+pht+" · "+t("sessionStatTotal")+tt+" "+t("tokensLabel")+warmupStats+warmupBind; const metaWrap=document.createElement("div"); metaWrap.style.display="flex"; metaWrap.style.flexDirection="column"; metaWrap.style.alignItems="flex-start"; metaWrap.style.gap="4px"; metaWrap.appendChild(sid); metaWrap.appendChild(st); head.appendChild(sel); head.appendChild(metaWrap); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noEvents"); events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } if(s.summaryBlocks&&Array.isArray(s.summaryBlocks.recent)&&s.summaryBlocks.recent.length){ const blk=document.createElement("div"); blk.className="ev"; const bm=document.createElement("div"); bm.className="meta"; bm.textContent=t("compressedBlocks")+" (latest "+s.summaryBlocks.recent.length+")"; const bt=document.createElement("div"); bt.className="txt"; bt.textContent=s.summaryBlocks.recent.map((b)=>`b${b.blockId} | ${b.source||"pretrim"} | m:${b.consumedMessages||0} | ${b.summaryPreview||""}`).join("\\n"); blk.appendChild(bm); blk.appendChild(bt); events.appendChild(blk); } if(s.sendPretrim&&s.sendPretrim.warmup&&Array.isArray(s.sendPretrim.warmup.logs)&&s.sendPretrim.warmup.logs.length){ const wl=document.createElement("div"); wl.className="ev"; const wm=document.createElement("div"); wm.className="meta"; wm.textContent=t("sessionWarmupLogs"); const wt=document.createElement("div"); wt.className="txt"; wt.textContent=s.sendPretrim.warmup.logs.slice(-8).map((x)=>`${x.ts?new Date(x.ts).toLocaleString():"-"} | ${x.level||"info"} | ${x.message||""}`).join("\\n"); wl.appendChild(wm); wl.appendChild(wt); events.appendChild(wl); } if(s.sendPretrim&&Array.isArray(s.sendPretrim.traces)&&s.sendPretrim.traces.length){ const tr=document.createElement("div"); tr.className="ev"; const m=document.createElement("div"); m.className="meta"; m.textContent=t("pretrimTraces"); const traceTxt=document.createElement("div"); traceTxt.className="txt"; const rows=s.sendPretrim.traces.slice(-8).map((x)=>{ const ts=x.ts?new Date(x.ts).toLocaleString():"-"; const strict=x.strictApplied?(` | strict:${x.strictReplacedMessages||0}`):\"\"; const llmMode=x.distillUsed?((String(x.distillProvider||\"\").includes(\"session-inline\"))?(` | ${t(\"llmSummaryInline\")}:${x.distillModel||\"current-session\"}`):(` | ${t(\"llmSummaryIndependent\")}:${x.distillProvider||\"\"}/${x.distillModel||\"\"}`)):((x.distillStatus&&x.distillStatus.includes(\"fail\"))?(` | ${t(\"llmSummaryFailed\")}:${x.distillStatus}`):(` | ${t(\"llmSummaryMechanical\")}`)); const strat=((x.strategyDedup||0)||(x.strategySupersedeWrites||0)||(x.strategyPurgedErrors||0)||(x.strategyPhaseTrim||0))?(` | strat:d${x.strategyDedup||0}/s${x.strategySupersedeWrites||0}/p${x.strategyPurgedErrors||0}/ph${x.strategyPhaseTrim||0}`):\"\"; const block=(x.blockId?(` | block:b${x.blockId}`):\"\"); const anchor=x.anchorReplaceApplied?(` | anchor:${x.anchorReplaceMessages||0}/b${x.anchorReplaceBlocks||0}`):\"\"; const comp=(()=>{ const b=x.compositionBefore||{}; const a=x.compositionAfter||{}; const bt=(b.total||0), at=(a.total||0); if(!bt||!at) return \"\"; const pct=(v,t)=>Math.round((100*v)/Math.max(1,t)); return ` | comp S:${pct(b.system||0,bt)}→${pct(a.system||0,at)} U:${pct(b.user||0,bt)}→${pct(a.user||0,at)} T:${pct(b.tool||0,bt)}→${pct(a.tool||0,at)}`; })(); return `${ts} | ${x.beforeTokens||0}→${x.afterTokens||0} | total:${x.totalBeforeTokens||((x.beforeTokens||0)+(x.systemTokensBefore||0))}→${x.totalAfterTokens||((x.afterTokens||0)+(x.systemTokensAfter||0))} | system~${x.systemTokensAfter||0} | plugin-hint~${x.pluginHintTokensAfter||0} | save~${x.savedTokens||0} | rw:${x.rewrittenMessages||0}/${x.rewrittenParts||0} | ex:${x.extractedMessages||0}${strict}${llmMode}${strat}${block}${anchor}${comp} | ${x.reason||""}`; }); traceTxt.textContent=rows.join("\\n"); tr.appendChild(m); tr.appendChild(traceTxt); events.appendChild(tr); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
+      '    function renderSessions(project){ if(!project||!project.sessions||!project.sessions.length){ sessionList.className="empty"; sessionList.textContent=t("nos"); updateBatchDeleteBtn(); return;} sessionList.className=""; sessionList.innerHTML=""; project.sessions.forEach((s)=>{ const wrap=document.createElement("div"); wrap.className="session"; const head=document.createElement("div"); head.className="session-h"; const sel=document.createElement("input"); sel.type="checkbox"; sel.style.marginRight="8px"; sel.checked=__selectedSessionIDs.has(s.sessionID||""); sel.addEventListener("click",(e)=>e.stopPropagation()); sel.addEventListener("change",(e)=>{ if(e.target.checked) __selectedSessionIDs.add(s.sessionID||""); else __selectedSessionIDs.delete(s.sessionID||""); updateBatchDeleteBtn(); }); const sid=document.createElement("div"); sid.className="session-id"; const _title=(s.sessionTitle&&s.sessionTitle.trim())?s.sessionTitle:(s.sessionID||""); sid.textContent=_title+"  id:"+(s.sessionID||""); sid.style.whiteSpace="normal"; const st=document.createElement("div"); st.className="stats"; const bt=(s.budget&&s.budget.lastEstimatedBodyTokens)||0; const stt=(s.budget&&s.budget.lastEstimatedSystemTokens)||0; const pht=(s.budget&&s.budget.lastEstimatedPluginHintTokens)||0; const tt=(s.budget&&s.budget.lastEstimatedTotalTokens)||((bt||0)+(stt||0)); const pb=(s.budget&&s.budget.sendPretrimBudget)||0; const pt=(s.budget&&s.budget.sendPretrimTarget)||0; const ig=(s.inject&&s.inject.globalPrefsCount)||0; const ic=(s.inject&&s.inject.currentSummaryCount)||0; const ir=(s.inject&&s.inject.triggerRecallCount)||0; const pa=s.pruneAudit||{}; const sp=s.sendPretrim||{}; const w=(sp&&sp.warmup)||{}; const lastTrace=(sp.traces&&sp.traces.length)?sp.traces[sp.traces.length-1]:null; const summaryMode=lastTrace?(lastTrace.distillUsed ?((lastTrace.warmupCacheHit||String(lastTrace.distillSource||"").includes("warmup"))?t("llmSummaryCache"):(String(lastTrace.distillProvider||"").includes("session-inline")?t("llmSummaryInline"):t("llmSummaryIndependent"))):t("llmSummaryMechanical")):"-"; const spLast=(sp.lastSavedTokens||0)>0?(" · "+t("sessionStatPretrimLast")+":"+(sp.lastBeforeTokens||0)+"→"+(sp.lastAfterTokens||0)+" (save~"+(sp.lastSavedTokens||0)+")"):""; const strictNow=(sp.traces&&sp.traces.length&&sp.traces[sp.traces.length-1].strictApplied)?(" · strict:ON("+((sp.traces[sp.traces.length-1].strictReplacedMessages)||0)+")"):""; const warmupStats=" · "+t("sessionStatWarmup")+":h"+(w.hitCount||0)+"/m"+(w.missCount||0)+"/s"+((w.skipBudgetCount||0)+(w.skipCooldownCount||0))+"/f"+(w.failCount||0); const warmupBind=" · "+t("sessionStatBound")+":"+((w.lastUserMessageID&&String(w.lastUserMessageID).slice(-16))||"-")+" · "+t("sessionStatWarmupStatus")+":"+((w.status&&String(w.status).slice(0,40))||"-"); const risk=(s.alerts&&s.alerts.contextStackRisk)?(" · "+t("sessionStatRiskStack")):""; const reasonRaw=(s.inject&&s.inject.lastReason)||""; const reasonMap={\"global-prefs\":t(\"injectReasonGlobal\"),\"current-session-refresh\":t(\"injectReasonCurrent\"),\"current-session-resume\":t(\"injectReasonCurrent\"),\"trigger-recall\":t(\"injectReasonRecall\"),\"memory-docs\":t(\"injectReasonDocs\"),\"memory-inject\":t(\"injectReasonManual\")}; const reasonLabel=reasonMap[reasonRaw]||t(\"none\"); const injectAt=(s.inject&&s.inject.lastAt)?new Date(s.inject.lastAt).toLocaleString():t(\"none\"); st.textContent=\"u:\"+(s.stats.userMessages||0)+\" · a:\"+(s.stats.assistantMessages||0)+\" · t:\"+(s.stats.toolResults||0)+\" · r:\"+((s.recall&&s.recall.count)||0)+\" · \"+t(\"sessionStatInject\")+\":g\"+ig+\"/c\"+ic+\"/x\"+ir+\" · \"+t(\"sessionStatLastInject\")+\":\"+reasonLabel+\" @ \"+injectAt+\" · \"+t(\"sessionStatPrune\")+\":\"+t(\"autoLabel\")+(pa.autoRuns||0)+\"/\"+t(\"manualLabel\")+(pa.manualRuns||0)+\" d\"+(pa.discardRemovedTotal||0)+\" e\"+(pa.extractMovedTotal||0)+\" · \"+t(\"sessionStatPretrim\")+\":\"+t(\"autoLabel\")+(sp.autoRuns||0)+\" \"+t(\"sessionStatSaved\")+\"~\"+(sp.savedTokensTotal||0)+\" · \"+t(\"tabLlm\")+\":\"+summaryMode+spLast+strictNow+risk+\" · \"+t(\"sessionStatBlocks\")+\":\"+(((s.summaryBlocks&&s.summaryBlocks.count)||0))+\" · \"+t(\"sessionStatBudget\")+\":\"+pb+\" · \"+t(\"sessionStatTarget\")+\":\"+pt+\" · \"+t(\"sessionStatBody")+bt+" · "+t("sessionStatSystem")+stt+" · "+t("sessionStatPluginHint")+pht+" · "+t("sessionStatTotal")+tt+" "+t("tokensLabel")+warmupStats+warmupBind; const metaWrap=document.createElement("div"); metaWrap.style.display="flex"; metaWrap.style.flexDirection="column"; metaWrap.style.alignItems="flex-start"; metaWrap.style.gap="4px"; metaWrap.appendChild(sid); metaWrap.appendChild(st); head.appendChild(sel); head.appendChild(metaWrap); const events=document.createElement("div"); events.className="events"; const sorted=(s.recentEvents||[]).slice().sort((a,b)=>(Date.parse(a.ts||0)||0)-(Date.parse(b.ts||0)||0)); if(!sorted.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noEvents"); events.appendChild(empty); } else { sorted.forEach((ev)=>{ const row=document.createElement("div"); row.className="ev "+(ev.kind||""); const meta=document.createElement("div"); meta.className="meta"; meta.textContent=(ev.kind||"event")+(ev.tool?" ["+ev.tool+"]":"")+" · "+(ev.ts?new Date(ev.ts).toLocaleString():""); const txt=document.createElement("div"); txt.className="txt"; txt.textContent=ev.summary||""; row.appendChild(meta); row.appendChild(txt); events.appendChild(row); }); } const actions=document.createElement("div"); actions.style.marginTop="8px"; const eb=document.createElement("button"); eb.textContent=t("edit"); eb.onclick=()=>{ const fallback=(s.summary&&s.summary.compressedText)||((s.recentEvents||[]).slice(-8).map((ev)=>"- "+(ev.kind||"event")+": "+(ev.summary||"")).join("\\n")); editSummary(project.name,s.sessionID,fallback); }; const db=document.createElement("button"); db.textContent=t("del"); db.style.marginLeft="8px"; db.onclick=()=>deleteSession(project.name,s.sessionID); actions.appendChild(eb); actions.appendChild(db); events.appendChild(actions); if(s.summary&&s.summary.compressedText){ const summary=document.createElement("div"); summary.className="ev"; const meta=document.createElement("div"); meta.className="meta"; const reason=(s.budget&&s.budget.lastCompactionReason)?(" · "+s.budget.lastCompactionReason):""; const paInfo=s.pruneAudit?(` · prune(last:${s.pruneAudit.lastSource||\"-\"}, d=${s.pruneAudit.lastDiscardRemoved||0}, e=${s.pruneAudit.lastExtractMoved||0})`):\"\"; meta.textContent=\"compressed summary\"+reason+paInfo; const txt=document.createElement("div"); txt.className="txt"; txt.textContent=s.summary.compressedText; summary.appendChild(meta); summary.appendChild(txt); events.appendChild(summary); } if(s.summaryBlocks&&Array.isArray(s.summaryBlocks.recent)&&s.summaryBlocks.recent.length){ const blk=document.createElement("div"); blk.className="ev"; const bm=document.createElement("div"); bm.className="meta"; bm.textContent=t("compressedBlocks")+" (latest "+s.summaryBlocks.recent.length+")"; const bt=document.createElement("div"); bt.className="txt"; bt.textContent=s.summaryBlocks.recent.map((b)=>`b${b.blockId} | ${b.source||"pretrim"} | m:${b.consumedMessages||0} | ${b.summaryPreview||""}`).join("\\n"); blk.appendChild(bm); blk.appendChild(bt); events.appendChild(blk); } if(s.sendPretrim&&s.sendPretrim.warmup&&Array.isArray(s.sendPretrim.warmup.logs)&&s.sendPretrim.warmup.logs.length){ const wl=document.createElement("div"); wl.className="ev"; const wm=document.createElement("div"); wm.className="meta"; wm.textContent=t("sessionWarmupLogs"); const wt=document.createElement("div"); wt.className="txt"; wt.textContent=s.sendPretrim.warmup.logs.slice(-8).map((x)=>`${x.ts?new Date(x.ts).toLocaleString():"-"} | ${x.level||"info"} | ${x.message||""}`).join("\\n"); wl.appendChild(wm); wl.appendChild(wt); events.appendChild(wl); } if(s.sendPretrim&&Array.isArray(s.sendPretrim.traces)&&s.sendPretrim.traces.length){ const tr=document.createElement("div"); tr.className="ev"; const m=document.createElement("div"); m.className="meta"; m.textContent=t("pretrimTraces"); const traceTxt=document.createElement("div"); traceTxt.className="txt"; const rows=s.sendPretrim.traces.slice(-8).map((x)=>{ const ts=x.ts?new Date(x.ts).toLocaleString():"-"; const strict=x.strictApplied?(` | strict:${x.strictReplacedMessages||0}`):\"\"; const llmMode=x.distillUsed?((String(x.distillProvider||\"\").includes(\"session-inline\"))?(` | ${t(\"llmSummaryInline\")}:${x.distillModel||\"current-session\"}`):(` | ${t(\"llmSummaryIndependent\")}:${x.distillProvider||\"\"}/${x.distillModel||\"\"}`)):((x.distillStatus&&x.distillStatus.includes(\"fail\"))?(` | ${t(\"llmSummaryFailed\")}:${x.distillStatus}`):(` | ${t(\"llmSummaryMechanical\")}`)); const strat=((x.strategyDedup||0)||(x.strategySupersedeWrites||0)||(x.strategyPurgedErrors||0)||(x.strategyPhaseTrim||0))?(` | strat:d${x.strategyDedup||0}/s${x.strategySupersedeWrites||0}/p${x.strategyPurgedErrors||0}/ph${x.strategyPhaseTrim||0}`):\"\"; const block=(x.blockId?(` | block:b${x.blockId}`):\"\"); const anchor=x.anchorReplaceApplied?(` | anchor:${x.anchorReplaceMessages||0}/b${x.anchorReplaceBlocks||0}`):\"\"; const comp=(()=>{ const b=x.compositionBefore||{}; const a=x.compositionAfter||{}; const bt=(b.total||0), at=(a.total||0); if(!bt||!at) return \"\"; const pct=(v,t)=>Math.round((100*v)/Math.max(1,t)); return ` | comp S:${pct(b.system||0,bt)}→${pct(a.system||0,at)} U:${pct(b.user||0,bt)}→${pct(a.user||0,at)} T:${pct(b.tool||0,bt)}→${pct(a.tool||0,at)}`; })(); return `${ts} | ${x.beforeTokens||0}→${x.afterTokens||0} | total:${x.totalBeforeTokens||((x.beforeTokens||0)+(x.systemTokensBefore||0))}→${x.totalAfterTokens||((x.afterTokens||0)+(x.systemTokensAfter||0))} | system~${x.systemTokensAfter||0} | plugin-hint~${x.pluginHintTokensAfter||0} | save~${x.savedTokens||0} | rw:${x.rewrittenMessages||0}/${x.rewrittenParts||0} | ex:${x.extractedMessages||0}${strict}${llmMode}${strat}${block}${anchor}${comp} | ${x.reason||""}`; }); traceTxt.textContent=rows.join("\\n"); tr.appendChild(m); tr.appendChild(traceTxt); events.appendChild(tr); } head.addEventListener("click", ()=>{ events.classList.toggle("open"); }); wrap.appendChild(head); wrap.appendChild(events); sessionList.appendChild(wrap); }); updateBatchDeleteBtn(); }',
       '    function setActiveProject(project,elem){ document.querySelectorAll(".project-item").forEach((e)=>e.classList.remove("active")); if(elem) elem.classList.add("active"); __activeProjectName=project.name||""; __selectedSessionIDs.clear(); projectTitle.textContent=project.name; const ts=(project.techStack&&project.techStack.length)?project.techStack.join(", "):"N/A"; projectMeta.textContent=t("projectMetaFmt").replace("{sessions}",String(project.sessionCount||0)).replace("{events}",String(project.totalEvents||0)).replace("{tech}",ts); const b=$("batchDeleteBtn"); if(b) b.onclick=()=>batchDeleteSessions(project.name); renderSessions(project); updateBatchDeleteBtn(); }',
       '    function renderProjects(){ projectList.innerHTML=""; if(!DATA.projects.length){ const empty=document.createElement("div"); empty.className="empty"; empty.textContent=t("noproj"); projectList.appendChild(empty); projectTitle.textContent=t("noProjectSelected"); projectMeta.textContent=""; const b=$("batchDeleteBtn"); if(b) b.onclick=null; renderSessions(null); return;} DATA.projects.forEach((p,i)=>{ const item=document.createElement("div"); item.className="project-item"; const name=document.createElement("div"); name.className="name"; name.textContent=p.name||""; const meta=document.createElement("div"); meta.className="meta"; meta.textContent=t("projectListMetaFmt").replace("{sessions}",String(p.sessionCount||0)).replace("{events}",String(p.totalEvents||0)); item.appendChild(name); item.appendChild(meta); item.addEventListener("click", ()=>setActiveProject(p,item)); projectList.appendChild(item); if(i===0) setActiveProject(p,item); }); }',
       '    let __autoRefreshTimer = null;',
@@ -7923,6 +8165,8 @@ Preferred global write forms (via memory tool):
 - {"content":"请记住以后默认使用中文回复"}
 For explicit user memory requests like "请记住以后默认使用中文回复", the plugin can auto-persist global memory before model response. Avoid redundant retry calls after auto-persist.
 For generic facts like "记住这个跨会话事实..." without explicit global/preference intent, do not call memory tool; answer directly.
+Global memory is ONLY for persistent user preferences: language, nickname, communication_style, and explicit user-requested note entries. Do NOT write project codes, task details, session-specific data, code names, or temporary facts to global memory. If the user says "我的项目代号是 ALPHA-777", this is session context, not a global preference — do NOT call the memory tool for it.
+Path anchors (file paths, directory paths, URLs) are automatically stored per-project, NOT in global memory. When user says "记住这个路径" or "路径锚点", the system saves it to the current project's memory so it won't pollute other projects. Use /memory anchors to view current project's path anchors.
 Preferred recall forms:
 - {"command":"recall","args":["word mcp path"]}
 - {"command":"global"}
@@ -7941,7 +8185,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
           properties: {
             command: {
               type: 'string',
-              enum: ['learn', 'project', 'global', 'set', 'prefer', 'delete', 'unset', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'distill', 'compress', 'context', 'stats', 'doctor', 'noop'],
+              enum: ['learn', 'project', 'global', 'set', 'prefer', 'delete', 'unset', 'save', 'export', 'import', 'clear', 'edit', 'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'distill', 'compress', 'compact', 'context', 'stats', 'doctor', 'anchors', 'noop'],
               description: 'The memory command to execute'
             },
             args: {
@@ -8131,7 +8375,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               'learn', 'project', 'global', 'set', 'prefer', 'save', 'export', 'import', 'clear', 'edit',
               'feedback', 'recall', 'sessions', 'dashboard', 'discard', 'extract', 'prune', 'distill',
               'delete', 'unset',
-              'compress', 'context', 'stats', 'doctor'
+              'compress', 'compact', 'context', 'stats', 'doctor', 'anchors'
             ]);
             if (validCommands.has(maybeCommand)) {
               command = maybeCommand;
@@ -8342,6 +8586,14 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               return 'Unsupported global write: only structured preference values or explicit note/path anchor content can be persisted. Stop calling memory and answer user directly.';
             }
             if (readKey) {
+              // Handle project-level path anchors read
+              if (readKey === 'project.pathAnchors') {
+                const projectAnchors = readProjectPathAnchors();
+                if (projectAnchors.length) {
+                  applySyntheticCommand('global', ['project.pathAnchors'], { query: 'project.pathAnchors' });
+                  return `Project path anchors for ${getProjectName()}: ${projectAnchors.join('；')}`;
+                }
+              }
               applySyntheticCommand('global', [readKey], { query: readKey });
               const g = readJson(globalMemoryPath) || {};
               const prefs = getNormalizedGlobalPreferences(g);
@@ -8368,6 +8620,11 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             if (!latestUserClean || isLowSignalUserText(latestUserClean)) {
               const g = readJson(globalMemoryPath) || {};
               const prefs = getNormalizedGlobalPreferences(g);
+              const projectAnchors = readProjectPathAnchors();
+              if (projectAnchors.length) {
+                applySyntheticCommand('global', ['project.pathAnchors'], { query: 'project.pathAnchors' });
+                return `Project path anchors for ${getProjectName()}: ${projectAnchors.join('；')}`;
+              }
               const note = lookupGlobalPreferenceValue(prefs, 'preferences.note');
               if (note !== undefined && note !== null && String(note).trim()) {
                 applySyntheticCommand('global', ['preferences.note'], { query: 'preferences.note' });
@@ -8635,7 +8892,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             case 'context': {
               let sid = '';
               if (args[0] === 'session') sid = args[1] || '';
-              if (!sid || args[0] === 'current') sid = sid || [...sessionUserMessageCounters.keys()].slice(-1)[0] || '';
+              if (!sid || args[0] === 'current') sid = sid || lastActiveSessionID || '';
               if (!sid) return 'No active session id found. Use: /memory context session <id>';
               if (!hasSessionMemoryFile(sid, projectName)) return `Session memory file not found: ${sid}`;
               const sess = loadSessionMemory(sid, projectName);
@@ -8792,7 +9049,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             case 'doctor': {
               let sid = '';
               if (args[0] === 'session') sid = args[1] || '';
-              if (!sid || args[0] === 'current') sid = sid || [...sessionUserMessageCounters.keys()].slice(-1)[0] || '';
+              if (!sid || args[0] === 'current') sid = sid || lastActiveSessionID || '';
               if (!sid) {
                 const sessions = listSessionMemories(projectName)
                   .filter((s) => isLikelySessionID(s?.sessionID))
@@ -8962,7 +9219,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
                 aggressive = args.includes('aggressive');
               }
 
-              const sid = targetSessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
+              const sid = targetSessionID || lastActiveSessionID;
               if (!sid) return 'No active session id found. Use: /memory discard session <id>';
               const sess = loadSessionMemory(sid, projectName);
               const res = discardLowValueToolEvents(sess, {
@@ -9003,7 +9260,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
                 maxEvents = Number(args[0]);
               }
 
-              const sid = targetSessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
+              const sid = targetSessionID || lastActiveSessionID;
               if (!sid) return 'No active session id found. Use: /memory extract session <id> 24';
               const sess = loadSessionMemory(sid, projectName);
               const res = extractSessionContext(sess, { maxExtract: maxEvents });
@@ -9070,6 +9327,39 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               });
               if (!res.ok) return res.message;
               return `Compress completed for ${res.sessionID}: topic=${res.topic}, blockAdded=${res.blockAdded}, blockId=${res.blockId}, blocks(after=${res.debugBlocksAfterPersist}), estBodyTokens=${res.estimatedTokens}`;
+            }
+
+            case 'compact': {
+              const sid = (args[0] && args[0] !== 'current' ? args[0] : '') || lastActiveSessionID;
+              if (!sid) return 'No active session id found. Usage: /memory compact [sessionID]';
+              const sess = loadSessionMemory(sid, projectName);
+              if (!sess?.sessionID) return `Session ${sid} not found.`;
+              const beforeEvents = Array.isArray(sess.recentEvents) ? sess.recentEvents.length : 0;
+              compressSessionMemory(sess);
+              const compactResult = compactConversationByBudget(sess) || { extracted: 0 };
+              const discardResult = discardLowValueToolEvents(sess);
+              persistSessionMemory(sess, projectName);
+              const afterEvents = Array.isArray(sess.recentEvents) ? sess.recentEvents.length : 0;
+              const removed = Number(discardResult?.removed || 0);
+              const extracted = Number(compactResult?.extracted || 0);
+              return `Compacted session ${sid}: ${beforeEvents} -> ${afterEvents} events, discarded ${removed}, extracted ${extracted}.`;
+            }
+
+            case 'anchors': {
+              const subCmd = (args[0] || '').toLowerCase();
+              if (subCmd === 'add' && args.length > 1) {
+                const anchorValue = args.slice(1).join(' ');
+                const res = appendProjectPathAnchor(anchorValue);
+                return res.message || (res.ok ? 'Path anchor added.' : 'Failed to add path anchor.');
+              }
+              if ((subCmd === 'delete' || subCmd === 'remove') && args.length > 1) {
+                const anchorValue = args.slice(1).join(' ');
+                const res = deleteProjectPathAnchor(anchorValue);
+                return res.message || (res.ok ? 'Path anchor removed.' : 'Failed to remove path anchor.');
+              }
+              const anchors = readProjectPathAnchors();
+              if (!anchors.length) return `No path anchors stored for project ${getProjectName()}.`;
+              return `Path anchors for project ${getProjectName()}:\n${anchors.map((a, i) => `${i + 1}. ${a}`).join('\n')}`;
             }
 
             case 'recall': {
@@ -9337,20 +9627,21 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
             case 'add':
               if (!args.length) return 'Invalid context command: add requires args. Use {"command":"add","args":["text"]}.';
               return `Added to context: ${args.join(' ')}`;
-            case 'view':
-              return 'Current Session Context:\n- (Mock) Active File: None\n- (Mock) Recent Changes: None';
+            case 'view': {
+              const viewSid = lastActiveSessionID;
+              if (!viewSid) return 'No active session. Context is empty.';
+              const viewSess = loadSessionMemory(viewSid);
+              const evtCount = Array.isArray(viewSess?.recentEvents) ? viewSess.recentEvents.length : 0;
+              const summaryText = normalizeText(String(viewSess?.summary?.compressedText || '')).slice(0, 300);
+              const cwd = normalizeText(String(viewSess?.sessionCwd || ''));
+              const title = normalizeText(String(viewSess?.sessionTitle || ''));
+              return `Session: ${viewSid}\nTitle: ${title || '(untitled)'}\nCwd: ${cwd || '(unknown)'}\nEvents: ${evtCount}\nSummary: ${summaryText || '(none)'}`;
+            }
             case 'clear':
               return 'Session context cleared.';
             default:
               return `Invalid context command: ${command}. Use {"command":"view"} | {"command":"add","args":["text"]} | {"command":"clear"}.`;
           }
-        }
-      },
-      compact: {
-        description: 'Compact the current session context',
-        parameters: { type: 'object', properties: {} },
-        execute: async () => {
-          return 'Context compacted. Redundant details removed.';
         }
       },
       discard: {
@@ -9364,7 +9655,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
         },
         execute: async ({ sessionID = '', aggressive = false } = {}) => {
           const projectName = getProjectName();
-          const sid = sessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
+          const sid = sessionID || lastActiveSessionID;
           if (!sid) return 'No active session id found.';
           const sess = loadSessionMemory(sid, projectName);
           const d = discardLowValueToolEvents(sess, {
@@ -9402,7 +9693,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
         },
         execute: async ({ sessionID = '', maxEvents = getExtractEventsPerPass() } = {}) => {
           const projectName = getProjectName();
-          const sid = sessionID || [...sessionUserMessageCounters.keys()].slice(-1)[0];
+          const sid = sessionID || lastActiveSessionID;
           if (!sid) return 'No active session id found.';
           const sess = loadSessionMemory(sid, projectName);
           const e = extractSessionContext(sess, { maxExtract: Number(maxEvents || getExtractEventsPerPass()) });
@@ -9498,9 +9789,8 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
         opencodeConfig.permission = {
           ...currentPerm,
           memory: currentPerm.memory || 'allow',
-          // compatibility tools are intentionally disabled to reduce noisy retries
-          remember_global: 'deny',
-          recall_memory: 'deny',
+          remember_global: currentPerm.remember_global || 'allow',
+          recall_memory: currentPerm.recall_memory || 'allow',
           context: currentPerm.context || 'allow',
           discard: currentPerm.discard || 'allow',
           extract: currentPerm.extract || 'allow',
@@ -9542,7 +9832,8 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               '',
               '| 子命令 | 用法 | 说明 |',
               '|--------|------|------|',
-              '| global | `/memory global <key>` | 读取全局偏好或锚点，例如 `preferences.language`、`preferences.note` |',
+              '| global | `/memory global <key>` | 读取全局偏好，例如 `preferences.language`、`preferences.note` |',
+              '| anchors | `/memory anchors [add|delete <value>]` | 查看/添加/删除当前项目的路径锚点（按项目隔离） |',
               '| set | `/memory set <key> <value>` | 直接写入全局键值 |',
               '| prefer | `/memory prefer <key> <value>` | 写入 `preferences.<key>` |',
               '| recall | `/memory recall <query>` | 从历史 session 召回相关记忆 |',
@@ -9576,14 +9867,17 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
       try {
         const messages = Array.isArray(output?.messages) ? output.messages : [];
         if (!messages.length) return;
-        const warmupSnapshot = JSON.parse(JSON.stringify(messages));
         clearInjectedHintParts(messages);
+        const sid = inferSessionIDFromMessages(messages);
+        const latestUserText =
+          inferLatestUserText(messages)
+          || inferLatestUserTextFromTransformInput(input)
+          || inferUserTextFromProcessArgv();
+        const latestUserID = inferLatestUserMessageID(messages);
         const beforeTokensNoHint = estimateOutgoingMessagesTokens(messages);
         injectMessageIdTags(messages, { beforeTokens: beforeTokensNoHint });
         injectPrunableToolsHint(messages, { beforeTokens: beforeTokensNoHint });
         const pluginHintTokensBefore = estimateInjectedHintTokens(messages);
-
-        const sid = inferSessionIDFromMessages(messages);
         let lastUser = null;
         for (let i = messages.length - 1; i >= 0; i -= 1) {
           if (normalizeText(String(messages[i]?.info?.role || '')).toLowerCase() === 'user') {
@@ -9607,11 +9901,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
         }
 
         if (sid) {
-          const latestUserText =
-            inferLatestUserText(messages)
-            || inferLatestUserTextFromTransformInput(input)
-            || inferUserTextFromProcessArgv();
-          const latestUserID = inferLatestUserMessageID(messages);
+          lastActiveSessionID = sid;
           if (latestUserText) {
             const observedAt = Date.now();
             lastObservedUserText = latestUserText;
@@ -9653,7 +9943,8 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
           if (stats.strictApplied) sessionStrictHitAt.set(sid, Date.now());
           recordSendPretrimAudit(sid, stats, 'auto');
           if (stats.savedTokens > 0) writeDashboardFiles();
-          void schedulePretrimWarmupFromMessages(sid, warmupSnapshot);
+          // Snapshot after pretrim so warmup pre-computes against post-trim state
+          void schedulePretrimWarmupFromMessages(sid, JSON.parse(JSON.stringify(messages)));
         }
       } catch (err) {
         console.error('memory-system send pretrim hook failed:', err);
@@ -9850,43 +10141,11 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
           summary: 'Session ended',
           rawEvent: event
         });
-        sessionUserMessageCounters.delete(sessionID);
-        sessionLatestUserTextByID.delete(sessionID);
-        sessionObservedUserTextByID.delete(sessionID);
-        sessionObservedUserAtByID.delete(sessionID);
-        sessionAutoGlobalWriteState.delete(sessionID);
-        rememberGlobalEmptyCallState.delete(sessionID);
-        memoryEmptyCallState.delete(sessionID);
-        contextEmptyCallState.delete(`${sessionID}:context-empty`);
-        if (lastActiveSessionID === sessionID) lastActiveSessionID = '';
-        lastObservedUserText = '';
-        lastObservedUserAt = 0;
-        sessionRecallState.delete(sessionID);
-        sessionTitleByID.delete(sessionID);
-        sessionUserDedupeState.delete(sessionID);
-        sessionStrictHitAt.delete(sessionID);
-        sessionPendingVisibleNoticeMirrors.delete(sessionID);
-        pretrimWarmupTasks.delete(sessionID);
+        cleanupSessionRuntimeState(sessionID);
       }
 
       if (event.type === 'session.deleted') {
-        sessionUserMessageCounters.delete(sessionID);
-        sessionLatestUserTextByID.delete(sessionID);
-        sessionObservedUserTextByID.delete(sessionID);
-        sessionObservedUserAtByID.delete(sessionID);
-        sessionAutoGlobalWriteState.delete(sessionID);
-        rememberGlobalEmptyCallState.delete(sessionID);
-        memoryEmptyCallState.delete(sessionID);
-        contextEmptyCallState.delete(`${sessionID}:context-empty`);
-        if (lastActiveSessionID === sessionID) lastActiveSessionID = '';
-        lastObservedUserText = '';
-        lastObservedUserAt = 0;
-        sessionRecallState.delete(sessionID);
-        sessionTitleByID.delete(sessionID);
-        sessionUserDedupeState.delete(sessionID);
-        sessionStrictHitAt.delete(sessionID);
-        sessionPendingVisibleNoticeMirrors.delete(sessionID);
-        pretrimWarmupTasks.delete(sessionID);
+        cleanupSessionRuntimeState(sessionID);
       }
     }
   };
