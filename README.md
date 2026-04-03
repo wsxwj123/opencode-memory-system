@@ -36,30 +36,49 @@
 
 ### 2. 安装教程
 
-#### 2.0 推荐安装方式（GitHub）
-先把仓库拉到本地，例如：
+#### 2.0 一键安装（macOS / Linux）
 
 ```bash
 git clone https://github.com/wsxwj123/opencode-memory-system.git
 cd opencode-memory-system
+mkdir -p ~/.config/opencode/plugins/scripts ~/.config/opencode/plugins/dashboard
+cp plugins/memory-system.js ~/.config/opencode/plugins/
+cp plugins/scripts/opencode_memory_dashboard.mjs ~/.config/opencode/plugins/scripts/
+cp plugins/dashboard/template.html ~/.config/opencode/plugins/dashboard/
 ```
 
-如果你只是想安装插件，不需要把整个仓库都塞进 OpenCode 配置目录。真正必须复制进去的，只有下面这 3 个文件。
+#### 2.0.1 一键安装（Windows PowerShell）
 
-#### 2.1 需要三个文件
-- `plugins/memory-system.js`
-- `plugins/scripts/opencode_memory_dashboard.mjs`
-- `plugins/dashboard/template.html`
+```powershell
+git clone https://github.com/wsxwj123/opencode-memory-system.git
+cd opencode-memory-system
+$dest = "$env:USERPROFILE\.config\opencode\plugins"
+New-Item -ItemType Directory -Force -Path "$dest\scripts", "$dest\dashboard" | Out-Null
+Copy-Item plugins\memory-system.js "$dest\"
+Copy-Item plugins\scripts\opencode_memory_dashboard.mjs "$dest\scripts\"
+Copy-Item plugins\dashboard\template.html "$dest\dashboard\"
+```
 
-#### 2.2 放入 OpenCode 全局配置
-- macOS/Linux:
-  - `~/.config/opencode/plugins/memory-system.js`
-  - `~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs`
-  - `~/.config/opencode/plugins/dashboard/template.html`
-- Windows:
-  - `C:\Users\<用户名>\.config\opencode\plugins\memory-system.js`
-  - `C:\Users\<用户名>\.config\opencode\plugins\scripts\opencode_memory_dashboard.mjs`
-  - `C:\Users\<用户名>\.config\opencode\plugins\dashboard\template.html`
+#### 2.0.2 一键安装（Windows CMD）
+
+```cmd
+git clone https://github.com/wsxwj123/opencode-memory-system.git
+cd opencode-memory-system
+mkdir "%USERPROFILE%\.config\opencode\plugins\scripts"
+mkdir "%USERPROFILE%\.config\opencode\plugins\dashboard"
+copy plugins\memory-system.js "%USERPROFILE%\.config\opencode\plugins\"
+copy plugins\scripts\opencode_memory_dashboard.mjs "%USERPROFILE%\.config\opencode\plugins\scripts\"
+copy plugins\dashboard\template.html "%USERPROFILE%\.config\opencode\plugins\dashboard\"
+```
+
+> 如果你只是想安装插件，不需要把整个仓库都塞进 OpenCode 配置目录。真正必须复制进去的，只有上面这 3 个文件。
+
+#### 2.1 需要的三个文件
+| 源文件 | macOS/Linux 目标 | Windows 目标 |
+|--------|------------------|--------------|
+| `plugins/memory-system.js` | `~/.config/opencode/plugins/memory-system.js` | `%USERPROFILE%\.config\opencode\plugins\memory-system.js` |
+| `plugins/scripts/opencode_memory_dashboard.mjs` | `~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs` | `%USERPROFILE%\.config\opencode\plugins\scripts\opencode_memory_dashboard.mjs` |
+| `plugins/dashboard/template.html` | `~/.config/opencode/plugins/dashboard/template.html` | `%USERPROFILE%\.config\opencode\plugins\dashboard\template.html` |
 
 #### 2.3 opencode.json 启用
 不要直接用 README 里的示例去覆盖你原来的 `~/.config/opencode/opencode.json`。
@@ -354,24 +373,52 @@ node scripts/run_path_regression_suite.mjs
 - **Visual dashboard at `:37777`**: real-time management of settings, templates, LLM config, and trash.
 
 ### Install
-1. Copy files:
-   - `plugins/memory-system.js`
-   - `plugins/scripts/opencode_memory_dashboard.mjs`
-   - `plugins/dashboard/template.html`
-2. Put into OpenCode config dir:
-   - macOS/Linux: `~/.config/opencode/plugins/...`
-   - Windows: `C:\Users\<User>\.config\opencode\plugins\...`
-3. Enable plugin in `opencode.json`:
+
+#### Quick Install (macOS / Linux)
+```bash
+git clone https://github.com/wsxwj123/opencode-memory-system.git
+cd opencode-memory-system
+mkdir -p ~/.config/opencode/plugins/scripts ~/.config/opencode/plugins/dashboard
+cp plugins/memory-system.js ~/.config/opencode/plugins/
+cp plugins/scripts/opencode_memory_dashboard.mjs ~/.config/opencode/plugins/scripts/
+cp plugins/dashboard/template.html ~/.config/opencode/plugins/dashboard/
+```
+
+#### Quick Install (Windows PowerShell)
+```powershell
+git clone https://github.com/wsxwj123/opencode-memory-system.git
+cd opencode-memory-system
+$dest = "$env:USERPROFILE\.config\opencode\plugins"
+New-Item -ItemType Directory -Force -Path "$dest\scripts", "$dest\dashboard" | Out-Null
+Copy-Item plugins\memory-system.js "$dest\"
+Copy-Item plugins\scripts\opencode_memory_dashboard.mjs "$dest\scripts\"
+Copy-Item plugins\dashboard\template.html "$dest\dashboard\"
+```
+
+#### Quick Install (Windows CMD)
+```cmd
+git clone https://github.com/wsxwj123/opencode-memory-system.git
+cd opencode-memory-system
+mkdir "%USERPROFILE%\.config\opencode\plugins\scripts"
+mkdir "%USERPROFILE%\.config\opencode\plugins\dashboard"
+copy plugins\memory-system.js "%USERPROFILE%\.config\opencode\plugins\"
+copy plugins\scripts\opencode_memory_dashboard.mjs "%USERPROFILE%\.config\opencode\plugins\scripts\"
+copy plugins\dashboard\template.html "%USERPROFILE%\.config\opencode\plugins\dashboard\"
+```
+
+#### Enable plugin in `opencode.json`
+Add `"./plugins/memory-system.js"` to the `"plugin"` array:
 ```json
 {
   "plugin": ["./plugins/memory-system.js"]
 }
 ```
-4. Restart OpenCode.
-   Dashboard `:37777` normally follows OpenCode via a watchdog-style lifecycle. If it is missing, restart manually:
-   ```bash
-   node ~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs restart 37777
-   ```
+
+#### Restart OpenCode
+Dashboard `:37777` normally follows OpenCode via a watchdog-style lifecycle. If it is missing, restart manually:
+```bash
+node ~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs restart 37777
+```
 
 ### Usage
 - Works automatically in chat.
