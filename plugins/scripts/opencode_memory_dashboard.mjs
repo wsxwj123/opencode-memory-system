@@ -1198,30 +1198,25 @@ function serve() {
   const explicitParentBinding = parentPid > 0;
   let miss = 0;
   const watchdog = setInterval(async () => {
-    const byParent = explicitParentBinding ? isPidAlive(parentPid) : false;
-    const byProcess = isOpencodeRunning();
-    const byPort = await isTcpPortListening(opencodePort);
-    const alive = byParent || byProcess || byPort;
+    let alive;
     if (explicitParentBinding) {
-      if (alive) {
-        miss = 0;
-        return;
-      }
-      miss += 1;
-      if (miss >= Math.min(watchdogMaxMiss, 3)) {
-        clearInterval(trashGcTimer);
-        clearInterval(watchdog);
-        process.exit(0);
-      }
-      return;
+      // Strict mode: when the plugin spawned us with its parent PID, ONLY
+      // trust that PID. Don't OR in byProcess/byPort — isOpencodeRunning's
+      // pgrep pattern matches our own argv (path contains "opencode_memory_
+      // dashboard.mjs") so byProcess would be permanently true and the
+      // watchdog would never fire after the real parent exits.
+      alive = isPidAlive(parentPid);
+    } else {
+      // No explicit parent PID — fall back to global OpenCode / port probing.
+      alive = isOpencodeRunning() || (await isTcpPortListening(opencodePort));
     }
-    // No explicit parent PID was provided. Fall back to global OpenCode / port probing.
     if (alive) {
       miss = 0;
       return;
     }
     miss += 1;
-    if (miss >= watchdogMaxMiss) {
+    const limit = explicitParentBinding ? Math.min(watchdogMaxMiss, 3) : watchdogMaxMiss;
+    if (miss >= limit) {
       clearInterval(trashGcTimer);
       clearInterval(watchdog);
       process.exit(0);
