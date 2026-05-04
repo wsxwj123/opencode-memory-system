@@ -65,15 +65,39 @@ function extractFunctionText(source, fnName) {
   let i = source.indexOf('{', start);
   let depth = 0;
   let end = -1;
+  // String-literal aware brace matching. Without this, template literals
+  // (`...${expr}...`) inside the function body would throw off depth counting:
+  // every `{` inside CSS/HTML/JS strings would be treated as a block open.
+  let strChar = null;     // null | "'" | '"' | '`'
+  let exprDepth = 0;      // > 0 when inside ${...} of a backtick template
+  let inLineCmt = false;
+  let inBlockCmt = false;
   for (; i < source.length; i += 1) {
     const ch = source[i];
-    if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) {
-        end = i;
-        break;
+    const next = source[i + 1] || '';
+    if (inLineCmt) { if (ch === '\n') inLineCmt = false; continue; }
+    if (inBlockCmt) { if (ch === '*' && next === '/') { inBlockCmt = false; i += 1; } continue; }
+    if (strChar) {
+      if (ch === '\\') { i += 1; continue; }    // skip escape next char
+      if (strChar === '`' && ch === '$' && next === '{') {
+        strChar = null; exprDepth = 1; i += 1; continue;  // enter ${...}
       }
+      if (ch === strChar) strChar = null;
+      continue;
+    }
+    if (ch === '/' && next === '/') { inLineCmt = true; i += 1; continue; }
+    if (ch === '/' && next === '*') { inBlockCmt = true; i += 1; continue; }
+    if (ch === "'" || ch === '"' || ch === '`') { strChar = ch; continue; }
+    if (ch === '{') {
+      depth += 1;
+      if (exprDepth > 0) exprDepth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (exprDepth > 0) {
+        exprDepth -= 1;
+        if (exprDepth === 0) { strChar = '`'; continue; }   // back into template
+      }
+      if (depth === 0) { end = i; break; }
     }
   }
   if (end < 0) return '';
@@ -91,29 +115,12 @@ function getDashboardDataFallback() {
 }
 
 function syncDashboardHtmlFromPlugin() {
-  try {
-    const pluginPath = pickPluginSourcePath();
-    if (!pluginPath) return { ok: false, reason: 'plugin_source_not_found' };
-    const data = safeReadJson(dataPath) || getDashboardDataFallback();
-    const src = fs.readFileSync(pluginPath, 'utf8');
-    const fnText = extractFunctionText(src, 'buildDashboardHtmlLegacy');
-    if (!fnText) return { ok: false, reason: 'buildDashboardHtmlLegacy_not_found' };
-    const context = { __data: data, __html: '' };
-    vm.createContext(context);
-    vm.runInContext(`${fnText}\n__html = buildDashboardHtmlLegacy(__data);`, context, { timeout: 3000 });
-    const html = String(context.__html || '');
-    if (!html.includes('<!doctype html>') || !html.includes('/api/dashboard')) {
-      return { ok: false, reason: 'generated_html_invalid' };
-    }
-    const oldHtml = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '';
-    if (oldHtml !== html) {
-      fs.writeFileSync(indexPath, html, 'utf8');
-      return { ok: true, reason: 'updated_from_legacy', source: pluginPath };
-    }
-    return { ok: true, reason: 'already_latest_legacy', source: pluginPath };
-  } catch (err) {
-    return { ok: false, reason: String(err?.message || err) };
-  }
+  // DISABLED: the source-extraction approach (vm.runInContext on a sliced
+  // function body) is fragile when the plugin uses template literals with
+  // ${...} interpolation in the dashboard HTML. The plugin itself writes
+  // the dashboard HTML directly via writeDashboardFiles(), so the service
+  // doesn't need to re-render. Just serve whatever's on disk.
+  return { ok: true, reason: 'sync_disabled_plugin_is_source' };
 }
 
 function ensureDashboardDir() {

@@ -322,6 +322,59 @@ node scripts/run_path_regression_suite.mjs
 
 ### 12. 更新日志
 
+#### 2026-05-04 (v2.1.0)
+**Apple 风格 Dashboard 重制 + 摘要质量大修 + 并发安全 + 跨 cwd 共享记忆**
+
+UI / Dashboard：
+- 完全重写 `buildDashboardHtmlLegacy`：Apple 官网风格（系统字体、毛玻璃 header、48px hero、药丸按钮、Apple Switch）
+- **中英文双语 i18n**（顶部 中/EN 切换，~70 条文案）
+- 所有面板**默认折叠**（原生 `<details>`），点 ▸ 才展开
+- **Section 内容懒加载**：第一次点 ▸ 才填 DOM，解决多 KB 摘要的卡顿
+- session 条目精简：去掉聊天记录显示，只保留 编辑/重置/删除按钮 + 5 个折叠 section（压缩摘要/压缩块/裁剪轨迹/系统审计/预热缓存）
+- **批量操作**：☐ 全选 / 取消所选 / 批量删除（计数显示）
+- **编辑摘要 modal 懒加载**（`requestAnimationFrame` 延迟塞入大 textarea）
+- **新增"重置摘要"按钮**：清掉历史脏 `compressedText`，下次裁剪自动按新格式生成
+- 移除 5s 自动轮询 → 手动刷新（性能提升明显）
+- Dashboard 写盘 debounce（1.5s 合并），原本每事件一次写
+
+摘要质量：
+- `buildCompressedChunk` 重写输出：`## Session Summary` + Goal/Key facts/Key files/Decisions/Blockers/Open items/Next，移除 workdir scoring、related_workdirs、tools used、handoff anchor 等调试字段
+- 过滤源头噪音：`[toolname] input={...}` 工具 I/O JSON、sub-agent CoT (`**Thinking...** I need to...`)、`output compacted by adaptive policy` 占位符
+- `appendCompressedSummaryChunk` / `enforceSessionFileBudget`：**REPLACE 替换**而不是 MERGE 合并；不再丢前面的内容；历史块全部保留在 `summaryBlocks`
+- LLM distill prompt 重写硬规则要求干净格式输出
+- `extractDistillTextFromResponse` 加多字段兜底：`reasoning_content` / `output_text` / `output[].content[].text` —— 解决 gpt-5.4 等推理模型的 `empty_text`
+- `distill-empty-debug.log` 自动 rotate（>1MB 切到 .1）
+- 中文 nickname 抽取：`我叫X` / `叫我X` / `我的名字是X` 配合"记住"自动写 `preferences.nickname`
+- 机械 fallback 修字段映射：tool-result 不再被错分到 assistant
+- 摘要块 dedup：相同窗口的 block 不再连续刷写
+
+并发与稳定：
+- 新增 `mutateSessionMemoryAsync` helper + **`AsyncLocalStorage` 可重入锁**（修死锁：processUserMessageEvent 锁住后内部 await injectMemoryText 又取同 session 锁）
+- 3 个 async mutator 加锁：`schedulePretrimWarmupFromMessages` / `injectMemoryText` / `maybeInjectTriggerRecall`
+- `cleanupSessionRuntimeState` 补漏：`sessionProjectCache` / `sessionProjectLookupLastAt` / `sessionNoticeState` 不再泄漏
+- 修 select-all 闭包 stale bug（切换项目后 SELECTED_SESSIONS 不再污染）
+
+注入与召回（去打扰）：
+- 注入提示**默认全关**：`visibleNoticesEnabled` / `visibleNoticeCurrentSummaryMirrorEnabled` / `visibleNoticeForDiscard` 默认 `false`，`notificationMode='off'`
+- 召回关键词收紧：去掉 "那个会话/上次那个对话" 等过宽短语
+- `referencesAnotherSessionTitle` 单向匹配，title 长度阈 8（短标题不再误中）
+- `injectGlobalReadResultHint` 同 turn dedup
+- 周期摘要：`count % every === 0` modulo gate → `lastPeriodicSummaryUserCount` 增量跟踪
+- 会话恢复触发间隔 5 分钟 → 60 分钟（不再每次回来都"已恢复"打断）
+
+输入处理与 Bug 修：
+- `inferGlobalPreferenceWriteFromText` 早退修复：`/记住(.+)/` 命中但 m[1] 推断不出 key 时让全文 fallback 有机会
+- `getIntPreference` / `getFloatSetting` clamp fallback
+- 文本指纹 dedup 加 4 秒时间窗（合法 retry 不再被 silent drop）
+
+跨 cwd 项目识别：
+- `getProjectName()` 优先 honor opencode DB 的 `project_id`：DB 返回 `'global'` 时 plugin 用 `global/` 目录（让所有非 git 仓库的 cwd 共享记忆）
+- 支持 git 仓库：cwd 在 git 仓库内时 plugin 自动按 git root basename 分组
+- 配套迁移：把零散的 cwd-basename 项目目录合并到 `global/`
+
+Dashboard 服务（`scripts/opencode_memory_dashboard.mjs`）：
+- 禁用 `syncDashboardHtmlFromPlugin`：之前的源码提取 + vm 重渲在模板字面量场景 brace 计数失败，**plugin 自身的 `writeDashboardFiles` 是唯一写源**
+
 #### 2026-04-03 (v2.0.0)
 **路径锚点项目隔离 + 7项实战修复**
 
@@ -517,6 +570,59 @@ node scripts/run_path_regression_suite.mjs
 ```
 
 ### Changelog
+
+#### 2026-05-04 (v2.1.0)
+**Apple-style Dashboard rebuild + Summary quality overhaul + Concurrency safety + Cross-cwd shared memory**
+
+UI / Dashboard:
+- Full rewrite of `buildDashboardHtmlLegacy`: Apple.com aesthetic (system fonts, frosted-glass header, 48px hero, pill buttons, Apple Switch toggles)
+- **Bilingual i18n** (中/EN switcher, ~70 strings)
+- All panels **default-collapsed** via native `<details>`
+- **Lazy section render**: large summaries only injected into DOM on first ▸ click — fixes lag
+- Slimmer session entries: chat history removed; only edit/reset/delete + 5 collapsible sections (compressed summary / chunks / pretrim trace / system audit / warmup cache)
+- **Batch ops**: select-all / clear / batch-delete with live count
+- **Edit modal lazy load**: `requestAnimationFrame` defers large textarea population
+- **New "Reset Summary" button**: clears legacy dirty `compressedText` so next pretrim regenerates clean
+- 5s auto-poll removed → manual refresh (significant perf win)
+- Dashboard write debounced (1.5s coalesce)
+
+Summary quality:
+- `buildCompressedChunk` rewritten: `## Session Summary` + Goal/Key facts/Key files/Decisions/Blockers/Open items/Next; debug fields (workdir scoring, related_workdirs, tools used, handoff anchor) removed
+- Source noise filtered: `[toolname] input={...}` JSON, sub-agent CoT (`**Thinking...** I need to...`), `output compacted by adaptive policy` placeholders
+- `appendCompressedSummaryChunk` / `enforceSessionFileBudget`: **REPLACE** instead of MERGE; no more dropped early content; full history retained in `summaryBlocks`
+- LLM distill prompt rewritten with hard formatting rules
+- `extractDistillTextFromResponse` adds fallback fields: `reasoning_content` / `output_text` / `output[].content[].text` — fixes `empty_text` from gpt-5.4-style reasoning models
+- `distill-empty-debug.log` auto-rotates (>1MB → .1)
+- Chinese nickname extraction: `我叫X` / `叫我X` / `我的名字是X` with "记住" → `preferences.nickname`
+- Mechanical fallback fixes field mapping: tool-result no longer misclassified as assistant
+- Summary block dedup: identical-window blocks no longer rewritten
+
+Concurrency & stability:
+- New `mutateSessionMemoryAsync` helper + **`AsyncLocalStorage` re-entrant lock** (fixes deadlock: `processUserMessageEvent` held lock then awaited `injectMemoryText` which re-acquired same session lock)
+- 3 async mutators now lock-protected: `schedulePretrimWarmupFromMessages` / `injectMemoryText` / `maybeInjectTriggerRecall`
+- `cleanupSessionRuntimeState` plugged leaks: `sessionProjectCache` / `sessionProjectLookupLastAt` / `sessionNoticeState`
+- Fixed select-all closure stale bug (project switch no longer pollutes `SELECTED_SESSIONS`)
+
+Injection & recall (low-noise):
+- Injection notices **default-off**: `visibleNoticesEnabled` / `visibleNoticeCurrentSummaryMirrorEnabled` / `visibleNoticeForDiscard` default `false`, `notificationMode='off'`
+- Recall keywords tightened: removed overly-broad phrases like "那个会话/上次那个对话"
+- `referencesAnotherSessionTitle` one-way matching, title threshold raised to 8 chars
+- `injectGlobalReadResultHint` same-turn dedup
+- Periodic summary: `count % every === 0` modulo gate → `lastPeriodicSummaryUserCount` delta tracking
+- Session-resume trigger interval 5min → 60min (no more "已恢复" interruptions every reload)
+
+Input handling & bug fixes:
+- `inferGlobalPreferenceWriteFromText` early-return fix: `/记住(.+)/` matches but key inference fails → fallthrough lets full-text fallback run
+- `getIntPreference` / `getFloatSetting` clamp fallback
+- Text fingerprint dedup gains 4s time window (legitimate retries no longer silent-dropped)
+
+Cross-cwd project resolution:
+- `getProjectName()` now honors opencode DB `project_id`: DB returns `'global'` → plugin uses `global/` directory (all non-git cwds share memory)
+- Git repo support: cwd inside git repo auto-grouped by git-root basename
+- Migration: scattered cwd-basename project dirs consolidated into `global/`
+
+Dashboard service (`scripts/opencode_memory_dashboard.mjs`):
+- `syncDashboardHtmlFromPlugin` disabled: previous source extraction + vm re-render fails brace counting on template literals — **plugin's own `writeDashboardFiles` is now the single source of truth**
 
 #### 2026-04-03 (v2.0.0)
 - Project-scoped path anchors (no cross-project pollution)
