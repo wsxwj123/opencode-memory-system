@@ -6075,11 +6075,11 @@ export const MemorySystemPlugin = ({ client }) => {
         sessionData.budget.lastCompactedAt = new Date().toISOString();
         sessionData.budget.lastCompactionReason = `discard_low_signal_tools(${discardResult.removed})`;
         if (getVisibleNoticeForDiscard()) {
-          void emitVisibleNotice(
+          emitVisibleNotice(
             sessionID,
             `已裁剪 ${discardResult.removed} 条低信号工具输出，正文估算 ~${estimatedTokens} tokens`,
             'discard:auto'
-          );
+          ).catch((e) => console.error('memory-system emitVisibleNotice (discard) failed:', e));
         }
       }
       persistSessionMemory(sessionData, projectName);
@@ -8169,12 +8169,12 @@ export const MemorySystemPlugin = ({ client }) => {
   .status-msg.ok { color: var(--success); }
   .status-msg.err { color: var(--danger); }
   /* Modal */
-  .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.4); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: none; align-items: center; justify-content: center; z-index: 200; padding: 24px; }
-  .modal.show { display: flex; animation: fade 0.2s ease; }
-  .modal-content { background: var(--surface); border-radius: var(--radius-lg); padding: 28px; width: 100%; max-width: 720px; max-height: 85vh; display: flex; flex-direction: column; box-shadow: var(--shadow-lg); }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; align-items: center; justify-content: center; z-index: 200; padding: 24px; }
+  .modal.show { display: flex; }
+  .modal-content { background: var(--surface); border-radius: var(--radius-lg); padding: 28px; width: 100%; max-width: 720px; max-height: 85vh; display: flex; flex-direction: column; box-shadow: var(--shadow-lg); transform: translateZ(0); contain: layout style paint; }
   .modal-content h2 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; margin-bottom: 6px; }
   .modal-content .modal-sub { font-size: 13px; color: var(--text-secondary); margin-bottom: 16px; word-break: break-all; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
-  .modal-content textarea { flex: 1; min-height: 320px; }
+  .modal-content textarea { flex: 1; min-height: 320px; contain: layout style paint; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   /* Trash */
   .trash-row { display: flex; gap: 12px; align-items: flex-start; padding: 12px; background: var(--surface); border: var(--hairline) solid var(--separator); border-radius: var(--radius-sm); margin-bottom: 8px; }
@@ -8371,7 +8371,11 @@ function renderProjects() {
   for (const p of projects) {
     const btn = document.createElement('button');
     btn.className = 'project-card' + (p.name === activeProject ? ' active' : '');
-    btn.onclick = () => { activeProject = p.name; renderProjects(); renderSessions(); };
+    btn.onclick = () => {
+      activeProject = p.name;
+      SELECTED_SESSIONS.clear();  // Avoid stale selections leaking across projects
+      renderProjects(); renderSessions();
+    };
     btn.innerHTML = '<div class="name"></div><div class="meta"></div>';
     btn.querySelector('.name').textContent = p.name || '(unnamed)';
     btn.querySelector('.meta').textContent = (p.sessionCount || 0) + ' ' + t('sessions') + ' · ' + (p.totalEvents || 0) + ' ' + t('events');
@@ -8434,8 +8438,11 @@ function renderSessions() {
   selAllCb.checked = sessions.length > 0 && sessions.every((s) => SELECTED_SESSIONS.has(s.sessionID));
   selAllCb.indeterminate = !selAllCb.checked && sessions.some((s) => SELECTED_SESSIONS.has(s.sessionID));
   selAllCb.onclick = () => {
-    if (selAllCb.checked) sessions.forEach((s) => SELECTED_SESSIONS.add(s.sessionID));
-    else sessions.forEach((s) => SELECTED_SESSIONS.delete(s.sessionID));
+    // Refetch sessions from CURRENT project to avoid stale-closure bug.
+    const proj2 = (DATA.projects || []).find((p) => p.name === activeProject);
+    const cur = proj2?.sessions || [];
+    if (selAllCb.checked) cur.forEach((s) => SELECTED_SESSIONS.add(s.sessionID));
+    else cur.forEach((s) => SELECTED_SESSIONS.delete(s.sessionID));
     renderSessions();
   };
   const selAllLabel = document.createElement('label');
@@ -8494,10 +8501,11 @@ function renderSessionCard(s) {
     updateSessionToolbar();
     const all = $('selectAllCb');
     if (all) {
-      const proj = (DATA.projects || []).find((p) => p.name === activeProject);
-      const sess = proj?.sessions || [];
-      all.checked = sess.length > 0 && sess.every((x) => SELECTED_SESSIONS.has(x.sessionID));
-      all.indeterminate = !all.checked && sess.some((x) => SELECTED_SESSIONS.has(x.sessionID));
+      // Refetch from current project (avoid closure capturing prior project's list)
+      const projNow = (DATA.projects || []).find((p) => p.name === activeProject);
+      const sessNow = projNow?.sessions || [];
+      all.checked = sessNow.length > 0 && sessNow.every((x) => SELECTED_SESSIONS.has(x.sessionID));
+      all.indeterminate = !all.checked && sessNow.some((x) => SELECTED_SESSIONS.has(x.sessionID));
     }
   };
   head.appendChild(cb);
@@ -10944,7 +10952,8 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
           recordSendPretrimAudit(sid, stats, 'auto');
           if (stats.savedTokens > 0) writeDashboardFiles();
           // Snapshot after pretrim so warmup pre-computes against post-trim state
-          void schedulePretrimWarmupFromMessages(sid, JSON.parse(JSON.stringify(messages)));
+          schedulePretrimWarmupFromMessages(sid, JSON.parse(JSON.stringify(messages)))
+            .catch((e) => console.error('memory-system schedulePretrimWarmupFromMessages failed:', e));
         }
       } catch (err) {
         console.error('memory-system send pretrim hook failed:', err);
