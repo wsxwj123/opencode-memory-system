@@ -4436,17 +4436,19 @@ export const MemorySystemPlugin = ({ client }) => {
       });
       if (appended) {
         traceItem.blockId = appended.blockId;
-        // Bridge: merge block summary into compressedText so recall system can surface it
+        // Bridge: REPLACE compressedText with the latest block (historical
+        // chunks live in summaryBlocks). Old behavior merged old+new and then
+        // truncated, which dropped earliest context whenever the merged
+        // string exceeded the budget — exactly the "前面内容被丢弃" bug.
         if (appended.summary) {
-          const current = sanitizeCompressedSummaryText(String(mem?.summary?.compressedText || ''));
-          const merged = [current, appended.summary].filter(Boolean).join('\n\n---\n\n');
           mem.summary = mem.summary || {};
-          mem.summary.compressedText = truncateText(merged, getSummaryMaxChars());
+          mem.summary.compressedText = truncateText(
+            sanitizeCompressedSummaryText(String(appended.summary)),
+            getSummaryMaxChars()
+          );
           mem.summary.compressedEvents = Number(mem.summary.compressedEvents || 0)
             + Number(appended.consumedMessages || 0);
-          if (!mem.summary.lastCompressedAt) {
-            mem.summary.lastCompressedAt = appended.createdAt || new Date().toISOString();
-          }
+          mem.summary.lastCompressedAt = appended.createdAt || new Date().toISOString();
         }
       }
     }
