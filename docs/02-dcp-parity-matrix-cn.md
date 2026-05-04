@@ -11,7 +11,7 @@
 | 独立 LLM 蒸馏 | 是（可配置） | 是（可配置） | `independent` 模式 |
 | 自动回退链 | 是 | 是 | independent -> session -> extract |
 | 可观测 traces | 是 | 是 | pretrim traces + doctor |
-| 回收站与审计 | 通常无内置 UI | 是 | 37777 面板支持 |
+| 回收站与审计 | 通常无内置 UI | 是 | 37776 面板支持 |
 | 内核级历史改写 | 否（同属插件层） | 否 | 都依赖发送前变换 |
 
 ## 已对齐重点
@@ -30,5 +30,5 @@
 - 超预算时：`beforeTokens > afterTokens` 且存在重写/蒸馏证据。
 - 系统层消息保留：system token 不被误裁剪。
 - 关键结果不丢：write/edit/bash/read 结果在摘要或保留窗口中可追溯。
-- 37777 可追踪最后一次 pretrim 和注入状态。
+- 37776 可追踪最后一次 pretrim 和注入状态。
 

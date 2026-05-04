@@ -586,8 +586,8 @@ export const MemorySystemPlugin = ({ client }) => {
   const DASHBOARD_MAX_EVENTS_PER_SESSION_VIEW = 80;
   const AUTO_DASHBOARD_AUTOSTART = true;
   const AUTO_DASHBOARD_PORT = (() => {
-    const raw = Number(process.env.OPENCODE_MEMORY_DASHBOARD_PORT || 37777);
-    return Number.isFinite(raw) && raw > 0 ? raw : 37777;
+    const raw = Number(process.env.OPENCODE_MEMORY_DASHBOARD_PORT || 37776);
+    return Number.isFinite(raw) && raw > 0 ? raw : 37776;
   })();
   const AUTO_OPENCODE_WEB_PORT = (() => {
     const raw = Number(process.env.OPENCODE_WEB_PORT || 4096);
@@ -695,7 +695,7 @@ export const MemorySystemPlugin = ({ client }) => {
       ];
 
       // Preserve an existing long-lived dashboard owner. Short-lived CLI runs
-      // should not steal 37777 from a web/desktop parent that is still alive.
+      // should not steal 37776 from a web/desktop parent that is still alive.
       const started = spawnSync('node', args, { stdio: 'ignore' });
       if (started.status !== 0) {
         // Avoid aggressive recovery here; plugin may initialize concurrently.
@@ -8241,7 +8241,7 @@ export const MemorySystemPlugin = ({ client }) => {
 </div>
 <footer class="footer">
   <span><span data-i18n="footerLeft">OpenCode Memory · 生成于</span> <span id="genAt"></span></span>
-  <span>port 37777</span>
+  <span>port 37776</span>
 </footer>
 <div class="modal" id="editModal">
   <div class="modal-content">
@@ -8330,7 +8330,7 @@ function fmt(d) { try { return new Date(d).toLocaleString(LANG === 'en' ? 'en-US
 
 async function apiFetch(url, opts) {
   try { return await fetch(url, opts); }
-  catch (e) { throw new Error('37777 ' + (LANG === 'en' ? 'service offline' : '面板服务未运行') + ': ' + (e?.message || e)); }
+  catch (e) { throw new Error('37776 ' + (LANG === 'en' ? 'service offline' : '面板服务未运行') + ': ' + (e?.message || e)); }
 }
 async function apiPost(url, body) {
   const r = await apiFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });

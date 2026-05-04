@@ -14,7 +14,7 @@
 - [1. 功能概览](#1-功能概览)
 - [2. 安装教程](#2-安装教程)
 - [3. 启动与使用](#3-启动与使用)
-- [4. 37777 页面说明](#4-37777-页面说明)
+- [4. 37776 页面说明](#4-37776-页面说明)
 - [5. 参数说明](#5-参数说明)
 - [6. 模板机制](#6-模板机制)
 - [7. 裁剪/总结/替换流程](#7-裁剪总结替换流程)
@@ -32,7 +32,7 @@
 - **发送前机械裁剪**（低信号工具输出降权/替换）。
 - **超阈值后 LLM 总结**（内联或独立模式）。
 - **会话压缩摘要**（保留完整最早历史，不丢失起始对话）。
-- **37777 看板可视化管理**（参数、模板、LLM、回收站、实时刷新）。
+- **37776 看板可视化管理**（参数、模板、LLM、回收站、实时刷新）。
 
 ### 2. 安装教程
 
@@ -127,29 +127,29 @@ copy plugins\dashboard\template.html "%USERPROFILE%\.config\opencode\plugins\das
 ```
 
 #### 2.4 重启 OpenCode
-重启后自动生效。`37777` 当前实现是 watchdog 跟随模式，通常会随 OpenCode 启动；如果本地未拉起，可手动执行 restart/start 恢复。
+重启后自动生效。`37776` 当前实现是 watchdog 跟随模式，通常会随 OpenCode 启动；如果本地未拉起，可手动执行 restart/start 恢复。
 
 #### 2.5 安装后如何确认装对了
 - 终端执行 `opencode web`
 - 打开：
   - `http://127.0.0.1:4096`
-  - `http://127.0.0.1:37777`
-- 如果 `37777` 能打开，并且会话页里能看到记忆统计、参数页、LLM设置、回收站，就说明插件已经被加载
+  - `http://127.0.0.1:37776`
+- 如果 `37776` 能打开，并且会话页里能看到记忆统计、参数页、LLM设置、回收站，就说明插件已经被加载
 - 顶部还会显示一个连接状态小标记
 
 ### 3. 启动与使用
 - 正常聊天即可，默认自动记录记忆与发送前裁剪。
-- 看板地址：`http://127.0.0.1:37777`
+- 看板地址：`http://127.0.0.1:37776`
 - 支持 OpenCode 前端与 CLI。
 - 常见使用方式：
   1. **直接聊天**：插件会自动记住当前会话摘要，并在需要时做发送前裁剪。
   2. **跨会话续接**：在新会话里明确提到"另一个会话/上一个会话/刚刚那个会话"，会触发 recall 注入。
   3. **写入全局偏好**：直接说"请记住我偏好中文回复"这类句子，模型可调用 memory 写入全局偏好。
   4. **路径锚点**：说"记住路径锚点 /path/to/project"，会**自动存入当前项目的记忆**，不会污染其他项目。
-  5. **调参数**：去 37777 的"参数页"或"LLM设置"页保存，下一次请求**立即生效**（无缓存，每次从磁盘读取）。
+  5. **调参数**：去 37776 的"参数页"或"LLM设置"页保存，下一次请求**立即生效**（无缓存，每次从磁盘读取）。
   6. **手动命令**：`/memory recall`, `/memory stats`, `/memory doctor`, `/memory anchors` 等。
 
-### 4. 37777 页面说明
+### 4. 37776 页面说明
 菜单顺序：
 1. 会话记忆
 2. 摘要模板设置
@@ -160,7 +160,7 @@ copy plugins\dashboard\template.html "%USERPROFILE%\.config\opencode\plugins\das
 #### 4.1 会话记忆页
 - 查看各会话统计、注入次数、pretrim 轨迹。
 - 编辑摘要、删除会话记忆、批量删除。
-- 左上角会显示面板连接状态，帮助判断 37777 是否还连着后台服务。
+- 左上角会显示面板连接状态，帮助判断 37776 是否还连着后台服务。
 - 支持 `全选 / 全不选 / 批量删除`。
 - 展开某个会话后，可以直接看到：
   - `压缩摘要`（保留完整历史，不截断起始对话）
@@ -278,18 +278,18 @@ flowchart TD
 | prune | `/memory prune [session <id>]` | 对当前或指定 session 执行裁剪组合动作 |
 | distill | `/memory distill <id:distillation> ...` | 写入人工蒸馏摘要 |
 | clear | `/memory clear [session <id>\|sessions <id1,id2,...>\|project\|all]` | 清理指定范围的记忆数据 |
-| dashboard | `/memory dashboard` | 启动/重启 37777 看板 |
+| dashboard | `/memory dashboard` | 启动/重启 37776 看板 |
 | sessions | `/memory sessions` | 列出当前项目的所有会话 |
 
 ### 10. 常见问题
 - **Q: 路径锚点会污染其他项目吗？**
   - A: 不会。路径锚点现在按项目隔离存储在 `projects/<project>/memory.json` 的 `pathAnchors` 数组中。全局偏好 `preferences.note` 只保存非路径内容。新会话启动时，只会注入**当前项目**的路径锚点。
-- **Q: 37777 页面修改参数后会立即生效吗？**
+- **Q: 37776 页面修改参数后会立即生效吗？**
   - A: 会。插件每次都从磁盘读取 `~/.opencode/memory/config.json`，没有内存缓存。Dashboard 保存参数后，下一次请求即使用新值。
 - **Q: 压缩摘要为什么只有最后几轮？**
   - A: 已修复。现在使用 `truncateText`（保留开头=最早历史）替代了旧的 `truncateFromEnd`（保留末尾），并增大了摘要字符限制到 8000 和保留事件数到 36。
 - **Q: `doctor` 怎么用？**
-  - A: `/memory doctor` 或 `/memory doctor session <id>`。先看它报的是哪一类问题（未触发、裁剪太激进、system太高、LLM失败），然后去 37777 调对应参数。
+  - A: `/memory doctor` 或 `/memory doctor session <id>`。先看它报的是哪一类问题（未触发、裁剪太激进、system太高、LLM失败），然后去 37776 调对应参数。
 - **Q: 可见通知（记忆提示）会导致 AI 回复消失吗？**
   - A: 已修复。所有 `emitVisibleNotice` 都使用 `noReply: true`，不会覆盖 AI 回复。
 - **Q: compact 工具和 `/memory compact` 冲突吗？**
@@ -297,10 +297,10 @@ flowchart TD
 - **Q: 页面没更新？**
   - A: 强刷浏览器，或重启 OpenCode。
 - **Q: 独立LLM超时？**
-  - A: 默认已是 `30000ms`，可在 37777 的 `LLM设置`页继续调高。
-- **Q: 37777 没起来？**
+  - A: 默认已是 `30000ms`，可在 37776 的 `LLM设置`页继续调高。
+- **Q: 37776 没起来？**
   - A: 手动执行：
-    - `node ~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs restart 37777`
+    - `node ~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs restart 37776`
 
 ### 11. 测试与验证
 
@@ -397,7 +397,7 @@ Dashboard 服务（`scripts/opencode_memory_dashboard.mjs`）：
 
 #### 2026-03-11
 - 完善 DCP 兼容性，发送前裁剪全链路验证
-- 37777 看板连接状态标记
+- 37776 看板连接状态标记
 - 系统层审计卡片默认折叠
 - 多轮回归测试扩展到 100+ 场景
 
@@ -423,7 +423,7 @@ Dashboard 服务（`scripts/opencode_memory_dashboard.mjs`）：
 - **Send-time mechanical trim**: low-signal tool outputs are pruned before sending.
 - **LLM summary on overflow**: inline or independent LLM summarization when token budget is exceeded.
 - **Session compression**: preserves earliest conversation history, not just recent turns.
-- **Visual dashboard at `:37777`**: real-time management of settings, templates, LLM config, and trash.
+- **Visual dashboard at `:37776`**: real-time management of settings, templates, LLM config, and trash.
 
 ### Install
 
@@ -468,20 +468,20 @@ Add `"./plugins/memory-system.js"` to the `"plugin"` array:
 ```
 
 #### Restart OpenCode
-Dashboard `:37777` normally follows OpenCode via a watchdog-style lifecycle. If it is missing, restart manually:
+Dashboard `:37776` normally follows OpenCode via a watchdog-style lifecycle. If it is missing, restart manually:
 ```bash
-node ~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs restart 37777
+node ~/.config/opencode/plugins/scripts/opencode_memory_dashboard.mjs restart 37776
 ```
 
 ### Usage
 - Works automatically in chat.
-- Open dashboard: `http://127.0.0.1:37777`
+- Open dashboard: `http://127.0.0.1:37776`
 - Typical workflow:
   1. **Chat normally**: the plugin records session memory and applies send-time trim when needed.
   2. **Cross-session recall**: mention a previous session explicitly to trigger context injection.
   3. **Save preferences**: say "remember I prefer Chinese" and the model writes to global preferences.
   4. **Path anchors**: say "remember path /foo/bar" — saved to **current project only**, not global.
-  5. **Adjust settings**: changes made in 37777 dashboard take effect **immediately** (no cache).
+  5. **Adjust settings**: changes made in 37776 dashboard take effect **immediately** (no cache).
 
 ### Dashboard Pages
 1. **Sessions**: view stats, injection counts, pretrim traces, compressed summaries (up to 80 events, 10 summary blocks).

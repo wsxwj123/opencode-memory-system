@@ -8,7 +8,7 @@ import { spawnSync, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const action = (process.argv[2] || 'start').toLowerCase();
-const port = Number(process.argv[3] || 37777);
+const port = Number(process.argv[3] || 37776);
 const isServeMode = action === 'serve';
 const parentPidArg = Number(process.argv[4] || 0);
 const opencodePortArg = Number(process.argv[5] || 4096);
