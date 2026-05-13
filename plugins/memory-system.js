@@ -658,14 +658,20 @@ export const MemorySystemPlugin = ({ client }) => {
     /另一个对话|另外一个对话|上一个对话|上次那个对话|之前那个对话|跨对话/i,
     /(?:另一个|另外一个|上一个|上一|上个|上次|前一个|之前的?|刚刚的?|刚才的?)(?:会话|对话|聊天|session)/i,
     /刚在另一个会话|刚刚在另一个会话|刚才在另一个会话|之前在另一个会话/i,
-    /in another chat|in previous chat|from previous session|other session/i
+    // Loose modifier with up to 12 chars gap so phrases like
+    // "其他项目文件夹下的会话" / "别的窗口的对话" still trigger.
+    /(?:其他|其它|别的|别个|另外|另一)[一-鿿]{0,12}?(?:会话|对话|聊天|session)/i,
+    /in another chat|in previous chat|from previous session|other session|other chat|in other session/i
   ];
   const RECALL_LOW_SIGNAL_TOKEN_PATTERN = /^(?:我|你|他|她|它|请|请你|请问|帮我|一下|刚才|刚刚|之前|上次|那个|这个|另外|另一个|会话|对话|聊天|session|chat|提到|提到的|写入|写入的|保存|保存的|记住|记住的|告诉我|看看|读取|读一下|查询|查看|只回复|回复|是什么|是啥|什么|哪个|哪一个|多少|不知道|路径或不知道|里面|里的|中的)$/i;
   const RECALL_FILLER_STRIP_PATTERNS = [
     /我刚才在另一个会话|刚才在另一个会话|我刚刚在另一个会话|刚刚在另一个会话|之前在另一个会话/gi,
     /另一个对话|另外一个对话|上一个对话|上次那个对话|之前那个对话|跨对话/gi,
     /另一个会话|另外一个会话|上一个会话|上个会话|前一个会话|之前的会话|刚才的会话|刚刚的会话|那个会话|上一会话|上次会话/gi,
-    /另一个session|另外的session|上一个session|之前的session|other session|previous session|previous chat|another chat/gi,
+    // Strip loose "其他/别的/另外 …(中间填充)… 会话/对话/聊天/session" so the
+    // residual query carries only the actual subject keywords.
+    /(?:其他|其它|别的|别个|另外|另一)[一-鿿]{0,12}?(?:会话|对话|聊天|session)/gi,
+    /另一个session|另外的session|上一个session|之前的session|other session|previous session|previous chat|another chat|other chat|in other session/gi,
     /我刚才|我刚刚|刚才|刚刚|之前|上次|请问|请你|请|帮我|告诉我|查看|看看|读取|读一下|查询|提到的|写入的|保存的|记住的/gi,
     /是什么|是啥|什么|哪个|哪一个|多少|只回复|路径或不知道|不知道/gi
   ];
