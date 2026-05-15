@@ -322,6 +322,41 @@ node scripts/run_path_regression_suite.mjs
 
 ### 12. 更新日志
 
+#### 2026-05-12 (v2.1.5)
+**扩展跨会话召回触发词**
+
+- `RECALL_TRIGGER_PATTERNS` 新增"其他 / 其它 / 别的 / 别个 / 另外 / 另一"作为方向词，与后续"会话 / 对话 / 聊天 / session"之间最多允许 12 个中文字间隔
+- 例："我刚刚在**其他项目文件夹下的会话**里提到的博士论文" 现在能触发召回（之前只认"另一个会话"等紧贴形式）
+- `RECALL_FILLER_STRIP_PATTERNS` 镜像更新，召回前的关键词清洗保留主语 keyword
+- 10/10 正反样例验证：正例如"别的会话 / 其它对话"命中；反例如"其他人 / 别的配置 / 其他文件夹里"不误触发
+
+#### 2026-05-12 (v2.1.4)
+**Dashboard 端口 37777 → 37776**
+
+- 全部 7 处端口引用统一更新（`memory-system.js` × 5 / `dashboard.mjs` / `dashboard/template.html` × 2 / README / docs）
+- 同时让出 37777 给社区主流插件 `claude-mem`（默认 37777），减少端口冲突
+
+#### 2026-05-11 (v2.1.3)
+**dashboard watchdog 跟随 opencode 父进程退出**
+
+- 修自爆 bug：`isOpencodeRunning()` 用 `pgrep -if opencode` 同时匹配到 dashboard 自己的 argv（含 `opencode_memory_dashboard.mjs`），`byProcess` 永远 true → watchdog 永远不退
+- 修法：当 plugin 传了 parent PID（`explicitParentBinding=true`）时，watchdog **只信 parent PID**，不再 OR `byProcess` / `byPort`
+- 结果：关 opencode 后约 30 秒 dashboard 自动 `process.exit(0)`，端口自动释放
+
+#### 2026-05-11 (v2.1.2)
+**修真正生效的"摘要替换"路径**
+
+- v2.1.0 只在 `compactConversationByBudget` 路径改了 REPLACE，但**生产实际走的 send-pretrim 路径**仍是老 MERGE：bridge 把新 block 拼到 `compressedText` 末尾再 `truncateText` 截断，**早期内容随预算膨胀被丢**
+- 修法：`recordSendPretrimAudit` 的 bridge 改成纯 REPLACE，最新 block 直接覆盖 `compressedText`；历史完整保存在 `summaryBlocks`（dashboard "压缩块" 面板可查）
+- 这才是用户"摘要会丢前面内容" bug 的真正修复点
+
+#### 2026-05-11 (v2.1.1)
+**编辑摘要 modal 卡顿 + fire-and-forget rejection 加 catch**
+
+- 真因：`.modal { backdrop-filter: blur(8px) }` 覆盖整个 viewport，textarea 每次输入/光标移动都触发 GPU 重算整页背后的高斯模糊。dashboard 后面卡片多时直接卡爆
+- 修法：移除 backdrop-filter blur，改用纯 `rgba(0,0,0,0.55)` 半透明；modal-content 和 textarea 加 `contain: layout style paint` 隔离重绘
+- 同时给 2 处 `void asyncFn(...)` 改成显式 `.catch(console.error)`：`emitVisibleNotice` 和 `schedulePretrimWarmupFromMessages`，避免 unhandled rejection 静默丢失
+
 #### 2026-05-04 (v2.1.0)
 **Apple 风格 Dashboard 重制 + 摘要质量大修 + 并发安全 + 跨 cwd 共享记忆**
 
@@ -570,6 +605,41 @@ node scripts/run_path_regression_suite.mjs
 ```
 
 ### Changelog
+
+#### 2026-05-12 (v2.1.5)
+**Broaden cross-session recall keywords**
+
+- `RECALL_TRIGGER_PATTERNS` now accepts "其他 / 其它 / 别的 / 别个 / 另外 / 另一" as directional modifiers, with up to 12 Chinese chars allowed between modifier and session-class noun ("会话 / 对话 / 聊天 / session")
+- Example: "我刚刚在**其他项目文件夹下的会话**里提到的博士论文" now triggers recall (previously only the tight "另一个会话" form was matched)
+- `RECALL_FILLER_STRIP_PATTERNS` mirror updated so cleaned-up query retains only subject keywords
+- Verified 10/10 cases: positives like "别的会话 / 其它对话" match; negatives like "其他人 / 别的配置 / 其他文件夹里" stay silent
+
+#### 2026-05-12 (v2.1.4)
+**Dashboard port 37777 → 37776**
+
+- Updated all 7 references (`memory-system.js` × 5 / `dashboard.mjs` / `dashboard/template.html` × 2 / README / docs)
+- Yields 37777 back to community plugin `claude-mem` (default 37777), avoiding port conflicts
+
+#### 2026-05-11 (v2.1.3)
+**Dashboard watchdog now exits with the opencode parent**
+
+- Self-detection bug fix: `isOpencodeRunning()` used `pgrep -if opencode` which also matched the dashboard's own argv (path contains `opencode_memory_dashboard.mjs`) → `byProcess` permanently true → watchdog never fired after real parent died
+- Fix: when plugin spawned us with explicit parent PID, watchdog **trusts only that PID**, no longer OR with byProcess / byPort
+- Result: ~30 s after opencode exits, dashboard `process.exit(0)`; port released
+
+#### 2026-05-11 (v2.1.2)
+**Fix the actually-triggered REPLACE path in pretrim bridge**
+
+- v2.1.0 only changed `compactConversationByBudget` to REPLACE, but **the send-pretrim bridge (production path)** still did legacy MERGE: joined new block to `compressedText` then `truncateText` cut it → earliest content dropped as merged length exceeded budget
+- Fix: `recordSendPretrimAudit` bridge now pure REPLACE — latest block overwrites `compressedText` verbatim; full history kept in `summaryBlocks` (browseable in dashboard "compressed blocks" panel)
+- This was the real fix for the long-standing "summary loses early content" complaint
+
+#### 2026-05-11 (v2.1.1)
+**Edit-summary modal post-open lag + harden fire-and-forget rejections**
+
+- Root cause of lag: `.modal { backdrop-filter: blur(8px) }` covered the whole viewport; every textarea reflow/cursor blink forced the GPU to recompute the blur over the entire dashboard underneath. Heavy dashboards made typing unusable
+- Fix: drop `backdrop-filter: blur` entirely, use plain `rgba(0,0,0,0.55)`; add `contain: layout style paint` on modal-content and textarea to isolate repaint
+- Also replaced two `void asyncFn(...)` call sites (`emitVisibleNotice`, `schedulePretrimWarmupFromMessages`) with explicit `.catch(console.error)` so unhandled rejections from outside the inner try/catch surface in logs
 
 #### 2026-05-04 (v2.1.0)
 **Apple-style Dashboard rebuild + Summary quality overhaul + Concurrency safety + Cross-cwd shared memory**
