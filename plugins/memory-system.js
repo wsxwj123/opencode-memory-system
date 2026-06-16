@@ -3089,6 +3089,22 @@ export const MemorySystemPlugin = ({ client }) => {
     return { providerID: '', modelID: '' };
   }
 
+  // Shared chain-of-thought / inner-monologue opener detector. Used by BOTH the
+  // mechanical summary path (buildCompressedChunk) and the distill input path
+  // (collectDistillSnippetsFromMessage) so reasoning narration — "Let me
+  // analyze...", "我看到了关键线索...", "现在我有了完整的图景..." — never becomes a
+  // summary fact, a distill snippet, or a summaryBlock line. Matches ONLY
+  // sentence-initial CoT openers, so concrete conclusion lines like "采用 X" /
+  // "已写入 /path" / "使用 revise-sci" / "我需要交付报告" are preserved.
+  function isChainOfThoughtText(s) {
+    const t = String(s || '').trim();
+    if (!t) return false;
+    if (/^(?:好的|好[，,]|行[，,]|嗯|那)?[，,]?\s*(?:现在|接下来|首先|然后|那么|这样|目前)?[，,]?\s*我(?:现在|来|先|想|得|已经|需要|可以|刚)?(?:看到|看了|有了|得到|拿到|提取|分析|总结|梳理|规划|检查|确认|明白|理解|发现|注意到|看|读)/.test(t)) return true;
+    if (/^让我(?:们)?(?:来|先|继续)?(?:看|分析|总结|想|检查|确认|梳理|规划|提取|整理|核对)/.test(t)) return true;
+    if (/^(?:(?:ok(?:ay)?|now|first(?:ly)?|next|then|so|alright|great|good|perfect|nice|cool|hmm)[,.!]?\s+){0,2}(?:let me\b|let'?s\b|i'?ll\b|i'?m\b|i am\b|i need\b|i should\b|i'?ve\b|i have\b|i see\b|i got\b|i now\b|i'?d\b|i will\b|i can\b|looking at\b|now that\b)/i.test(t)) return true;
+    return false;
+  }
+
   function collectDistillSnippetsFromMessage(msg) {
     if (!msg || !Array.isArray(msg.parts)) return [];
     const lines = [];
@@ -3105,6 +3121,9 @@ export const MemorySystemPlugin = ({ client }) => {
       // The bare "I need to..." pattern was too aggressive: legitimate
       // assistant replies often start that way ("Let me check the file...").
       if (/\*\*[A-Z][A-Za-z\s'-]{1,40}\*\*\s+I (need|should|will|have to|must|am|'m) /.test(text)) continue;
+      // Drop sentence-initial CoT openers (shared filter) so reasoning narration
+      // never lands in distill snippets or mechanical extract summaryBlocks.
+      if (isChainOfThoughtText(text)) continue;
       lines.push(truncateText(text, 220));
       if (lines.length >= 2) break;
     }
@@ -5574,22 +5593,8 @@ export const MemorySystemPlugin = ({ client }) => {
       if (/^\s*\{.*"todos"\s*:\s*\[/i.test(t)) return true;
       return false;
     };
-    // Chain-of-thought / inner-monologue opener detection. Assistant messages
-    // often begin with reasoning narration — "Let me analyze...", "我看到了关键
-    // 线索...", "现在我有了完整的图景..." — which is NOT a summary-worthy fact or
-    // decision. It leaks into Goal/Key facts/Decisions because the mechanical
-    // path pulls raw ev.summary text. Gate every field at the clean stage so a
-    // CoT sentence is dropped (field left empty) rather than rendered as a fact.
-    // Matches ONLY sentence-initial CoT openers, so concrete conclusion lines
-    // like "采用 X 流程" / "已写入 /path" / "使用 revise-sci" are NOT killed.
-    const isChainOfThoughtText = (s) => {
-      const t = String(s || '').trim();
-      if (!t) return false;
-      if (/^(?:好的|好[，,]|行[，,]|嗯|那)?[，,]?\s*(?:现在|接下来|首先|然后|那么|这样|目前)?[，,]?\s*我(?:现在|来|先|想|得|已经|需要|可以|刚)?(?:看到|看了|有了|得到|拿到|提取|分析|总结|梳理|规划|检查|确认|明白|理解|发现|注意到|看|读)/.test(t)) return true;
-      if (/^让我(?:们)?(?:来|先|继续)?(?:看|分析|总结|想|检查|确认|梳理|规划|提取|整理|核对)/.test(t)) return true;
-      if (/^(?:(?:ok(?:ay)?|now|first(?:ly)?|next|then|so|alright|great|good|perfect|nice|cool|hmm)[,.!]?\s+){0,2}(?:let me\b|let'?s\b|i'?ll\b|i'?m\b|i am\b|i need\b|i should\b|i'?ve\b|i have\b|i see\b|i got\b|i now\b|i'?d\b|i will\b|i can\b|looking at\b|now that\b)/i.test(t)) return true;
-      return false;
-    };
+    // CoT filter is the shared module-level isChainOfThoughtText (defined near
+    // collectDistillSnippetsFromMessage) so mechanical + distill paths agree.
     const isNoiseFact = (s) => isRawToolIO(s) || isChainOfThoughtText(s);
     const cleanFacts = keyFacts.filter((f) => !isNoiseFact(f)).slice(0, 4);
     const cleanGoals = goalHints.filter((g) => !isNoiseFact(g)).slice(0, 2);
