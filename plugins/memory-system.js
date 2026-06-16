@@ -7734,7 +7734,23 @@ export const MemorySystemPlugin = ({ client }) => {
       state
     );
 
-    const summary = truncateText(sanitizeCompressedSummaryText(String(s?.summary?.compressedText || '')), 260);
+    // P0 fix (freshness guard): compressedText has multiple writers — the
+    // mechanical budget/file-size paths (appendCompressedSummaryChunk,
+    // enforceSessionFileBudget) overwrite it with a different/older event
+    // window while summaryBlocks keeps the newer distill block. That made the
+    // injected summary diverge from (and lag behind) the latest block, e.g.
+    // ct="Status: done" while the latest block says "in-progress". Inject
+    // whichever of ct / latest-block is FRESHER by timestamp so the LLM never
+    // sees a stale summary.
+    const ctText = sanitizeCompressedSummaryText(String(s?.summary?.compressedText || ''));
+    const ctAt = Date.parse(String(s?.summary?.lastCompressedAt || '')) || 0;
+    const blocks = Array.isArray(s?.summaryBlocks) ? s.summaryBlocks : [];
+    const latestBlock = blocks.length ? blocks[blocks.length - 1] : null;
+    const blockAt = latestBlock ? (Date.parse(String(latestBlock.createdAt || '')) || 0) : 0;
+    const chosen = (latestBlock && latestBlock.summary && blockAt > ctAt)
+      ? sanitizeCompressedSummaryText(String(latestBlock.summary))
+      : ctText;
+    const summary = truncateText(chosen, 260);
     if (summary) pushLineWithLimit(lines, `compressed: ${summary}`, state);
 
     const recent = s.recentEvents.slice(-getCurrentSessionSummaryMaxEvents());
