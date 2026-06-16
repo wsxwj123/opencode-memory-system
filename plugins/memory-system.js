@@ -4079,8 +4079,15 @@ export const MemorySystemPlugin = ({ client }) => {
           result.rewrittenMessages += candidateIndices.length;
           result.rewrittenParts += candidateIndices.length;
           result.afterTokens = estimateOutgoingMessagesTokens(messages);
+          // Tag the block by its ACTUAL producer (inline before distill, since
+          // "[pretrim-distill-inline]" also startsWith "[pretrim-distill"). Was
+          // hardcoded 'pretrim-distill' so dashboard mislabeled mechanical
+          // extract / inline-fallback blocks as real LLM distill.
+          const blockSource = /^\[pretrim-extract\]/.test(summary) ? 'pretrim-extract'
+            : /^\[pretrim-distill-inline/.test(summary) ? 'pretrim-distill-inline'
+            : 'pretrim-distill';
           result.compressedBlock = {
-            source: 'pretrim-distill',
+            source: blockSource,
             startMessageID,
             endMessageID,
             anchorMessageID,
