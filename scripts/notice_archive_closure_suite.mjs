@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { spawnSync, spawn } from 'child_process';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 
 const HOST = '127.0.0.1';
 const PORT = 4096;
-const DB_PATH = '/Users/wsxwj/.local/share/opencode/opencode.db';
+const DB_PATH = process.env.OPENCODE_DB || path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db');
 
 function run(cmd, args, options = {}) {
   const res = spawnSync(cmd, args, {

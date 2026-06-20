@@ -322,6 +322,14 @@ node scripts/run_path_regression_suite.mjs
 
 ### 12. 更新日志
 
+#### 2026-06-20 (maintenance)
+**公开发布脱敏 + 路径可移植化**
+
+- 清除测试脚本与文档中残留的硬编码个人家目录（`/Users/<user>/...` → `os.homedir()` / `~` / `/Users/me` 占位）
+- `scripts/notice_archive_closure_suite.mjs` 的 `DB_PATH` 改为 `process.env.OPENCODE_DB || path.join(os.homedir(), '.local/share/opencode/opencode.db')`，跨机器开箱即用
+- 插件主代码（`memory-system.js` / `opencode_memory_dashboard.mjs`）本就全程用 `os.homedir()`，无需改动
+- 全仓库已无任何硬编码绝对个人路径
+
 #### 2026-05-12 (v2.1.5)
 **扩展跨会话召回触发词**
 
@@ -605,6 +613,14 @@ node scripts/run_path_regression_suite.mjs
 ```
 
 ### Changelog
+
+#### 2026-06-20 (maintenance)
+**Public-release sanitization + portable paths**
+
+- Removed hardcoded personal home paths from test scripts and docs (`/Users/<user>/...` → `os.homedir()` / `~` / `/Users/me` placeholder)
+- `scripts/notice_archive_closure_suite.mjs` `DB_PATH` now resolves via `process.env.OPENCODE_DB || path.join(os.homedir(), '.local/share/opencode/opencode.db')` — works on any machine
+- Core plugin code (`memory-system.js` / `opencode_memory_dashboard.mjs`) already used `os.homedir()` throughout; no change needed
+- No hardcoded absolute personal paths remain anywhere in the repo
 
 #### 2026-05-12 (v2.1.5)
 **Broaden cross-session recall keywords**
