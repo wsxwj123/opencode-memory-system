@@ -617,6 +617,24 @@ export const MemorySystemPlugin = ({ client }) => {
   const pluginDir = path.dirname(fileURLToPath(import.meta.url));
   const dashboardServiceScript = path.join(pluginDir, 'scripts', 'opencode_memory_dashboard.mjs');
 
+  // opencode.db lives under different roots per OS (macOS/Linux: ~/.local/share,
+  // Windows: ~/AppData/Roaming). Honor an explicit override, else probe candidates.
+  const opencodeDbCandidates = [
+    path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db'),
+    path.join(os.homedir(), 'AppData', 'Roaming', 'opencode', 'opencode.db')
+  ];
+  function resolveOpencodeDbPath() {
+    if (process.env.OPENCODE_DB) return process.env.OPENCODE_DB;
+    for (const candidate of opencodeDbCandidates) {
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {
+        // ignore missing candidate
+      }
+    }
+    return '';
+  }
+
   // Runtime state
   const sessionRecallState = new Map();
   const sessionUserMessageCounters = new Map();
@@ -702,7 +720,7 @@ export const MemorySystemPlugin = ({ client }) => {
 
       // Preserve an existing long-lived dashboard owner. Short-lived CLI runs
       // should not steal 37776 from a web/desktop parent that is still alive.
-      const started = spawnSync('node', args, { stdio: 'ignore' });
+      const started = spawnSync(process.execPath, args, { stdio: 'ignore' });
       if (started.status !== 0) {
         // Avoid aggressive recovery here; plugin may initialize concurrently.
         // If another initializer won the race, service is already running.
@@ -715,7 +733,7 @@ export const MemorySystemPlugin = ({ client }) => {
   function ensureDashboardServiceStopped() {
     try {
       if (!fs.existsSync(dashboardServiceScript)) return;
-      spawnSync('node', [dashboardServiceScript, 'stop', String(AUTO_DASHBOARD_PORT)], { stdio: 'ignore' });
+      spawnSync(process.execPath, [dashboardServiceScript, 'stop', String(AUTO_DASHBOARD_PORT)], { stdio: 'ignore' });
     } catch (err) {
       console.error('memory-system dashboard stop failed:', err);
     }
@@ -731,7 +749,8 @@ export const MemorySystemPlugin = ({ client }) => {
     if (now - lastAt < 10000) return;
     sessionProjectLookupLastAt.set(sessionID, now);
     try {
-      const dbPath = path.join(os.homedir(), '.local/share/opencode/opencode.db');
+      const dbPath = resolveOpencodeDbPath();
+      if (!dbPath) return;
       // Use \x1f (ASCII unit separator) to avoid conflicts with | in directory paths
       const SEP = '\x1f';
       const result = spawnSync('sqlite3', [
@@ -1017,18 +1036,22 @@ export const MemorySystemPlugin = ({ client }) => {
     return /记住这个路径锚点|记住这个路径|记住这个笔记|保存这个备注|写入备注|保存到note|写入note/i.test(t);
   }
 
+  // Detect a filesystem path: Windows drive (C:\a\b or C:/a/b) or Unix (/a/b).
+  // The lookbehind keeps the Windows branch from matching the "s:" inside https://.
+  const FS_PATH_DETECT_RE = /((?<![A-Za-z])[A-Za-z]:[\\/][^\s"'，。；;]*|\/[^\s"'，。；;]+(?:\/[^\s"'，。；;]+)*)/;
+
   function shouldFallbackToGlobalNote(rawText = '') {
     const text = normalizeText(String(rawText || ''));
     if (!text) return false;
     if (isExplicitNoteIntent(text)) return true;
     if (/(?:路径锚点|path anchor)/i.test(text)) return true;
-    return /(\/[^\s"'，。；;]+(?:\/[^\s"'，。；;]+)*)/.test(text);
+    return FS_PATH_DETECT_RE.test(text);
   }
 
   function sanitizeGlobalNoteContent(raw = '') {
     let text = sanitizeUserTextForMemoryInference(raw);
     if (!text) return '';
-    const pathMatch = text.match(/(\/[^\s"'，。；;]+(?:\/[^\s"'，。；;]+)*)/);
+    const pathMatch = text.match(FS_PATH_DETECT_RE);
     if (pathMatch && pathMatch[1]) return normalizeText(pathMatch[1]);
     text = text
       .replace(/^这个路径锚点\s*/i, '')

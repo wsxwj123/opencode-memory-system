@@ -1,0 +1,9 @@
+# Normalize line endings to LF for all text so Windows autocrlf does not
+# rewrite source/config and break cross-platform diffs.
+* text=auto eol=lf
+
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.md   text eol=lf

@@ -282,6 +282,8 @@ flowchart TD
 | sessions | `/memory sessions` | 列出当前项目的所有会话 |
 
 ### 10. 常见问题
+- **Q: Windows 上有什么注意事项？**
+  - A: 记忆主功能（记录/召回/裁剪/总结/看板）在 Windows 与 macOS/Linux 完全一致，路径全部用 `os.homedir()` 自适应。**唯一依赖外部命令的功能**是"从 opencode.db 读取会话列表 / 跨 cwd 项目识别"，它调用系统 `sqlite3` CLI。macOS 自带 `sqlite3`；**Windows 默认没有**，需自行安装（如 `winget install SQLite.SQLite` 或把 sqlite3.exe 放进 PATH）才能用这部分。未安装时插件自动降级（按 git 仓库名 / 目录名分组记忆），不影响其他功能。opencode.db 路径可用环境变量 `OPENCODE_DB` 覆盖。
 - **Q: 路径锚点会污染其他项目吗？**
   - A: 不会。路径锚点现在按项目隔离存储在 `projects/<project>/memory.json` 的 `pathAnchors` 数组中。全局偏好 `preferences.note` 只保存非路径内容。新会话启动时，只会注入**当前项目**的路径锚点。
 - **Q: 37776 页面修改参数后会立即生效吗？**
@@ -329,6 +331,14 @@ node scripts/run_path_regression_suite.mjs
 - `scripts/notice_archive_closure_suite.mjs` 的 `DB_PATH` 改为 `process.env.OPENCODE_DB || path.join(os.homedir(), '.local/share/opencode/opencode.db')`，跨机器开箱即用
 - 插件主代码（`memory-system.js` / `opencode_memory_dashboard.mjs`）本就全程用 `os.homedir()`，无需改动
 - 全仓库已无任何硬编码绝对个人路径
+
+**Windows 双端兼容加固**
+
+- `memory-system.js` 的 `opencode.db` 路径改为候选探测（`~/.local/share` + `~/AppData/Roaming`）+ `OPENCODE_DB` 覆盖，原先写死 Unix 路径在 Windows 必错
+- dashboard 自启动从 `spawnSync('node', ...)` 改为 `process.execPath`，不再依赖 `node` 在 PATH（与 dashboard 自身 self-spawn 一致）
+- 路径识别正则（`shouldFallbackToGlobalNote` / `sanitizeGlobalNoteContent`）新增 Windows 盘符分支 `C:\...`，裸 Windows 路径现可被隐式识别
+- 新增 `.gitattributes` 强制文本文件 `eol=lf`，防止 Windows `autocrlf` 污染
+- README 注明 Windows 需自装 `sqlite3` 才能用 DB 会话/跨 cwd 识别功能
 
 #### 2026-05-12 (v2.1.5)
 **扩展跨会话召回触发词**
@@ -596,6 +606,8 @@ flowchart TD
 ```
 
 ### FAQ
+- **Q: Anything Windows-specific?**
+  - A: Core memory features (record/recall/trim/summary/dashboard) behave identically on Windows and macOS/Linux — all paths resolve via `os.homedir()`. The **only feature that shells out** is reading the session list from `opencode.db` / cross-cwd project resolution, which calls the system `sqlite3` CLI. macOS ships `sqlite3`; **Windows does not by default** — install it (`winget install SQLite.SQLite`, or put `sqlite3.exe` on PATH) to enable that part. Without it the plugin degrades gracefully (groups memory by git-repo / directory name); nothing else is affected. The `opencode.db` location can be overridden via the `OPENCODE_DB` env var.
 - **Q: Will path anchors leak across projects?**
   - A: No. Path anchors are stored per-project in `projects/<project>/memory.json`. Only current project's anchors are injected on session start.
 - **Q: Do dashboard settings take effect immediately?**
@@ -621,6 +633,14 @@ node scripts/run_path_regression_suite.mjs
 - `scripts/notice_archive_closure_suite.mjs` `DB_PATH` now resolves via `process.env.OPENCODE_DB || path.join(os.homedir(), '.local/share/opencode/opencode.db')` — works on any machine
 - Core plugin code (`memory-system.js` / `opencode_memory_dashboard.mjs`) already used `os.homedir()` throughout; no change needed
 - No hardcoded absolute personal paths remain anywhere in the repo
+
+**Windows cross-platform hardening**
+
+- `memory-system.js` `opencode.db` path now probes candidates (`~/.local/share` + `~/AppData/Roaming`) with `OPENCODE_DB` override; the old hardcoded Unix path always failed on Windows
+- Dashboard autostart switched from `spawnSync('node', ...)` to `process.execPath` — no longer depends on `node` being on PATH (matches the dashboard's own self-spawn)
+- Path-detection regexes (`shouldFallbackToGlobalNote` / `sanitizeGlobalNoteContent`) gained a Windows drive branch `C:\...`, so bare Windows paths are now recognized implicitly
+- Added `.gitattributes` enforcing `eol=lf` on text files to prevent Windows `autocrlf` corruption
+- README notes that Windows needs `sqlite3` installed for the DB session list / cross-cwd resolution feature
 
 #### 2026-05-12 (v2.1.5)
 **Broaden cross-session recall keywords**
