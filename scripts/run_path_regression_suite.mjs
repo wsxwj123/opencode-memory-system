@@ -4024,14 +4024,14 @@ async function testFindSkillsBoilerplateUserNoiseDoesNotPersistAsUserEvent() {
 
     await plugin.__test.processUserMessageEvent(
       'sid-find-skills-noise',
-      '# find-skills # Helps users discover and install agent skills when they ask questions like "how do I do X", "find a skill for X", "is there a skill that can...", or express interest in extending capabilities. This skill should be used when the user is looking for functionality that might exist as an installable skill. # Supporting tools and docs are in /Users/wsxwj/.config/opencode/skills/find-skills # ============================================ # Find Skills This skill helps you discover and install skills from the open agent skills ecosystem.',
+      '# find-skills # Helps users discover and install agent skills when they ask questions like "how do I do X", "find a skill for X", "is there a skill that can...", or express interest in extending capabilities. This skill should be used when the user is looking for functionality that might exist as an installable skill. # Supporting tools and docs are in /Users/me/.config/opencode/skills/find-skills # ============================================ # Find Skills This skill helps you discover and install skills from the open agent skills ecosystem.',
       {
         type: 'message.part.updated',
         properties: {
           info: {
             sessionID: 'sid-find-skills-noise',
             summary: {
-              body: '# find-skills # Helps users discover and install agent skills when they ask questions like "how do I do X", "find a skill for X", "is there a skill that can...", or express interest in extending capabilities. This skill should be used when the user is looking for functionality that might exist as an installable skill. # Supporting tools and docs are in /Users/wsxwj/.config/opencode/skills/find-skills # ============================================ # Find Skills This skill helps you discover and install skills from the open agent skills ecosystem.'
+              body: '# find-skills # Helps users discover and install agent skills when they ask questions like "how do I do X", "find a skill for X", "is there a skill that can...", or express interest in extending capabilities. This skill should be used when the user is looking for functionality that might exist as an installable skill. # Supporting tools and docs are in /Users/me/.config/opencode/skills/find-skills # ============================================ # Find Skills This skill helps you discover and install skills from the open agent skills ecosystem.'
             }
           }
         }
@@ -4286,7 +4286,7 @@ async function testVisibleNoticeFallbackPromptDoesNotCreateExtraSessionFiles() {
 async function testIsPathAnchorContentDetectsFilePaths() {
   return withPluginHome('is_path_anchor_content_detects_file_paths', async ({ plugin }) => {
     const t = plugin.__test.isPathAnchorContent;
-    const yes1 = t('根目录: /Users/wsxwj/Desktop/openclaw');
+    const yes1 = t('根目录: /Users/me/Desktop/openclaw');
     const yes2 = t('C:\\Users\\test\\project');
     const yes3 = t('路径锚点 my-project');
     const yes4 = t('https://github.com/example/repo');
@@ -4301,7 +4301,7 @@ async function testIsPathAnchorContentDetectsFilePaths() {
 
 async function testAppendProjectPathAnchorWritesToProjectMeta() {
   return withPluginHome('append_project_path_anchor_writes_to_project_meta', async ({ homeDir, plugin }) => {
-    const res = plugin.__test.appendProjectPathAnchor('根目录: /Users/wsxwj/Desktop/openclaw');
+    const res = plugin.__test.appendProjectPathAnchor('根目录: /Users/me/Desktop/openclaw');
     const projectMetaPath = path.join(homeDir, '.opencode', 'memory', 'projects', path.basename(process.cwd()), 'memory.json');
     let meta = {};
     if (fs.existsSync(projectMetaPath)) {
@@ -4309,7 +4309,7 @@ async function testAppendProjectPathAnchorWritesToProjectMeta() {
     }
     const anchors = meta.pathAnchors || [];
     return {
-      ok: res.ok && anchors.length === 1 && anchors[0].includes('/Users/wsxwj/Desktop/openclaw'),
+      ok: res.ok && anchors.length === 1 && anchors[0].includes('/Users/me/Desktop/openclaw'),
       detail: JSON.stringify({ result: res, anchors })
     };
   });
@@ -4346,7 +4346,7 @@ async function testDeleteProjectPathAnchorRemovesMatch() {
 
 async function testAppendValueToGlobalNoteRedirectsPathToProject() {
   return withPluginHome('append_value_to_global_note_redirects_path_to_project', async ({ homeDir, plugin }) => {
-    const res = plugin.__test.appendValueToGlobalNote('根目录: /Users/wsxwj/Desktop/my-project');
+    const res = plugin.__test.appendValueToGlobalNote('根目录: /Users/me/Desktop/my-project');
     // Should have been redirected to project pathAnchors
     const projectMetaPath = path.join(homeDir, '.opencode', 'memory', 'projects', path.basename(process.cwd()), 'memory.json');
     const meta = fs.existsSync(projectMetaPath) ? readJson(projectMetaPath) : {};
@@ -4356,7 +4356,7 @@ async function testAppendValueToGlobalNoteRedirectsPathToProject() {
     const globalMem = fs.existsSync(globalPath) ? readJson(globalPath) : {};
     const globalNote = String(globalMem?.preferences?.note || '');
     return {
-      ok: res.ok && anchors.some(a => a.includes('/Users/wsxwj/Desktop/my-project')) && !globalNote.includes('/Users/wsxwj/Desktop/my-project'),
+      ok: res.ok && anchors.some(a => a.includes('/Users/me/Desktop/my-project')) && !globalNote.includes('/Users/me/Desktop/my-project'),
       detail: JSON.stringify({ result: res, anchors, globalNote: globalNote.slice(0, 100) })
     };
   });
@@ -4398,12 +4398,12 @@ async function testBuildGlobalPrefsContextTextFiltersPathsFromNote() {
     const globalPath = path.join(homeDir, '.opencode', 'memory', 'global.json');
     const globalMem = fs.existsSync(globalPath) ? readJson(globalPath) : {};
     if (!globalMem.preferences) globalMem.preferences = {};
-    globalMem.preferences.note = '1. 根目录: /Users/wsxwj/Desktop/openclaw\n2. 我喜欢简洁的代码风格，请注意代码质量和可读性';
+    globalMem.preferences.note = '1. 根目录: /Users/me/Desktop/openclaw\n2. 我喜欢简洁的代码风格，请注意代码质量和可读性';
     globalMem.preferences.language = 'Chinese';
     writeJson(globalPath, globalMem);
     const text = plugin.__test.buildGlobalPrefsContextText();
     // Should NOT contain the path line, but SHOULD contain the non-path note
-    const hasPath = text.includes('/Users/wsxwj/Desktop/openclaw');
+    const hasPath = text.includes('/Users/me/Desktop/openclaw');
     const hasNonPath = text.includes('简洁的代码风格') || text.includes('代码质量');
     return {
       ok: !hasPath && hasNonPath,

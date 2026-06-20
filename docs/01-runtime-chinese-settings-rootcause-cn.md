@@ -3,7 +3,7 @@
 ## 现象
 - `~/.config/opencode/opencode.json` 的 `plugin` 列表里未声明 `chinese-settings`。
 - 但 `opencode debug config` 的最终有效插件列表仍出现：
-  - `file:///Users/wsxwj/.config/opencode/plugins/chinese-settings.js`
+  - `file:///Users/me/.config/opencode/plugins/chinese-settings.js`
 
 ## 取证结论
 - OpenCode 运行时会加载 `~/.config/opencode/plugins/` 下可加载的 `.js` 文件。
