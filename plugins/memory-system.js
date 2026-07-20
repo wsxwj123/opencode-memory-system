@@ -614,6 +614,11 @@ export const MemorySystemPlugin = ({ client }) => {
   const dashboardDir = path.join(memoryDir, 'dashboard');
   const dashboardHtmlPath = path.join(dashboardDir, 'index.html');
   const dashboardDataPath = path.join(dashboardDir, 'data.json');
+  // 看板写入去抖状态：提前声明，好让下方 autostart 时的 writeDashboardFilesNow()
+  // 不会撞上 let 的暂时性死区（TDZ）而静默失败。
+  const DASHBOARD_DEBOUNCE_MS = 1500;
+  let __dashboardWriteTimer = null;
+  let __dashboardLastWriteAt = 0;
   const pluginDir = path.dirname(fileURLToPath(import.meta.url));
   const dashboardServiceScript = path.join(pluginDir, 'scripts', 'opencode_memory_dashboard.mjs');
 
@@ -703,6 +708,11 @@ export const MemorySystemPlugin = ({ client }) => {
   }
   ensureDashboardDir();
   if (AUTO_DASHBOARD_AUTOSTART) {
+    // 防复发：opencode 启动、拉起看板前，先用当前插件重新生成 index.html。否则插件
+    // 升级后、下一次记忆写入触发生成之前，看板会一直 serve 旧产物（如 refreshData 打
+    // 已废弃端点导致删除后不刷新）。writeDashboardFilesNow 自带 try/catch，不会拖垮启动。
+    // ponytail: 无条件全量生成一次，不做过期检测；启动不频繁，一次几百 ms 阻塞可接受。
+    writeDashboardFilesNow();
     ensureDashboardServiceStarted();
   }
 
@@ -9278,9 +9288,7 @@ setConn(true);
   // synchronously rebuilding+writing JSON+HTML 50 times during a tool-heavy
   // turn was a measurable IO/CPU regression. Coalesce to at most one write
   // every DASHBOARD_DEBOUNCE_MS (1500ms), with a trailing flush guaranteed.
-  const DASHBOARD_DEBOUNCE_MS = 1500;
-  let __dashboardWriteTimer = null;
-  let __dashboardLastWriteAt = 0;
+  // (DASHBOARD_DEBOUNCE_MS / __dashboardWriteTimer / __dashboardLastWriteAt 已提前到文件上方声明)
   function writeDashboardFilesNow() {
     try {
       ensureDashboardDir();
