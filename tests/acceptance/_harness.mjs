@@ -102,7 +102,7 @@ const TEST_EXPORTS = [
   // B3 compaction / discard / injection
   'compressSessionMemory', 'compactConversationByBudget', 'discardLowValueToolEvents',
   'appendCompressedSummaryChunk', 'enforceSessionFileBudget', 'buildCurrentSessionSummaryText',
-  'ensureSummaryBlocks',
+  'ensureSummaryBlocks', 'buildCompressedChunk',
   // C2 persistence primitives
   'readJson', 'writeJson', 'readMemoryConfig', 'writeMemoryConfig',
   // B1 dashboard generation
