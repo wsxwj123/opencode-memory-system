@@ -106,7 +106,9 @@ const TEST_EXPORTS = [
   // C2 persistence primitives
   'readJson', 'writeJson', 'readMemoryConfig', 'writeMemoryConfig',
   // B1 dashboard generation
-  'writeDashboardFilesNow'
+  'writeDashboardFilesNow',
+  // batch2 security — read-only access to recall assembly (H2)
+  'buildRecallContextText'
 ];
 
 export async function loadPluginWithHome(homeDir) {
