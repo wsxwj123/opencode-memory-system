@@ -88,10 +88,37 @@ async function test_H3_secret_redacted_on_disk() {
   });
 }
 
+// --- Guard B: global memory write path must redact secrets too ---
+// H3 only covered session files. writeGlobalMemoryValue (memory-system.js
+// L1336) / global memory persist path stores value verbatim. Contract: raw
+// secret must not reach global.json; the surrounding marker must survive.
+// PRE-FIX: value stored verbatim -> secrets on disk -> FAIL.
+const G_AIZA = 'AIzaSyRedact1234567890abcdefGHIJKLmnopq';
+const G_SK = 'sk-proj-SECRETglobal9876543210zyxwv';
+const G_MARKER = 'DEPLOYSNIPPET';
+
+async function test_GuardB_global_write_redacted() {
+  return await withPluginHome('batch2_guardb', async ({ homeDir, plugin }) => {
+    const globalPath = `${homeDir}/.opencode/memory/global.json`;
+    const value = `${G_MARKER} google ${G_AIZA} openai ${G_SK} end`;
+    const res = plugin.__test.writeGlobalMemoryValue('snippets.deploy', value);
+    if (!res || res.ok !== true) return { ok: false, detail: `global write rejected: ${res?.message || 'no result'}` };
+
+    if (!fs.existsSync(globalPath)) return { ok: false, detail: `global.json not written at ${globalPath}` };
+    const raw = fs.readFileSync(globalPath, 'utf8');
+    const recorded = raw.includes(G_MARKER);
+    const leaks = [];
+    if (raw.includes(G_AIZA)) leaks.push('aiza-key');
+    if (raw.includes(G_SK)) leaks.push('sk-key');
+    return { ok: recorded && leaks.length === 0, detail: `entryRecorded=${recorded} leakedSecrets=[${leaks.join(',')}] (want recorded + no leaks)` };
+  });
+}
+
 async function main() {
   const cases = [
     ['H2 recall block carries isolation declaration', test_H2_recall_isolation_declaration],
-    ['H3 secrets masked in persisted session JSON', test_H3_secret_redacted_on_disk]
+    ['H3 secrets masked in persisted session JSON', test_H3_secret_redacted_on_disk],
+    ['GuardB global memory write path redacts secrets', test_GuardB_global_write_redacted]
   ];
   let pass = 0;
   for (const [name, fn] of cases) {

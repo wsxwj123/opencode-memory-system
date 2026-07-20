@@ -81,7 +81,10 @@ async function boot() {
         independentLlmProvider: 'openai_compatible',
         independentLlmBaseURL: 'https://example.invalid/v1',
         independentLlmApiKey: SECRET_API_KEY,
-        independentLlmModel: 'test-model'
+        independentLlmModel: 'test-model',
+        // Guard A: numeric "token"-named fields that must NOT be masked.
+        independentLlmMaxTokens: 512,
+        recallTokenBudget: 8000
       }
     });
 
@@ -138,6 +141,33 @@ async function test_C1b_no_plaintext_key_settings() {
   const res = await httpReq(port, { method: 'GET', path: '/api/memory/settings', headers: { Host: `127.0.0.1:${port}` } });
   const leaked = res.status === 200 && res.text.includes(SECRET_API_KEY);
   return { ok: res.status === 200 && !leaked, detail: `status=${res.status} rawKeyPresent=${leaked} (want key absent)` };
+}
+
+// ---- Guard A: masking must not clobber numeric "token"-named fields ----
+// isSecretFieldName substring-matches "token" -> independentLlmMaxTokens /
+// recallTokenBudget get masked to ****. Contract: numeric fields keep original
+// value AND independentLlmApiKey is still masked.
+// PRE-FIX (no masking yet): apiKey leaks raw -> keyMasked=false -> FAIL.
+function checkGuardA(ms) {
+  const numOk = ms && ms.independentLlmMaxTokens === 512 && ms.recallTokenBudget === 8000;
+  const keyMasked = !ms || ms.independentLlmApiKey === undefined || ms.independentLlmApiKey !== SECRET_API_KEY;
+  return { numOk, keyMasked };
+}
+async function test_GuardA_dashboard_numeric_not_masked() {
+  const { port } = ctx;
+  const res = await httpReq(port, { method: 'GET', path: '/api/dashboard', headers: { Host: `127.0.0.1:${port}` } });
+  let ms;
+  try { ms = JSON.parse(res.text)?.settings?.memorySystem; } catch { return { ok: false, detail: `body not JSON (status=${res.status})` }; }
+  const { numOk, keyMasked } = checkGuardA(ms);
+  return { ok: res.status === 200 && numOk && keyMasked, detail: `numericPreserved=${numOk} apiKeyMasked=${keyMasked} maxTokens=${ms?.independentLlmMaxTokens} recallBudget=${ms?.recallTokenBudget}` };
+}
+async function test_GuardA_settings_numeric_not_masked() {
+  const { port } = ctx;
+  const res = await httpReq(port, { method: 'GET', path: '/api/memory/settings', headers: { Host: `127.0.0.1:${port}` } });
+  let ms;
+  try { ms = JSON.parse(res.text)?.memorySystem; } catch { return { ok: false, detail: `body not JSON (status=${res.status})` }; }
+  const { numOk, keyMasked } = checkGuardA(ms);
+  return { ok: res.status === 200 && numOk && keyMasked, detail: `numericPreserved=${numOk} apiKeyMasked=${keyMasked} maxTokens=${ms?.independentLlmMaxTokens} recallBudget=${ms?.recallTokenBudget}` };
 }
 
 // ---- H1 ----
@@ -204,6 +234,8 @@ async function main() {
     ['C1a legit: Host 127.0.0.1/localhost allowed (200)', test_C1a_host_allow_local],
     ['C1b attack: /api/dashboard hides raw apiKey', test_C1b_no_plaintext_key_dashboard],
     ['C1b attack: /api/memory/settings hides raw apiKey', test_C1b_no_plaintext_key_settings],
+    ['GuardA: /api/dashboard keeps numeric token fields, masks apiKey', test_GuardA_dashboard_numeric_not_masked],
+    ['GuardA: /api/memory/settings keeps numeric token fields, masks apiKey', test_GuardA_settings_numeric_not_masked],
     ['H1 attack: text/plain POST delete rejected + session kept', test_H1_reject_text_plain],
     ['H1 attack: cross-origin POST delete rejected + session kept', test_H1_reject_cross_origin],
     ['H1 legit: same-origin json POST delete succeeds', test_H1_allow_same_origin_json],
