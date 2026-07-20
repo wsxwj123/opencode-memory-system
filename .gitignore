@@ -1,0 +1,7 @@
+# dev-flow 开发过程产物，不进版本库
+.devflow/
+PROJECT.md
+
+# 运行时临时/损坏备份
+*.tmp-*
+*.corrupt-*
