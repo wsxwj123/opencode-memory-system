@@ -5606,10 +5606,11 @@ export const MemorySystemPlugin = ({ client }) => {
     const isGoodDir = (dir) => {
       const d = normalizeText(dir);
       if (!d) return false;
-      if (/^\/[A-Za-z]$/.test(d)) return false;
-      if (/^\/Users\/[^/]+$/.test(d)) return false;
-      if (/^\/Users\/[^/]+\/[^/]{1,4}$/.test(d)) return false;
-      const depth = d.split('/').filter(Boolean).length;
+      if (/^[/\\][A-Za-z]$/.test(d)) return false;
+      if (/^[A-Za-z]:[/\\]?$/.test(d)) return false;
+      if (/^(?:[A-Za-z]:)?[/\\]Users[/\\][^/\\]+$/.test(d)) return false;
+      if (/^(?:[A-Za-z]:)?[/\\]Users[/\\][^/\\]+[/\\][^/\\]{1,4}$/.test(d)) return false;
+      const depth = d.split(/[\\/]/).filter(Boolean).length;
       return depth >= 4;
     };
     const workdirs = [...dirScores.entries()]
