@@ -180,7 +180,11 @@ function getTrashRetentionDays() {
 // C1b：外发前掩码所有密钥字段（apiKey/secret/token/password）。密钥只写不读，
 // 面板回显只留后4位；空值保持空。
 function isSecretFieldName(name) {
-  return /(apikey|api_key|secret|token|password|passwd)/i.test(String(name || ''));
+  const n = String(name || '').toLowerCase();
+  // 放行含 "token" 的数值配置：maxTokens / tokenBudget / *tokens。
+  if (/maxtoken|tokenbudget|tokens/.test(n)) return false;
+  // 只认真正的密钥字段；token 仅认密钥语义形态。
+  return /apikey|api_key|secret|password|passwd|_token$|access[_-]?token|auth[_-]?token/.test(n);
 }
 function maskSecretValue(v) {
   const s = String(v == null ? '' : v);

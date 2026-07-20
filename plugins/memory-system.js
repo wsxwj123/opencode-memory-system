@@ -1142,6 +1142,13 @@ export const MemorySystemPlugin = ({ client }) => {
     return hasExplicitGlobalMemoryIntent(text);
   }
 
+  // GuardB 落盘收口：全局记忆写盘前统一脱敏，防明文密钥进 global.json。
+  // 只脱敏磁盘态，不改内存传参语义。deepRedactSecretsInPlace/writeJson 均为闭包内声明（已提升）。
+  function writeGlobalMemory(globalMemory) {
+    deepRedactSecretsInPlace(globalMemory);
+    writeJson(globalMemoryPath, globalMemory);
+  }
+
   function appendValueToGlobalNote(rawValue = '') {
     const value = sanitizeFallbackGlobalNoteContent(rawValue) || sanitizeGlobalNoteContent(rawValue);
     if (!value) return { ok: false, key: 'preferences.note', value: '', message: 'Rejected empty global note content' };
@@ -1182,7 +1189,7 @@ export const MemorySystemPlugin = ({ client }) => {
       const merged = entries.concat(newValues);
       next = merged.map((line, index) => `${index + 1}. ${line}`).join('\n');
       globalMemory.preferences.note = next;
-      writeJson(globalMemoryPath, globalMemory);
+      writeGlobalMemory(globalMemory);
       writeDashboardFiles();
       return { ok: true, key: 'preferences.note', value: newValues.join('；'), message: `Global setting updated: preferences.note += ${newValues.join('；')}` };
     } catch (e) {
@@ -1362,7 +1369,7 @@ export const MemorySystemPlugin = ({ client }) => {
       if (key === 'preferences.language' && globalMemory.preferences.language_preference !== undefined) {
         delete globalMemory.preferences.language_preference;
       }
-      writeJson(globalMemoryPath, globalMemory);
+      writeGlobalMemory(globalMemory);
       writeDashboardFiles();
       return { ok: true, key, value, message: `Global setting updated: ${key} = ${value}` };
     } catch (e) {
@@ -1413,7 +1420,7 @@ export const MemorySystemPlugin = ({ client }) => {
         return { ok: true, key, existed: false, message: `Global setting already absent: ${key}` };
       }
       delete current[leaf];
-      writeJson(globalMemoryPath, globalMemory);
+      writeGlobalMemory(globalMemory);
       writeDashboardFiles();
       return { ok: true, key, existed: true, message: `Global setting deleted: ${key}` };
     } catch (e) {
@@ -2121,7 +2128,10 @@ export const MemorySystemPlugin = ({ client }) => {
       .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [REDACTED]')
       .replace(/\bsk-[A-Za-z0-9_-]{16,}/g, '[REDACTED]')
       .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}/g, '[REDACTED]')
-      .replace(/\bAKIA[0-9A-Z]{12,}/g, '[REDACTED]');
+      .replace(/\bAKIA[0-9A-Z]{12,}/g, '[REDACTED]')
+      .replace(/\bAIza[0-9A-Za-z_-]{20,}/g, '[REDACTED]')
+      .replace(/\bxox[baprs]-[0-9A-Za-z-]{10,}/g, '[REDACTED]')
+      .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[REDACTED]');
   }
 
   function deepRedactSecretsInPlace(node, depth = 0) {
@@ -5075,7 +5085,8 @@ export const MemorySystemPlugin = ({ client }) => {
   }
 
   function writeProjectMeta(projectMeta, projectName = getProjectName()) {
-    writeJson(getProjectMemoryPath(projectName), projectMeta || {});
+    // GuardB 落盘收口：项目记忆写盘前脱敏。
+    writeJson(getProjectMemoryPath(projectName), deepRedactSecretsInPlace(projectMeta || {}));
   }
 
   function readLegacySessionFromMeta(sessionID, projectName = getProjectName()) {
@@ -9931,7 +9942,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               if (!globalMemory.snippets) globalMemory.snippets = {};
               globalMemory.snippets[snippetName] = 'Snippet content placeholder';
 
-              writeJson(globalMemoryPath, globalMemory);
+              writeGlobalMemory(globalMemory);
               writeDashboardFiles();
               return `Snippet "${snippetName}" saved to global memory.`;
             }
@@ -10040,7 +10051,7 @@ For /memory doctor, do not use task/subagent. Call memory directly and use curre
               const globalMemory = readJson(globalMemoryPath);
               if (!globalMemory.feedback) globalMemory.feedback = [];
               globalMemory.feedback.push({ date: new Date().toISOString(), message });
-              writeJson(globalMemoryPath, globalMemory);
+              writeGlobalMemory(globalMemory);
               writeDashboardFiles();
               return 'Thank you for your feedback. It has been recorded.';
             }
