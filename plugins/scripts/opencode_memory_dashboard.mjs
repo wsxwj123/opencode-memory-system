@@ -177,9 +177,38 @@ function getTrashRetentionDays() {
   return Number(cfg.trashRetentionDays || DEFAULT_RETENTION_DAYS);
 }
 
+// C1b：外发前掩码所有密钥字段（apiKey/secret/token/password）。密钥只写不读，
+// 面板回显只留后4位；空值保持空。
+function isSecretFieldName(name) {
+  const n = String(name || '').toLowerCase();
+  // 放行含 "token" 的数值配置：maxTokens / tokenBudget / *tokens。
+  if (/maxtoken|tokenbudget|tokens/.test(n)) return false;
+  // 只认真正的密钥字段；token 仅认密钥语义形态。
+  return /apikey|api_key|secret|password|passwd|_token$|access[_-]?token|auth[_-]?token/.test(n);
+}
+function maskSecretValue(v) {
+  const s = String(v == null ? '' : v);
+  if (!s) return s;
+  return s.length > 4 ? `****${s.slice(-4)}` : '****';
+}
+function maskSecretFields(obj, depth = 0) {
+  if (depth > 12 || obj == null) return obj;
+  if (Array.isArray(obj)) return obj.map((x) => maskSecretFields(x, depth + 1));
+  if (typeof obj === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (isSecretFieldName(k) && (typeof v === 'string' || typeof v === 'number')) out[k] = maskSecretValue(v);
+      else out[k] = maskSecretFields(v, depth + 1);
+    }
+    return out;
+  }
+  return obj;
+}
+
 function getMemorySystemSettings() {
   const cfg = readMemoryConfig();
-  return cfg.memorySystem && typeof cfg.memorySystem === 'object' ? cfg.memorySystem : {};
+  const ms = cfg.memorySystem && typeof cfg.memorySystem === 'object' ? cfg.memorySystem : {};
+  return maskSecretFields(ms);
 }
 
 function updateMemorySystemSettings(patch = {}) {
@@ -1261,6 +1290,34 @@ function serve() {
     const parsedUrl = new URL(req.url || '/', 'http://127.0.0.1');
     const rawPath = decodeURIComponent(parsedUrl.pathname || '/');
 
+    // --- C1/H1 前置鉴权：Host + Origin + Content-Type 三重头校验（不引入 token）。---
+    // 端口用实际绑定的 `port` 变量，勿硬编码 37776。
+    // Host 校验是 DNS-rebinding 主防线：Host 必须指向本机回环绑定。
+    const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
+    if (!allowedHosts.has(String(req.headers.host || '').toLowerCase())) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Forbidden: host');
+      return;
+    }
+    // 写方法（改状态/破坏性）额外挡 CSRF：Content-Type 必须 JSON；Origin 若在须同源。
+    if (method === 'POST' || method === 'PUT' || method === 'DELETE' || method === 'PATCH') {
+      const ctype = String(req.headers['content-type'] || '').toLowerCase();
+      if (!/^application\/json\b/.test(ctype)) {
+        res.writeHead(415, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Unsupported Media Type: application/json required');
+        return;
+      }
+      const origin = req.headers.origin;
+      if (origin != null && origin !== '') {
+        const allowedOrigins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
+        if (!allowedOrigins.has(String(origin).toLowerCase())) {
+          res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Forbidden: origin');
+          return;
+        }
+      }
+    }
+
     if (method === 'GET' && rawPath === '/api/memory/opencode/sessions') {
       const archived = parseBoolQuery(parsedUrl.searchParams.get('archived'));
       const limit = Number(parsedUrl.searchParams.get('limit') || 200);
@@ -1324,7 +1381,7 @@ function serve() {
           keys: Object.keys(patch || {})
         });
         const live = buildLiveDashboardData();
-        sendJson(res, 200, { ok: true, settings, dashboard: live.settings || {} });
+        sendJson(res, 200, { ok: true, settings: maskSecretFields(settings), dashboard: live.settings || {} });
       } catch (err) {
         sendJson(res, 500, { error: err?.message || String(err) });
       }
@@ -1612,7 +1669,7 @@ function serve() {
       return;
     }
     const target = path.join(dashboardDir, reqPath);
-    if (!target.startsWith(dashboardDir)) {
+    if (!target.startsWith(dashboardDir + path.sep)) {
       res.writeHead(403);
       res.end('Forbidden');
       return;
