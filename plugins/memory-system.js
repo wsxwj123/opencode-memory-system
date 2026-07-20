@@ -871,12 +871,19 @@ export const MemorySystemPlugin = ({ client }) => {
     return { sessionID: sid, projectName };
   }
 
+  // 副作用：解析失败会把损坏文件改名 .corrupt-* 并返回 {}（数据保留、可人工恢复）
   function readJson(filePath) {
     if (!fs.existsSync(filePath)) return {};
     try {
       return JSON.parse(fs.readFileSync(filePath, 'utf8'));
     } catch (err) {
       console.warn(`memory-system: failed to parse JSON at ${filePath}: ${err?.message || err}`);
+      try {
+        // 保留损坏现场：改名 .corrupt-<ts>（不以 .json 结尾，被 readdir 的 .json 过滤跳过）
+        fs.renameSync(filePath, `${filePath}.corrupt-${Date.now()}`);
+      } catch (_) {
+        // 改名失败（已被别的进程移走等）不中断读流程
+      }
       return {};
     }
   }
@@ -922,11 +929,21 @@ export const MemorySystemPlugin = ({ client }) => {
     return fallback;
   }
 
+  // ponytail: 单进程原子（tmp+rename）；跨进程 lockfile 见后续批次
   function writeJson(filePath, data) {
+    const json = JSON.stringify(data, null, 2);
+    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
     try {
-      fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+      fs.writeFileSync(tmp, json);
+      fs.renameSync(tmp, filePath);
     } catch (err) {
-      console.warn(`memory-system: failed to write JSON at ${filePath}: ${err?.message || err}`);
+      // rename 失败（Windows 目标被并发打开等）回退直接写，退化为非原子但保证可用
+      try { fs.unlinkSync(tmp); } catch (_) {}
+      try {
+        fs.writeFileSync(filePath, json);
+      } catch (err2) {
+        console.warn(`memory-system: failed to write JSON at ${filePath}: ${err2?.message || err2}`);
+      }
     }
   }
 
@@ -5169,10 +5186,12 @@ export const MemorySystemPlugin = ({ client }) => {
     return sessionData.systemPrompt;
   }
 
+  // 纯读：不得调用 ensureSummaryBlocks（它会重建 summaryBlocks 数组，令 appendSummaryBlock
+  // 里已捕获的 arr 引用失效，导致无 blockId 的块 push 到孤儿数组、丢失）。
   function nextSummaryBlockId(sessionData) {
-    const arr = ensureSummaryBlocks(sessionData);
+    const arr = Array.isArray(sessionData?.summaryBlocks) ? sessionData.summaryBlocks : [];
     let maxId = 0;
-    for (const b of arr) maxId = Math.max(maxId, Number(b.blockId || 0));
+    for (const b of arr) maxId = Math.max(maxId, Number(b?.blockId || 0));
     return maxId + 1;
   }
 
@@ -5771,6 +5790,19 @@ export const MemorySystemPlugin = ({ client }) => {
     // Each pretrim REPLACES compressedText with the latest fresh chunk.
     // Historical chunks live in summaryBlocks (browseable via dashboard
     // "compressed blocks" section).
+    // B3: snapshot the value being evicted BEFORE the replace, so no
+    // compressedText is silently lost — covers both cross-turn replacement and
+    // per-round overwrite inside a multi-round over-budget compact loop.
+    const old = sanitizeCompressedSummaryText(sessionData?.summary?.compressedText);
+    if (old) {
+      appendSummaryBlock(sessionData, {
+        summary: old,
+        source: 'auto-snapshot',
+        // 用旧 lastCompressedAt：历史块不越级，新鲜度守卫仍选当前 compressedText
+        createdAt: sessionData?.summary?.lastCompressedAt || new Date().toISOString(),
+        consumedMessages: Number(sessionData?.summary?.compressedEvents || 0)
+      });
+    }
     const chunk = buildCompressedChunk(eventsToCompress, sessionData);
     sessionData.summary = {
       compressedText: truncateText(chunk, getSummaryMaxCharsBudgetMode()),
@@ -5884,10 +5916,9 @@ export const MemorySystemPlugin = ({ client }) => {
     }
 
     sessionData.recentEvents = events.filter((_, idx) => !removeSet.has(idx));
-    appendCompressedSummaryChunk(sessionData, removedEvents.map((ev) => ({
-      ...ev,
-      summary: `[discarded-low-signal] ${truncateText(normalizeText(String(ev?.summary || '')), 160)}`
-    })));
+    // B3: discard只从 recentEvents 移除低信号事件，不再用 [discarded-low-signal] 垃圾
+    // 覆盖 compressedText（丢弃≠折叠进摘要）。删除动作已由 recordPruneAudit /
+    // lastCompactionReason / emitVisibleNotice 记录，无需进摘要。
 
     return {
       removed: removeSet.size,
@@ -5919,6 +5950,7 @@ export const MemorySystemPlugin = ({ client }) => {
     return { extracted: picked.length };
   }
 
+  // ponytail: 同 B3 家族，file-size 路径的 compressedText 替换也不备份旧摘要，留后续批次
   function enforceSessionFileBudget(sessionData, sessionPath) {
     let guard = 0;
     let prevSize = Infinity;
@@ -8415,7 +8447,7 @@ async function apiGet(url) {
 }
 
 async function refreshData() {
-  try { DATA = await apiGet('/api/memory/data'); setConn(true); renderAll(); }
+  try { DATA = await apiGet('/api/dashboard'); setConn(true); renderAll(); }
   catch (e) { setConn(false, e?.message); }
 }
 function setConn(ok, err) {

@@ -148,8 +148,19 @@ function safeReadJson(p) {
   }
 }
 
+// ponytail: 单进程原子（tmp+rename）；跨进程 lockfile 见后续批次。
+// 与插件侧一并原子写，任何读者只见旧/新完整文件，绝不见半截 → 插件 readJson 的 .corrupt 改名只在真损坏时触发。
 function writeJson(p, obj) {
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf8');
+  const json = JSON.stringify(obj, null, 2);
+  const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.writeFileSync(tmp, json, 'utf8');
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    // rename 失败（Windows 目标被并发打开等）回退直接写，退化为非原子但保证可用
+    try { fs.unlinkSync(tmp); } catch {}
+    fs.writeFileSync(p, json, 'utf8');
+  }
 }
 
 function readMemoryConfig() {
@@ -836,6 +847,28 @@ function readProjectSessions(projectName) {
         lastAt: obj?.sendPretrim?.lastAt || null,
         lastReason: obj?.sendPretrim?.lastReason || '',
         lastStatus: obj?.sendPretrim?.lastStatus || '',
+        // 与 memory-system.js:8042-8062 的 warmup 形状保持一致（全部带默认）
+        warmup: {
+          sourceHash: String(obj?.sendPretrim?.warmup?.sourceHash || ''),
+          status: String(obj?.sendPretrim?.warmup?.status || ''),
+          mode: String(obj?.sendPretrim?.warmup?.mode || ''),
+          provider: String(obj?.sendPretrim?.warmup?.provider || ''),
+          model: String(obj?.sendPretrim?.warmup?.model || ''),
+          lastUserMessageID: String(obj?.sendPretrim?.warmup?.lastUserMessageID || ''),
+          lastAttemptAt: obj?.sendPretrim?.warmup?.lastAttemptAt || null,
+          consecutiveFails: Number(obj?.sendPretrim?.warmup?.consecutiveFails || 0),
+          failCount: Number(obj?.sendPretrim?.warmup?.failCount || 0),
+          hitCount: Number(obj?.sendPretrim?.warmup?.hitCount || 0),
+          missCount: Number(obj?.sendPretrim?.warmup?.missCount || 0),
+          skipBudgetCount: Number(obj?.sendPretrim?.warmup?.skipBudgetCount || 0),
+          skipCooldownCount: Number(obj?.sendPretrim?.warmup?.skipCooldownCount || 0),
+          skipPausedCount: Number(obj?.sendPretrim?.warmup?.skipPausedCount || 0),
+          preparedAt: obj?.sendPretrim?.warmup?.preparedAt || null,
+          usedAt: obj?.sendPretrim?.warmup?.usedAt || null,
+          logs: Array.isArray(obj?.sendPretrim?.warmup?.logs)
+            ? obj.sendPretrim.warmup.logs.slice(-20)
+            : []
+        },
         traces: traces.slice(-8)
       }
       ,
